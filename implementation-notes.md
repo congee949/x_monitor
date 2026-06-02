@@ -31,3 +31,18 @@
 ## Open Questions
 
 - None for the current implementation. The historical dotey article has been fetched, summarized by Gemini, sent to Telegram without visible link/preview, and cleaned up successfully.
+
+---
+
+## 2026-06-02 — Push reliability + crash-safety pass
+
+### Design Decisions
+- **Seen marking is now success-gated** (REL-1/FMT-1): `seen |= (new_ids - push_failed)`. Tweets routed to push are marked seen only if the send returned ok; failed sends stay unseen and retry on the next cron run, bounded by the existing push-age window. Intentionally-skipped tweets (auto_seed / seed / stale / filtered) are still marked seen as before.
+- **send_telegram is resilient**: retries 429 (honoring `parameters.retry_after`, capped 30s) and 5xx with bounded backoff (3 attempts); on a 400 (usually an HTML parse error) it degrades ONCE to plain text (`_html_to_plain`) so the message is delivered instead of raising → being dropped. Raises only after retries are exhausted, so the caller leaves the id unseen.
+- **State writes are atomic** (STATE-1): `_atomic_write` (tmp + fsync + os.replace) for seen files, article queue, and markdown cache — no more truncate-in-place corruption on crash/overlap.
+- **Single-run lock** (LOCK-1): non-blocking `fcntl.flock` on `.monitor.lock` at the top of main(); an overrunning run no longer overlaps the next 30-min cron tick (which caused double-sends + last-writer-wins state clobber). Verified live: lock-held → skip+exit before any fetch; lock-free → proceeds.
+
+### Open Questions / Follow-ups
+- ART-1 (article queue persists once per account at loop end) is mitigated by atomic writes but not fully fixed; a mid-account crash can still re-push the in-flight article. Per-entry persistence after each terminal transition is the remaining hardening.
+- ESC-1 (TL;DR double-escape) / PRE-1 (code-fence <pre>) / SPLIT-1 (split mid-tag) are cosmetic-to-medium formatting bugs left for a follow-up; none silently drop messages now that send_telegram has a plain-text 400 fallback.
+- SEC-3: cc98_config.json / twitter_ai.json hold secrets in cleartext on the VPS — confirm chmod 600 and whether the bot token equals the (now-redacted, to-be-rotated) Taoli98Bot token.
