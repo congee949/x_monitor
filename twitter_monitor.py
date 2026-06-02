@@ -26,9 +26,15 @@ import subprocess
 import re
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
+
+try:
+    import fcntl  # POSIX file locking; used for the single-run guard (LOCK-1)
+except ImportError:
+    fcntl = None
 
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -48,6 +54,20 @@ except ImportError:
 
 API_BASE = "https://ai.6551.io"
 API_ENDPOINT = f"{API_BASE}/open/twitter_user_tweets"
+
+
+def _atomic_write(path: str, data: str) -> None:
+    """Write text atomically: tmp in same dir, fsync, then os.replace (POSIX-atomic).
+
+    Prevents the truncate-in-place corruption (STATE-1) where a crash or an
+    overlapping run leaves an empty/partial JSON that load_* silently resets.
+    """
+    tmp = f"{path}.tmp.{os.getpid()}"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
 
 # ── Article 处理 ─────────────────────────────────────
 
@@ -113,8 +133,7 @@ def save_article(username: str, article_id: str, tweet: dict) -> None:
         "content": None,
     }
     queue.append(entry)
-    with open(queue_path, "w") as f:
-        json.dump(queue, f, ensure_ascii=False, indent=2)
+    _atomic_write(queue_path, json.dumps(queue, ensure_ascii=False, indent=2))
     print(f"    Article detected: {article_id} (queued)")
 
 
@@ -169,8 +188,7 @@ def article_fetch_url(username: str, entry: dict) -> str:
 def cache_article_markdown(article_id: str, markdown: str) -> str:
     os.makedirs(ARTICLE_CACHE_DIR, exist_ok=True)
     path = os.path.join(ARTICLE_CACHE_DIR, f"{article_id}.md")
-    with open(path, "w") as f:
-        f.write(markdown)
+    _atomic_write(path, markdown)
     return path
 
 
@@ -933,10 +951,9 @@ def load_seen(username: str) -> tuple[set[str], str | None]:
 def save_seen(username: str, seen: set[str], last_post_ts: str | None = None) -> None:
     path = get_seen_path(username)
     kept = sorted(seen, reverse=True)[:500]
-    with open(path, "w") as f:
-        json.dump({"ids": kept, "updated": datetime.now().isoformat(),
-                   "last_post_ts": last_post_ts}, f,
-                  ensure_ascii=False, indent=2)
+    _atomic_write(path, json.dumps({"ids": kept, "updated": datetime.now().isoformat(),
+                                    "last_post_ts": last_post_ts},
+                                   ensure_ascii=False, indent=2))
 
 
 def clear_seen(username: str) -> None:
@@ -1052,6 +1069,20 @@ def format_message(username: str, t: dict, ai: "AIClassifier | None" = None) -> 
     return text, link
 
 
+def _tg_post(token: str, payload: dict) -> dict:
+    req = urllib.request.Request(
+        f"https://api.telegram.org/bot{token}/sendMessage",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def _html_to_plain(text: str) -> str:
+    return html.unescape(re.sub(r"<[^>]+>", "", text))
+
+
 def send_telegram(token: str, chat_id: str, text: str, link: str = "") -> dict:
     payload: dict = {
         "chat_id": chat_id,
@@ -1069,13 +1100,44 @@ def send_telegram(token: str, chat_id: str, text: str, link: str = "") -> dict:
         }
     else:
         payload["link_preview_options"] = {"is_disabled": True}
-    req = urllib.request.Request(
-        f"https://api.telegram.org/bot{token}/sendMessage",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-    )
-    with urllib.request.urlopen(req, timeout=15) as r:
-        return json.loads(r.read().decode("utf-8"))
+
+    # Resilient send (REL-1/FMT-1): retry 429 honoring retry_after and 5xx with bounded
+    # backoff; on a 400 (usually an HTML parse error) degrade once to plain text so the
+    # message is still delivered instead of raising and being dropped/marked-seen.
+    last_err = None
+    for attempt in range(3):
+        try:
+            return _tg_post(token, payload)
+        except urllib.error.HTTPError as e:
+            last_err = e
+            try:
+                body = e.read().decode("utf-8", "replace")
+            except Exception:
+                body = ""
+            if e.code == 429:
+                retry_after = 3
+                try:
+                    retry_after = int(json.loads(body)["parameters"]["retry_after"])
+                except Exception:
+                    pass
+                time.sleep(min(max(retry_after, 1), 30))
+                continue
+            if e.code >= 500:
+                time.sleep(2 * (attempt + 1))
+                continue
+            if e.code == 400 and payload.get("parse_mode"):
+                payload = dict(payload)
+                payload["text"] = _html_to_plain(text)
+                payload.pop("parse_mode", None)
+                continue
+            raise
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            last_err = e
+            time.sleep(2 * (attempt + 1))
+            continue
+    if last_err:
+        raise last_err
+    raise RuntimeError("send_telegram: exhausted retries")
 
 
 # ── 单用户处理 ──────────────────────────────────────
@@ -1188,8 +1250,10 @@ def process_user(
         print("    seed 模式：跳过推送")
         to_push = []
 
+    push_failed: set[str] = set()
     for t, _reason in to_push:
         msg, link = format_message(username, t, ai)
+        tid = str(t.get("id") or "")
         if args.dry_run:
             print("----- DRY RUN -----")
             print(msg)
@@ -1202,14 +1266,19 @@ def process_user(
                 print(f"    推送 {'OK' if ok else 'FAIL'}: {t.get('id')}")
                 if not ok:
                     print(f"        resp: {r}")
+                    push_failed.add(tid)
                 time.sleep(1.2)
             except Exception as e:
                 print(f"    推送异常: {e}")
+                push_failed.add(tid)
 
     if args.seed:
         seen |= {str(t.get("id")) for t in tweets if t.get("id")}
     else:
-        seen |= new_ids
+        # REL-1/FMT-1: only mark a tweet seen if its push did NOT fail. Failed sends
+        # stay unseen so the next cron run retries them (bounded by the push-age
+        # window) instead of being silently dropped forever.
+        seen |= (new_ids - push_failed)
 
     latest_ts = last_post_iso
     for t in tweets:
@@ -1341,8 +1410,7 @@ def process_article_queue(ai: AIClassifier, bot_token: str, chat_id: str, dry_ru
             processed += 1
 
         if changed and not dry_run:
-            with open(queue_path, "w") as f:
-                json.dump(queue, f, ensure_ascii=False, indent=2)
+            _atomic_write(queue_path, json.dumps(queue, ensure_ascii=False, indent=2))
     return processed
 
 
@@ -1359,6 +1427,16 @@ def main() -> int:
     ap.add_argument("--user", default=None)
     ap.add_argument("--fetch-articles", action="store_true", help="Process article queue now (auto runs after polling too)")
     args = ap.parse_args()
+
+    # LOCK-1: prevent an overrunning run from overlapping the next cron tick (which
+    # causes double-sends + last-writer-wins state clobber). Non-blocking; skip if held.
+    if fcntl is not None:
+        _lock_fp = open(os.path.join(SCRIPT_DIR, ".monitor.lock"), "w")
+        try:
+            fcntl.flock(_lock_fp, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("上一轮 monitor 仍在运行，跳过本次", file=sys.stderr)
+            return 0
 
     with open(CONFIG_PATH) as f:
         cfg = json.load(f)

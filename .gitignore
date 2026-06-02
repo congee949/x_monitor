@@ -17,3 +17,6 @@ __pycache__/
 *.bak.*
 *.bak-*
 *.before-*
+
+# single-run lock
+.monitor.lock
