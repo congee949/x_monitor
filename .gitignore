@@ -1,0 +1,19 @@
+# --- secrets / tokens (never commit) ---
+env.sh
+cc98_config.json
+twitter_tokens.json
+twitter_ai.json
+.auth_cookies.json
+.guest_token_cache.json
+*.env
+# --- rotating state / caches ---
+twitter_seen/
+twitter_articles/
+vista8_seen_ids.json
+__pycache__/
+*.pyc
+# --- manual backups ---
+*.bak
+*.bak.*
+*.bak-*
+*.before-*
