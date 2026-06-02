@@ -818,7 +818,6 @@ COMMERCIAL_KEYWORDS = [
     "立即体验", "方舟平台",
 ]
 COMMERCIAL_HIT_THRESHOLD = 2
-INACTIVE_DAYS = 7
 DEFAULT_MAX_PUSH_AGE_MINUTES = 45
 URL_RE = re.compile(r"https?://\S+")
 AFFILIATE_URL_RE = re.compile(
@@ -954,12 +953,6 @@ def save_seen(username: str, seen: set[str], last_post_ts: str | None = None) ->
     _atomic_write(path, json.dumps({"ids": kept, "updated": datetime.now().isoformat(),
                                     "last_post_ts": last_post_ts},
                                    ensure_ascii=False, indent=2))
-
-
-def clear_seen(username: str) -> None:
-    path = get_seen_path(username)
-    if os.path.exists(path):
-        os.remove(path)
 
 
 def parse_tweet_datetime(t: dict) -> datetime | None:
@@ -1161,20 +1154,6 @@ def process_user(
         return 0, 0, 0, 0
 
     seen, last_post_iso = load_seen(username)
-
-    if last_post_iso:
-        try:
-            last_dt = datetime.fromisoformat(last_post_iso)
-            if last_dt.tzinfo is None:
-                last_dt = last_dt.replace(tzinfo=timezone.utc)
-            idle_days = (datetime.now(timezone.utc) - last_dt).days
-            if idle_days >= INACTIVE_DAYS and not args.test and not args.seed:
-                print(f"  已 {idle_days} 天无新推文，清理 seen 数据")
-                clear_seen(username)
-                seen = set()
-                last_post_iso = None
-        except Exception:
-            pass
 
     new_ids: set[str] = set()
     to_push: list[tuple[dict, str]] = []

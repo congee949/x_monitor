@@ -46,3 +46,23 @@
 - ART-1 (article queue persists once per account at loop end) is mitigated by atomic writes but not fully fixed; a mid-account crash can still re-push the in-flight article. Per-entry persistence after each terminal transition is the remaining hardening.
 - ESC-1 (TL;DR double-escape) / PRE-1 (code-fence <pre>) / SPLIT-1 (split mid-tag) are cosmetic-to-medium formatting bugs left for a follow-up; none silently drop messages now that send_telegram has a plain-text 400 fallback.
 - SEC-3: cc98_config.json / twitter_ai.json hold secrets in cleartext on the VPS — confirm chmod 600 and whether the bot token equals the (now-redacted, to-be-rotated) Taoli98Bot token.
+
+---
+
+## 2026-06-03 — Three latent-bug fix pass
+
+Fixed the three priority bugs flagged in the 2026-06-02 multi-agent eval. All were latent (masked by daily cookie refresh / active accounts / slow disk growth), none affected live pushes, but all were real.
+
+### Deviations / Fixes
+- **BUG-1 (twitter_graphql.py `get_user_id`)**: `variables` was assigned only inside `if ah:` yet used unconditionally in the URL → guest fallback (`ah == {}`) hit a `NameError`, making the guest path a dead end. Moved the assignment out of the `if` so it is always defined. Verified offline: guest path now returns `None` gracefully instead of raising.
+- **BUG-2 (logrotate)**: config still targeted the stale `/var/log/vista8_monitor.log`; the real log `/var/log/x_monitor.log` (≈749K) was never rotated. Replaced `/etc/logrotate.d/vista8_monitor` with `/etc/logrotate.d/x_monitor` pointing at the correct path (kept weekly/rotate 4/maxsize 5M/copytruncate). NOTE: this file lives under /etc, outside this repo, so it is not tracked here. `logrotate -d` dry-run confirms it is now picked up.
+- **BUG-3 (twitter_monitor.py idle-clear loop)**: an account idle ≥ `INACTIVE_DAYS` (7) had its seen file wiped, which then triggered `auto_seed` and swallowed the first tweet on revival (recorded, not pushed) — losing the comeback signal (notably Vida_BWE). Removed the idle-clear branch entirely; `save_seen` already caps seen at 500 ids so there is no unbounded growth. `last_post_iso` keeps its loaded value and still feeds `latest_ts` correctly.
+
+### Cleanup (dead code created by BUG-3 fix)
+- Removed the now-unreachable `clear_seen()` helper (only caller was the deleted idle branch).
+- Removed the now-unused `INACTIVE_DAYS` module constant.
+
+### Verification
+- `py_compile` clean on both files; no residual references to `clear_seen` / `INACTIVE_DAYS`.
+- Existing unittest suite: 11/11 pass.
+- Live `run.sh` end-to-end: normal run, token pool 5/5, GraphQL primary path working.

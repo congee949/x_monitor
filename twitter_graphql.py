@@ -119,8 +119,9 @@ def get_user_id(screen_name):
     """Get user ID by screen name."""
     # Try authenticated first
     ah = _auth_headers()
-    if ah:
-        variables = json.dumps({"screen_name": screen_name, "withSafetyModeUserFields": True})
+    # Build variables unconditionally: the guest fallback (ah == {}) must not hit a
+    # NameError on `variables` used in the URL below.
+    variables = json.dumps({"screen_name": screen_name, "withSafetyModeUserFields": True})
     features = json.dumps({
         "hidden_profile_subscriptions_enabled": True,
         "rweb_tipjar_consumption_enabled": True,
