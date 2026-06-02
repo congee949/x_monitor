@@ -198,5 +198,51 @@ class MessageFormattingTest(unittest.TestCase):
         self.assertIn("作者讨论 DeepSeek", msg)
 
 
+class LatentFixRegressionTest(unittest.TestCase):
+    """Regression guards for the 2026-06-03 latent-bug fixes."""
+
+    def test_esc1_tldr_not_double_escaped(self):
+        # ESC-1: a TL;DR containing '&' must render as a single &amp;, not &amp;amp;.
+        ai = FakeAI(available=True,
+                    summary="这是一个包含 A & B 与符号的中文摘要内容长度足够通过质量检查测试")
+        msg, _ = twitter_monitor.format_message("dotey", {"id": "1", "note_tweet": {"text": "x" * 80}}, ai)
+        self.assertNotIn("&amp;amp;", msg)
+        self.assertIn("&amp;", msg)
+
+    def test_pre1_code_fence_renders_real_pre(self):
+        # PRE-1: fenced code must produce real <pre>, not literal &lt;pre&gt;.
+        out = twitter_monitor.markdown_to_telegram_html("看代码：\n```python\nprint('a < b & c')\n```\n完")
+        self.assertIn("<pre>", out)
+        self.assertNotIn("&lt;pre&gt;", out)
+        self.assertIn("&lt; b &amp; c", out)  # content escaped once, inside <pre>
+
+    def test_split1_balances_inline_tags_across_chunks(self):
+        # SPLIT-1: a <b> spanning a chunk boundary must be closed/reopened.
+        chunks = twitter_monitor._balance_html_chunks(["前段 <b>加粗开始", "加粗结束</b> 后段"])
+        self.assertTrue(chunks[0].endswith("</b>"))
+        self.assertTrue(chunks[1].startswith("<b>"))
+
+    def test_cat4_unwraps_tweet_with_visibility_results(self):
+        # CAT4: TweetWithVisibilityResults-wrapped tweets must not be dropped.
+        import json as _json
+        import twitter_graphql as tg
+        legacy = lambda i, t: {"id_str": i, "full_text": t, "created_at": "Mon Jun 02 10:00:00 +0000 2026"}
+        synthetic = {"data": {"user": {"result": {"timeline_v2": {"timeline": {"instructions": [
+            {"entries": [
+                {"content": {"itemContent": {"tweet_results": {"result": {
+                    "__typename": "Tweet", "legacy": legacy("100", "plain")}}}}},
+                {"content": {"itemContent": {"tweet_results": {"result": {
+                    "__typename": "TweetWithVisibilityResults",
+                    "tweet": {"legacy": legacy("200", "wrapped")}}}}}},
+            ]}]}}}}}}
+        with patch.object(tg, "_auth_headers", lambda: None), \
+             patch.object(tg, "_get_guest_token", lambda: "gt"), \
+             patch.object(tg, "get_user_id", lambda u: "123"), \
+             patch.object(tg, "_curl", lambda *a, **k: _json.dumps(synthetic)):
+            ids = [t["id"] for t in tg.fetch_tweets("dotey", limit=20)]
+        self.assertIn("100", ids)
+        self.assertIn("200", ids)
+
+
 if __name__ == "__main__":
     unittest.main()

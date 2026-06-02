@@ -316,12 +316,23 @@ def summarize_article(ai: "AIClassifier", username: str, entry: dict, markdown: 
 
 
 def markdown_to_telegram_html(text: str) -> str:
-    text = re.sub(r"```(?:\w+)?\n([\s\S]*?)```", lambda m: f"<pre>{html.escape(m.group(1).strip())}</pre>", text)
+    # Protect fenced code blocks: escape once and stash behind a placeholder so the
+    # per-line escaping below does not re-escape the <pre> tags into literal &lt;pre&gt;.
+    pre_blocks: list[str] = []
+
+    def _stash_pre(m: "re.Match") -> str:
+        pre_blocks.append(f"<pre>{html.escape(m.group(1).strip())}</pre>")
+        return f"\x00PRE{len(pre_blocks) - 1}\x00"
+
+    text = re.sub(r"```(?:\w+)?\n([\s\S]*?)```", _stash_pre, text)
     out = []
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line:
             out.append("")
+            continue
+        if re.fullmatch(r"\x00PRE\d+\x00", line):
+            out.append(line)
             continue
         line = re.sub(r"^#{1,6}\s+", "", line)
         bullet = re.match(r"^[-*]\s+(.+)$", line)
@@ -342,7 +353,35 @@ def markdown_to_telegram_html(text: str) -> str:
         escaped = re.sub(r"https?://\S+", "", escaped).strip()
         if escaped:
             out.append(prefix + escaped)
-    return "\n".join(out).strip()
+    result = "\n".join(out).strip()
+    for i, block in enumerate(pre_blocks):
+        result = result.replace(f"\x00PRE{i}\x00", block)
+    return result
+
+
+def _balance_html_chunks(chunks: list[str]) -> list[str]:
+    """Make each chunk valid standalone Telegram HTML: close inline tags left open
+    at a chunk boundary and reopen them at the start of the next chunk, so a split
+    never produces an unbalanced <b>/<i>/<code> that Telegram rejects with HTTP 400."""
+    inline = {"b", "strong", "i", "em", "u", "s", "code", "pre"}
+    carry: list[str] = []
+    balanced: list[str] = []
+    for chunk in chunks:
+        body = "".join(f"<{t}>" for t in carry) + chunk
+        stack: list[str] = []
+        for m in re.finditer(r"<(/?)([a-zA-Z]+)[^>]*>", body):
+            closing, name = m.group(1), m.group(2).lower()
+            if name not in inline:
+                continue
+            if closing:
+                if stack and stack[-1] == name:
+                    stack.pop()
+            else:
+                stack.append(name)
+        body += "".join(f"</{t}>" for t in reversed(stack))
+        balanced.append(body)
+        carry = stack
+    return balanced
 
 
 def split_telegram_html(text: str, limit: int = 3500) -> list[str]:
@@ -378,12 +417,17 @@ def split_telegram_html(text: str, limit: int = 3500) -> list[str]:
                     cut = line.rfind("，", 0, limit)
                 if cut < limit // 2:
                     cut = limit
+                # Never cut inside an HTML tag (would emit a broken "<b" fragment).
+                lt = line.rfind("<", 0, cut)
+                gt = line.rfind(">", 0, cut)
+                if lt > gt and lt > 0:
+                    cut = lt
                 parts.append(line[:cut].strip())
                 line = line[cut:].lstrip()
             current = line
     if current.strip():
         parts.append(current.strip())
-    return parts
+    return _balance_html_chunks(parts)
 
 
 def format_article_summary_messages(username: str, entry: dict, summary: str) -> list[str]:
@@ -1048,7 +1092,9 @@ def format_message(username: str, t: dict, ai: "AIClassifier | None" = None) -> 
     if note_text:
         preview = summarize_note_tweet(ai, username, note_text) if ai else None
         if preview:
-            body = f"TL;DR：{html.escape(preview)}"
+            # Do NOT escape here: format_message escapes `body` once below. Escaping
+            # twice turned "&"/"<" in the TL;DR into literal &amp;/&lt; in Telegram.
+            body = f"TL;DR：{preview}"
         else:
             body = short_preview(note_text)
     elif t.get("article"):
@@ -1150,7 +1196,10 @@ def process_user(
 
     tweets = fetch_tweets(pool, username, limit=args.limit)
     if not tweets:
-        print(f"  没拉到推文")
+        # Every data source returned an empty timeline — anomalous (auth break,
+        # query-id drift, or account issue). Emit a greppable WARN marker so this
+        # never stays silent the way a normal "0 new tweets" run does.
+        print(f"  ⚠️ WARN: @{username} 拉到 0 条推文（疑似数据源异常/认证失效）")
         return 0, 0, 0, 0
 
     seen, last_post_iso = load_seen(username)

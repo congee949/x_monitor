@@ -226,9 +226,26 @@ def fetch_tweets(username, limit=20):
 
     errors = data.get("errors")
     if errors:
-        # Retry once with fresh guest token on server errors
         error_msgs = [e.get("message", "") for e in errors]
-        if any("Internal server error" in m for m in error_msgs) and not use_auth:
+        # Cookie auth failed -> fall back to the free guest token before giving up,
+        # so we don't burn paid 6551.io credits and the cookie expiry stays visible.
+        if use_auth:
+            print(f"  [GraphQL] cookie 认证失效，降级 guest 模式: {error_msgs}")
+            if os.path.exists(GUEST_TOKEN_CACHE):
+                os.remove(GUEST_TOKEN_CACHE)
+            gt2 = _get_guest_token()
+            if not gt2:
+                raise RuntimeError("GraphQL auth failed and cannot get guest token: " + str(errors))
+            resp = _curl(url, _gql_headers(gt2), timeout=20)
+            try:
+                data = json.loads(resp)
+            except json.JSONDecodeError:
+                raise RuntimeError("GraphQL response not JSON (guest fallback): " + resp[:200])
+            errors = data.get("errors")
+            if errors:
+                raise RuntimeError("GraphQL errors (auth+guest fallback): " + str(errors))
+        # Guest mode hit a transient internal error -> retry once with a fresh token.
+        elif any("Internal server error" in m for m in error_msgs):
             if os.path.exists(GUEST_TOKEN_CACHE):
                 os.remove(GUEST_TOKEN_CACHE)
             gt2 = _get_guest_token()
@@ -237,9 +254,7 @@ def fetch_tweets(username, limit=20):
                 try:
                     data = json.loads(resp)
                     errors = data.get("errors")
-                    if not errors:
-                        pass  # Retry succeeded
-                    else:
+                    if errors:
                         raise RuntimeError("GraphQL errors (after retry): " + str(errors))
                 except json.JSONDecodeError:
                     raise RuntimeError("GraphQL response not JSON (after retry): " + resp[:200])
@@ -266,6 +281,11 @@ def fetch_tweets(username, limit=20):
                 .get("tweet_results", {})
                 .get("result", {})
             )
+            # Unwrap TweetWithVisibilityResults: the real tweet (and its legacy
+            # node) lives under ["tweet"]; otherwise these tweets are silently dropped.
+            if tweet_result.get("__typename") == "TweetWithVisibilityResults":
+                tweet_result = tweet_result.get("tweet", {})
+
             legacy = tweet_result.get("legacy")
             if not legacy:
                 continue

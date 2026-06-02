@@ -66,3 +66,32 @@ Fixed the three priority bugs flagged in the 2026-06-02 multi-agent eval. All we
 - `py_compile` clean on both files; no residual references to `clear_seen` / `INACTIVE_DAYS`.
 - Existing unittest suite: 11/11 pass.
 - Live `run.sh` end-to-end: normal run, token pool 5/5, GraphQL primary path working.
+
+---
+
+## 2026-06-03 — Medium/low-priority pass (CAT1–CAT4)
+
+Addressed the remaining eval items the user explicitly opted into.
+
+### CAT1 — Security + cleanup
+- `chmod 600` on `.auth_cookies.json`, `cc98_config.json`, `twitter_ai.json` (were 644; dir is 700 so low risk, done as defense-in-depth).
+- Removed dead `vista8_monitor.py` (git-tracked) and untracked clutter (`*.bak*`, `*.before-*`, `vista8_seen_ids.json`). `.gitignore` already excludes secrets/state/backups.
+
+### CAT2 — Cookie SPOF investigation (conclusion)
+- **Finding:** `.auth_cookies.json` is **manually maintained**. `twitter_graphql._save_auth_cookies()` exists but has **no caller anywhere** — it is a dead refresh hook, NOT an auto-refresh. There is no cron/timer/script that refreshes cookies; the only cron is the */30 monitor run. When `auth_token`/`ct0` expire, the cookie path fails.
+- **Mitigation (not a rewrite):** cookie expiry is no longer silent — see CAT4 guest fallback, which now prints `[GraphQL] cookie 认证失效，降级 guest 模式` (greppable) instead of quietly burning paid 6551.io credits.
+- Pre-existing dead `_save_auth_cookies` is intentionally **left in place** (flagged, not deleted) as the hook for a future Set-Cookie-capture auto-refresh. Proper auto-refresh (capturing rotated ct0 from response headers) is deferred.
+
+### CAT3 — Telegram formatting (ESC-1 / PRE-1 / SPLIT-1)
+- **ESC-1** (`format_message`): the TL;DR branch escaped `preview` and then `format_message` escaped `body` again → `&`/`<` became literal `&amp;`/`&lt;`. Removed the inner escape so the unified escape runs once.
+- **PRE-1** (`markdown_to_telegram_html`): fenced code was converted to `<pre>` first, then the per-line loop re-`html.escape`d it, turning the tags into literal `&lt;pre&gt;`. Now code fences are stashed behind a placeholder before line processing and restored after.
+- **SPLIT-1** (`split_telegram_html`): added `_balance_html_chunks` so an inline tag (`<b>/<i>/<code>/<pre>`) spanning a chunk boundary is closed and reopened, making every chunk valid standalone HTML; also guarded the char-level cut so it never lands inside a `<...>` tag.
+
+### CAT4 — Robustness
+- **GraphQL dropped tweets** (`twitter_graphql.fetch_tweets`): tweets wrapped in `TweetWithVisibilityResults` carry their `legacy` under `["tweet"]`; the old `tweet_result.get("legacy")` returned None and `continue`d, silently dropping them. Now unwraps the visibility wrapper before reading `legacy`.
+- **Guest fallback on auth failure**: when cookies are present but the authed call returns `errors`, the code previously raised → the wrapper fell back to paid 6551.io. Now it retries once with a free guest token first (and logs the degradation), only raising if guest also fails.
+- **Zero-tweet alert** (`process_user`): an empty timeline from all sources now prints a greppable `⚠️ WARN: @user 拉到 0 条推文` instead of the indistinguishable-from-normal silent `没拉到推文`.
+
+### Verification
+- `py_compile` clean (incl. tests). Full suite **15/15 pass** (11 existing + 4 new regression tests for ESC-1/PRE-1/SPLIT-1/visibility-unwrap).
+- Live `run.sh`: all 6 accounts via GraphQL primary path, token pool 5/5.
