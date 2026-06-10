@@ -87,6 +87,7 @@ class AccountIsolationTest(unittest.TestCase):
         processed = []
         config_path = Path("test_config.json")
         config_path.write_text('{"telegram_bot_token": "bot", "telegram_chat_id": "chat"}')
+        failures_path = Path("test_failures.json")
 
         def fake_process_user(pool, ai, username, bot_token, chat_id, args):
             processed.append(username)
@@ -96,14 +97,16 @@ class AccountIsolationTest(unittest.TestCase):
 
         try:
             with patch.object(twitter_monitor, "CONFIG_PATH", str(config_path)):
-                with patch.object(twitter_monitor.TokenPool, "load", return_value=None):
-                    with patch.object(twitter_monitor.AIClassifier, "load", return_value=FakeAI(False)):
-                        with patch.object(twitter_monitor, "load_accounts", return_value=[{"username": "ok1"}, {"username": "broken"}, {"username": "ok2"}]):
-                            with patch.object(twitter_monitor, "process_user", side_effect=fake_process_user):
-                                with patch.object(sys, "argv", ["twitter_monitor.py"]):
-                                    result = twitter_monitor.main()
+                with patch.object(twitter_monitor, "FAILURES_PATH", str(failures_path)):
+                    with patch.object(twitter_monitor.TokenPool, "load", return_value=None):
+                        with patch.object(twitter_monitor.AIClassifier, "load", return_value=FakeAI(False)):
+                            with patch.object(twitter_monitor, "load_accounts", return_value=[{"username": "ok1"}, {"username": "broken"}, {"username": "ok2"}]):
+                                with patch.object(twitter_monitor, "process_user", side_effect=fake_process_user):
+                                    with patch.object(sys, "argv", ["twitter_monitor.py"]):
+                                        result = twitter_monitor.main()
         finally:
             config_path.unlink(missing_ok=True)
+            failures_path.unlink(missing_ok=True)
 
         self.assertEqual(result, 0)
         self.assertEqual(processed, ["ok1", "broken", "ok2"])
@@ -242,6 +245,263 @@ class LatentFixRegressionTest(unittest.TestCase):
             ids = [t["id"] for t in tg.fetch_tweets("dotey", limit=20)]
         self.assertIn("100", ids)
         self.assertIn("200", ids)
+
+
+class ArticleQueuePruneTest(unittest.TestCase):
+    """_article_entry_expired：只清理超过保留期的 sent / 终态 failed 条目。"""
+
+    NOW = datetime(2026, 6, 10, 0, 0, 0, tzinfo=timezone.utc)
+
+    def test_old_sent_and_terminal_failed_expire(self):
+        old_sent = {"status": "sent", "updated_at": "2026-06-01T00:00:00+00:00"}
+        old_failed_terminal = {"status": "failed", "attempts": 3,
+                               "updated_at": "2026-06-01T00:00:00+00:00"}
+        self.assertTrue(twitter_monitor._article_entry_expired(old_sent, now=self.NOW))
+        self.assertTrue(twitter_monitor._article_entry_expired(old_failed_terminal, now=self.NOW))
+
+    def test_fresh_retryable_pending_and_unstamped_are_kept(self):
+        fresh_sent = {"status": "sent", "updated_at": "2026-06-08T00:00:00+00:00"}
+        old_failed_retryable = {"status": "failed", "attempts": 1,
+                                "updated_at": "2026-06-01T00:00:00+00:00"}
+        old_pending = {"status": "pending", "updated_at": "2026-06-01T00:00:00+00:00"}
+        sent_no_ts = {"status": "sent"}
+        self.assertFalse(twitter_monitor._article_entry_expired(fresh_sent, now=self.NOW))
+        self.assertFalse(twitter_monitor._article_entry_expired(old_failed_retryable, now=self.NOW))
+        self.assertFalse(twitter_monitor._article_entry_expired(old_pending, now=self.NOW))
+        self.assertFalse(twitter_monitor._article_entry_expired(sent_no_ts, now=self.NOW))
+
+
+class FailureAlertTest(unittest.TestCase):
+    """账号连续失败达到阈值只告警一次，成功后清零。"""
+
+    def test_alert_fires_once_at_threshold_and_resets_on_success(self):
+        sent = []
+
+        def fake_send_telegram(token, chat_id, text, link=""):
+            sent.append(text)
+            return {"ok": True}
+
+        failures = {}
+        with patch.object(twitter_monitor, "send_telegram", side_effect=fake_send_telegram):
+            for _ in range(twitter_monitor.FAIL_ALERT_THRESHOLD - 1):
+                twitter_monitor.note_account_failure(failures, "ghost", "Cannot find user", "bot", "chat")
+            self.assertEqual(sent, [])
+
+            twitter_monitor.note_account_failure(failures, "ghost", "Cannot find user", "bot", "chat")
+            self.assertEqual(len(sent), 1)
+            self.assertIn("@ghost", sent[0])
+            self.assertTrue(failures["ghost"]["alerted"])
+
+            twitter_monitor.note_account_failure(failures, "ghost", "Cannot find user", "bot", "chat")
+            self.assertEqual(len(sent), 1)  # 不重复告警
+
+        twitter_monitor.note_account_success(failures, "ghost")
+        self.assertNotIn("ghost", failures)
+
+    def test_dry_run_does_not_send_or_mark_alerted(self):
+        sent = []
+        failures = {"ghost": {"count": twitter_monitor.FAIL_ALERT_THRESHOLD - 1, "alerted": False}}
+        with patch.object(twitter_monitor, "send_telegram", side_effect=lambda *a, **k: sent.append(a) or {"ok": True}):
+            twitter_monitor.note_account_failure(failures, "ghost", "err", "bot", "chat", dry_run=True)
+        self.assertEqual(sent, [])
+        self.assertFalse(failures["ghost"].get("alerted"))
+
+
+class ArticleSeedGatingTest(unittest.TestCase):
+    """article 只对「新且非 seed」推文入队：seed/auto-seed 不灌历史，已 seen 不重复入队。"""
+
+    def _run(self, seed, seen, tweets):
+        calls = []
+        args = argparse.Namespace(test=False, seed=seed, dry_run=False,
+                                  limit=20, max_push_age_minutes=45)
+        with patch.object(twitter_monitor, "datetime", FixedDatetime), \
+             patch.object(twitter_monitor, "fetch_tweets", return_value=tweets), \
+             patch.object(twitter_monitor, "load_seen", return_value=(seen, None)), \
+             patch.object(twitter_monitor, "save_seen", return_value=None), \
+             patch.object(twitter_monitor, "save_article", side_effect=lambda u, a, t: calls.append(a)), \
+             patch.object(twitter_monitor, "send_telegram", return_value={"ok": True}), \
+             patch.object(twitter_monitor.time, "sleep", return_value=None):
+            twitter_monitor.process_user(pool=None, ai=FakeAI(False), username="dotey",
+                                         bot_token="bot", chat_id="chat", args=args)
+        return calls
+
+    ARTICLE_TWEET = {
+        "id": "art-tweet",
+        "text": "新文章发布了，欢迎阅读 https://x.com/i/article/777000111 全文链接",
+        "createdAt": "Tue May 12 00:20:00 +0000 2026",
+    }
+
+    def test_normal_new_tweet_enqueues_article(self):
+        calls = self._run(seed=False, seen={"some-old-id"}, tweets=[self.ARTICLE_TWEET])
+        self.assertEqual(calls, ["777000111"])
+
+    def test_seed_and_auto_seed_do_not_enqueue(self):
+        self.assertEqual(self._run(seed=True, seen=set(), tweets=[self.ARTICLE_TWEET]), [])
+        self.assertEqual(self._run(seed=False, seen=set(), tweets=[self.ARTICLE_TWEET]), [])
+
+    def test_already_seen_tweet_does_not_reenqueue(self):
+        calls = self._run(seed=False, seen={"art-tweet", "other"}, tweets=[self.ARTICLE_TWEET])
+        self.assertEqual(calls, [])
+
+
+class RetweetArticleTest(unittest.TestCase):
+    """RT 的 article 必须按原推（原作者 status URL）入队抓取，否则抓到空 {}。"""
+
+    # 模拟归一化之后的 RT 推文（article 取自原推、retweeted_status 已展开）
+    RT_TWEET = {
+        "id": "2062952690750021934",
+        "text": "RT @liuren: https://t.co/oa1PZY0g9C",
+        "entities": {"urls": [{"expanded_url": "http://x.com/i/article/2062806260563771392"}]},
+        "article": {"title": "测试文章", "preview_text": "预览", "rest_id": "2062806260563771392"},
+        "retweeted_status": {"id": "2062808278812520765", "screen_name": "liuren"},
+    }
+
+    def test_normalizer_unwraps_rt_article(self):
+        import json as _json
+        import twitter_graphql as tg
+        rt_original = {
+            "__typename": "Tweet",
+            "legacy": {"id_str": "2062808278812520765", "full_text": "原推正文"},
+            "core": {"user_results": {"result": {"legacy": {"screen_name": "liuren"}}}},
+            "article": {"article_results": {"result": {
+                "title": "测试文章", "preview_text": "预览", "rest_id": "2062806260563771392"}}},
+        }
+        synthetic = {"data": {"user": {"result": {"timeline_v2": {"timeline": {"instructions": [
+            {"entries": [
+                {"content": {"itemContent": {"tweet_results": {"result": {
+                    "__typename": "Tweet",
+                    "legacy": {"id_str": "2062952690750021934",
+                               "full_text": "RT @liuren: https://t.co/x",
+                               "created_at": "Fri Jun 05 17:30:00 +0000 2026",
+                               "retweeted_status_result": {"result": rt_original}}}}}}},
+            ]}]}}}}}}
+        with patch.object(tg, "_auth_headers", lambda: None), \
+             patch.object(tg, "_get_guest_token", lambda: "gt"), \
+             patch.object(tg, "get_user_id", lambda u: "123"), \
+             patch.object(tg, "_curl", lambda *a, **k: _json.dumps(synthetic)):
+            tweets = tg.fetch_tweets("dotey", limit=20)
+        self.assertEqual(len(tweets), 1)
+        self.assertEqual(tweets[0]["article"]["title"], "测试文章")  # 取到原推 article
+        self.assertEqual(tweets[0]["retweeted_status"],
+                         {"id": "2062808278812520765", "screen_name": "liuren"})
+
+    def test_save_article_enqueues_original_tweet(self):
+        import json as _json
+        import os as _os
+        import tempfile
+        with tempfile.TemporaryDirectory() as d, \
+             patch.object(twitter_monitor, "ARTICLE_QUEUE_DIR", d):
+            twitter_monitor.save_article("dotey", "2062806260563771392", self.RT_TWEET)
+            with open(_os.path.join(d, "dotey_queue.json")) as f:
+                entry = _json.load(f)[0]
+        self.assertEqual(entry["tweet_id"], "2062808278812520765")  # 原推，不是转推壳
+        self.assertEqual(entry["author"], "liuren")
+        self.assertEqual(entry["article_title"], "测试文章")
+        self.assertEqual(twitter_monitor.article_fetch_url("dotey", entry),
+                         "https://x.com/liuren/status/2062808278812520765")
+
+    def test_legacy_entry_without_author_falls_back_to_username(self):
+        entry = {"article_id": "111", "tweet_id": "222"}  # 部署前的旧队列条目
+        self.assertEqual(twitter_monitor.article_fetch_url("dotey", entry),
+                         "https://x.com/dotey/status/222")
+
+    def test_fetch_article_markdown_passes_original_status_url(self):
+        import types
+        entry = {"article_id": "2062806260563771392",
+                 "tweet_id": "2062808278812520765", "author": "liuren"}
+        captured = {}
+
+        def fake_run(cmd, **kw):
+            captured["cmd"] = cmd
+            return types.SimpleNamespace(returncode=0, stdout="# t\n" + "x" * 300, stderr="")
+
+        with patch.object(twitter_monitor, "load_article_markdown_cmd",
+                          return_value="/usr/local/bin/x-article-to-markdown"), \
+             patch.object(twitter_monitor.subprocess, "run", side_effect=fake_run):
+            md, err = twitter_monitor.fetch_article_markdown("dotey", entry)
+        self.assertIsNone(err)
+        self.assertEqual(captured["cmd"][-1], "https://x.com/liuren/status/2062808278812520765")
+
+
+class UserIdCacheTest(unittest.TestCase):
+    """user rest_id 持久缓存：miss 写回 / hit 免解析 / 失效自愈 / 损坏容错。"""
+
+    def setUp(self):
+        import tempfile
+        import twitter_graphql as tg
+        self.tg = tg
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.cache_path = Path(self._tmpdir.name) / ".user_id_cache.json"
+        self._patcher = patch.object(tg, "USER_ID_CACHE", str(self.cache_path))
+        self._patcher.start()
+        self.addCleanup(self._patcher.stop)
+        self.addCleanup(self._tmpdir.cleanup)
+
+    def _read_cache(self):
+        import json as _json
+        return _json.loads(self.cache_path.read_text()) if self.cache_path.exists() else {}
+
+    def test_miss_resolves_then_writes_back_atomically(self):
+        import json as _json
+        resp = _json.dumps({"data": {"user": {"result": {"rest_id": "424242"}}}})
+        calls = []
+        with patch.object(self.tg, "_auth_headers", lambda: {"Authorization": "x"}), \
+             patch.object(self.tg, "_curl", lambda *a, **k: calls.append(1) or resp):
+            self.assertEqual(self.tg.get_user_id("NewUser"), "424242")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self._read_cache(), {"newuser": "424242"})  # 键小写
+        self.assertFalse(Path(str(self.cache_path) + ".tmp").exists())  # 原子写无残留
+
+    def test_hit_skips_resolution_network_call(self):
+        self.cache_path.write_text('{"dotey": "123"}')
+        with patch.object(self.tg, "_curl", side_effect=AssertionError("cache hit 不应发请求")):
+            self.assertEqual(self.tg.get_user_id("dotey"), "123")
+            self.assertEqual(self.tg.get_user_id("DoTey"), "123")  # 大小写不敏感
+
+    def test_failed_resolution_never_cached(self):
+        import json as _json
+        miss = _json.dumps({"data": {"user": {}}})  # Cannot find user
+        with patch.object(self.tg, "_auth_headers", lambda: {"Authorization": "x"}), \
+             patch.object(self.tg, "_get_guest_token", lambda: "gt"), \
+             patch.object(self.tg, "_curl", lambda *a, **k: miss):
+            self.assertIsNone(self.tg.get_user_id("deleted_user"))
+        self.assertEqual(self._read_cache(), {})  # 空值绝不入缓存
+
+    def test_invalidate_removes_entry(self):
+        self.cache_path.write_text('{"dotey": "123", "vista8": "456"}')
+        self.tg.invalidate_user_id("DoTey")
+        self.assertEqual(self._read_cache(), {"vista8": "456"})
+        self.tg.invalidate_user_id("never_cached")  # 不存在的键不报错
+
+    def test_corrupted_cache_falls_back_to_resolution(self):
+        import json as _json
+        self.cache_path.write_text("{broken json!!!")
+        resp = _json.dumps({"data": {"user": {"result": {"rest_id": "777"}}}})
+        with patch.object(self.tg, "_auth_headers", lambda: {"Authorization": "x"}), \
+             patch.object(self.tg, "_curl", lambda *a, **k: resp):
+            self.assertEqual(self.tg.get_user_id("dotey"), "777")  # 不抛异常
+        self.assertEqual(self._read_cache(), {"dotey": "777"})  # 损坏文件被修复
+
+    def test_fetch_tweets_suspended_error_invalidates_cache(self):
+        import json as _json
+        self.cache_path.write_text('{"gone_user": "999"}')
+        err = _json.dumps({"errors": [{"message": "Authorization: User has been suspended. (63)"}]})
+        with patch.object(self.tg, "_auth_headers", lambda: None), \
+             patch.object(self.tg, "_get_guest_token", lambda: "gt"), \
+             patch.object(self.tg, "_curl", lambda *a, **k: err):
+            with self.assertRaises(RuntimeError):  # 对外仍按原行为抛错
+                self.tg.fetch_tweets("gone_user", limit=5)
+        self.assertEqual(self._read_cache(), {})  # 下一轮自动重新解析
+
+    def test_fetch_tweets_empty_user_node_invalidates_but_returns_empty(self):
+        import json as _json
+        self.cache_path.write_text('{"ghost": "888"}')
+        empty = _json.dumps({"data": {"user": {}}})
+        with patch.object(self.tg, "_auth_headers", lambda: None), \
+             patch.object(self.tg, "_get_guest_token", lambda: "gt"), \
+             patch.object(self.tg, "_curl", lambda *a, **k: empty):
+            self.assertEqual(self.tg.fetch_tweets("ghost", limit=5), [])  # 行为不变
+        self.assertEqual(self._read_cache(), {})
 
 
 if __name__ == "__main__":

@@ -74,6 +74,9 @@ def _atomic_write(path: str, data: str) -> None:
 ARTICLE_QUEUE_DIR = os.path.join(SCRIPT_DIR, "twitter_articles")
 ARTICLE_CACHE_DIR = os.path.join(ARTICLE_QUEUE_DIR, "cache")
 ARTICLE_MAX_ATTEMPTS = 3
+ARTICLE_RETENTION_DAYS = 7  # sent/终态 failed 条目保留天数，到期从队列清除（防无限累积）
+FAILURES_PATH = os.path.join(SCRIPT_DIR, ".account_failures.json")
+FAIL_ALERT_THRESHOLD = 4  # 账号连续失败轮数达到阈值（*/30 cron ≈ 2 小时）发一次 TG 告警
 ARTICLE_MARKDOWN_CMD = os.environ.get("X_ARTICLE_MARKDOWN_CMD", "").strip()
 ARTICLE_URL_RE = re.compile(
     r"https?://(?:x\.com|twitter\.com)/(?:i/article|([a-zA-Z0-9_]+)/articles)/(\d+)",
@@ -121,9 +124,13 @@ def save_article(username: str, article_id: str, tweet: dict) -> None:
     note = tweet.get("note_tweet") or {}
     note_text = note.get("text", "").strip()
     article_data = tweet.get("article") or {}
+    # RT 时记原推 id + 原作者：抓取必须走原作者 status URL（壳 URL 无 article
+    # 节点，工具会退化到按 article_id 直查的空 {} 路径 → empty_article_body）
+    rt = tweet.get("retweeted_status") or {}
     entry = {
         "article_id": article_id,
-        "tweet_id": tweet.get("id"),
+        "tweet_id": rt.get("id") or tweet.get("id"),
+        "author": rt.get("screen_name") or username,
         "detected_at": datetime.now(timezone.utc).isoformat(),
         "tweet_text": (tweet.get("text") or "")[:200],
         "note_tweet_text": note_text,
@@ -181,7 +188,9 @@ def article_url(article_id: str) -> str:
 def article_fetch_url(username: str, entry: dict) -> str:
     tweet_id = entry.get("tweet_id")
     if tweet_id:
-        return f"https://x.com/{username}/status/{tweet_id}"
+        # RT 条目带 author（原作者）；旧条目无该键时回退监控账号名
+        author = entry.get("author") or username
+        return f"https://x.com/{author}/status/{tweet_id}"
     return article_url(entry["article_id"])
 
 
@@ -999,6 +1008,53 @@ def save_seen(username: str, seen: set[str], last_post_ts: str | None = None) ->
                                    ensure_ascii=False, indent=2))
 
 
+def load_account_failures() -> dict:
+    """读取账号连续失败状态 {username: {count, alerted, last_error, last_failed_at}}。"""
+    try:
+        with open(FAILURES_PATH) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_account_failures(failures: dict) -> None:
+    _atomic_write(FAILURES_PATH, json.dumps(failures, ensure_ascii=False, indent=2))
+
+
+def note_account_failure(failures: dict, username: str, error: str,
+                         bot_token: str, chat_id: str, dry_run: bool = False) -> None:
+    """记一次账号级失败；连续达到 FAIL_ALERT_THRESHOLD 轮只发一次 TG 告警。
+
+    背景：aborninblood 曾静默失败 54 轮无人知晓（TokenExhausted 只进 stderr）。
+    恢复成功由 note_account_success 清零，下次再连续失败会重新告警。
+    """
+    rec = failures.get(username) or {"count": 0, "alerted": False}
+    rec["count"] = int(rec.get("count", 0)) + 1
+    rec["last_error"] = str(error)[:300]
+    rec["last_failed_at"] = datetime.now(timezone.utc).isoformat()
+    if rec["count"] >= FAIL_ALERT_THRESHOLD and not rec.get("alerted"):
+        text = (f"⚠️ <b>X 监控告警</b>：@{username} 已连续 {rec['count']} 轮拉取失败\n"
+                f"最近错误：{html.escape(rec['last_error'])}")
+        if dry_run:
+            print(f"  DRY RUN 失败告警: @{username} 连续 {rec['count']} 轮")
+        else:
+            try:
+                r = send_telegram(bot_token, chat_id, text)
+                print(f"  失败告警推送 {'OK' if r.get('ok') else 'FAIL'}: @{username}")
+                if r.get("ok"):
+                    rec["alerted"] = True
+            except Exception as e:
+                print(f"  失败告警推送异常: {e}")
+    failures[username] = rec
+
+
+def note_account_success(failures: dict, username: str) -> None:
+    """账号本轮成功，清除失败计数（连续性归零）。"""
+    if username in failures:
+        del failures[username]
+
+
 def parse_tweet_datetime(t: dict) -> datetime | None:
     ts_str = t.get("createdAt") or t.get("created_at") or ""
     if not ts_str:
@@ -1221,11 +1277,6 @@ def process_user(
         status, reason = classify(t)
         text = (t.get("text") or "").strip()
 
-        # Article detection (zero API cost - checks already-fetched tweet data)
-        article_id = detect_article(t)
-        if article_id:
-            save_article(username, article_id, t)
-
         if status == "suspicious" and ai.is_available():
             is_promo, ai_reason = ai.confirm_promo(username, text)
             if is_promo:
@@ -1250,6 +1301,12 @@ def process_user(
             new_ids.add(tid)
             if auto_seed or args.seed:
                 continue
+            # Article detection（零 API 成本）。只对「新且非 seed」的推文入队：
+            # 放在 seen 判断之前会让 seed/新账号首轮灌入历史文章，且已 seen 推文
+            # 会把被 7 天清理删掉的 sent 条目重新入队造成重复推送。
+            article_id = detect_article(t)
+            if article_id:
+                save_article(username, article_id, t)
             if not is_within_push_window(t, args.max_push_age_minutes):
                 print(f"    skip stale: {tid}")
                 continue
@@ -1325,6 +1382,27 @@ def process_user(
 # ── 主流程 ──────────────────────────────────────────
 
 
+def _article_entry_expired(entry: dict, now: datetime | None = None) -> bool:
+    """sent / 终态 failed（attempts 用尽）条目超过保留期后从队列清除。
+
+    没有可解析时间戳的条目一律保留（宁可不删）。
+    """
+    status = entry.get("status")
+    terminal = status == "sent" or (
+        status == "failed" and int(entry.get("attempts", 0)) >= ARTICLE_MAX_ATTEMPTS)
+    if not terminal:
+        return False
+    ts_str = entry.get("updated_at") or entry.get("sent_at") or entry.get("detected_at") or ""
+    try:
+        ts = datetime.fromisoformat(ts_str)
+    except (ValueError, TypeError):
+        return False
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    now = now or datetime.now(timezone.utc)
+    return (now - ts) > timedelta(days=ARTICLE_RETENTION_DAYS)
+
+
 def process_article_queue(ai: AIClassifier, bot_token: str, chat_id: str, dry_run: bool = False) -> int:
     """处理 Article 队列：抓 Markdown、AI 摘要、推送，成功后删除缓存。"""
     if not os.path.exists(ARTICLE_QUEUE_DIR):
@@ -1343,12 +1421,19 @@ def process_article_queue(ai: AIClassifier, bot_token: str, chat_id: str, dry_ru
             print(f"  article queue load failed: {queue_path}: {e}")
             continue
 
+        username = fname.replace("_queue.json", "")
+        before = len(queue)
+        queue = [a for a in queue if not _article_entry_expired(a)]
+        changed = len(queue) != before
+        if changed:
+            print(f"  @{username}: 清理 {before - len(queue)} 条过期文章记录")
+
         candidates = [a for a in queue if a.get("status") in ("pending", "failed", "fetched") and a.get("attempts", 0) < ARTICLE_MAX_ATTEMPTS]
         if not candidates:
+            if changed and not dry_run:
+                _atomic_write(queue_path, json.dumps(queue, ensure_ascii=False, indent=2))
             continue
-        username = fname.replace("_queue.json", "")
         print(f"  @{username}: {len(candidates)} article jobs")
-        changed = False
 
         for entry in candidates:
             aid = entry["article_id"]
@@ -1466,6 +1551,10 @@ def main() -> int:
             print("上一轮 monitor 仍在运行，跳过本次", file=sys.stderr)
             return 0
 
+    # 每轮起止时间戳：日志此前无任何时间标记，无法事后审计运行时长/定位轮次
+    run_started = time.monotonic()
+    print(f"\n==== monitor run {datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S %z')} ====")
+
     with open(CONFIG_PATH) as f:
         cfg = json.load(f)
     bot_token = args.bot_token or cfg["telegram_bot_token"]
@@ -1499,6 +1588,7 @@ def main() -> int:
     total_push = 0
     total_filter = 0
     total_ai_override = 0
+    failures = load_account_failures()
 
     for account in accounts:
         username = account["username"]
@@ -1509,10 +1599,13 @@ def main() -> int:
             )
         except TokenExhausted as e:
             print(f"  @{username}: {e}", file=sys.stderr)
+            note_account_failure(failures, username, str(e), bot_token, chat_id, args.dry_run)
             continue
         except Exception as e:
             print(f"  @{username} failed: {e}", file=sys.stderr)
+            note_account_failure(failures, username, str(e), bot_token, chat_id, args.dry_run)
             continue
+        note_account_success(failures, username)
         total_new += new
         total_push += pushed
         total_filter += filtered
@@ -1529,6 +1622,9 @@ def main() -> int:
         print(f"  Article queue error: {e}")
     if pool is not None:
         print(f"  token 池：{pool.available_count}/{len(pool._tokens)} 可用")
+    if not args.dry_run:
+        save_account_failures(failures)
+    print(f"  耗时 {time.monotonic() - run_started:.1f}s")
     return 0
 
 

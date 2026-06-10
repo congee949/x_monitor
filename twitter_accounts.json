@@ -22,5 +22,17 @@
   {
     "username": "trq212",
     "enabled": true
+  },
+  {
+    "username": "8BTCNews",
+    "enabled": true
+  },
+  {
+    "username": "aborninblood",
+    "enabled": false
+  },
+  {
+    "username": "dontbesilent",
+    "enabled": true
   }
 ]

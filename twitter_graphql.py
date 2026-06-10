@@ -15,6 +15,7 @@ from urllib.parse import quote
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 GUEST_TOKEN_CACHE = os.path.join(SCRIPT_DIR, ".guest_token_cache.json")
 AUTH_COOKIE_CACHE = os.path.join(SCRIPT_DIR, ".auth_cookies.json")
+USER_ID_CACHE = os.path.join(SCRIPT_DIR, ".user_id_cache.json")
 
 # Twitter web app bearer token (public, embedded in JS)
 BEARER = "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs=1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA"
@@ -92,6 +93,46 @@ def _save_auth_cookies(auth_token, ct0):
         json.dump({"auth_token": auth_token, "ct0": ct0}, f)
 
 
+def _load_user_id_cache():
+    """Load the screen_name(lower) -> rest_id cache.
+
+    An unreadable/corrupted cache file is treated as an empty cache so the
+    cache layer can never break the caller.
+    """
+    if os.path.exists(USER_ID_CACHE):
+        try:
+            with open(USER_ID_CACHE) as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+    return {}
+
+
+def _save_user_id_cache(cache):
+    """Save the user id cache atomically (tmp file + os.replace).
+
+    A crash mid-write can never leave half-written JSON behind; write
+    failures are non-fatal (next run simply re-resolves).
+    """
+    try:
+        tmp = USER_ID_CACHE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(cache, f)
+        os.replace(tmp, USER_ID_CACHE)
+    except Exception:
+        pass
+
+
+def invalidate_user_id(screen_name):
+    """Drop the cached rest_id for screen_name so the next run re-resolves it
+    via UserByScreenName (used when the cached id turns out to be stale)."""
+    cache = _load_user_id_cache()
+    if cache.pop(screen_name.lower(), None) is not None:
+        _save_user_id_cache(cache)
+
+
 def _gql_headers(guest_token):
     return {
         "Authorization": f"Bearer {BEARER}",
@@ -116,7 +157,17 @@ def _auth_headers():
 
 
 def get_user_id(screen_name):
-    """Get user ID by screen name."""
+    """Get user ID by screen name, with persistent local cache.
+
+    rest_id never changes for a given account, so resolving each screen name
+    once and caching it on disk skips the UserByScreenName call on every
+    later run (halves the GraphQL calls of the 30-min monitor loop).
+    """
+    cache = _load_user_id_cache()
+    uid = cache.get(screen_name.lower())
+    if uid:
+        return uid
+
     # Try authenticated first
     ah = _auth_headers()
     # Build variables unconditionally: the guest fallback (ah == {}) must not hit a
@@ -139,6 +190,8 @@ def get_user_id(screen_name):
         data = json.loads(resp)
         uid = data.get("data", {}).get("user", {}).get("result", {}).get("rest_id")
         if uid:
+            cache[screen_name.lower()] = uid
+            _save_user_id_cache(cache)
             return uid
     except Exception:
         pass
@@ -150,9 +203,14 @@ def get_user_id(screen_name):
     resp = _curl(url, _gql_headers(gt))
     try:
         data = json.loads(resp)
-        return data.get("data", {}).get("user", {}).get("result", {}).get("rest_id")
+        uid = data.get("data", {}).get("user", {}).get("result", {}).get("rest_id")
     except Exception:
         return None
+    # Only cache successful resolutions; never write None/empty into the cache.
+    if uid:
+        cache[screen_name.lower()] = uid
+        _save_user_id_cache(cache)
+    return uid
 
 
 def fetch_tweets(username, limit=20):
@@ -227,6 +285,12 @@ def fetch_tweets(username, limit=20):
     errors = data.get("errors")
     if errors:
         error_msgs = [e.get("message", "") for e in errors]
+        # Errors saying the account is gone mean the cached rest_id is stale:
+        # invalidate it so the next run re-resolves the screen name (self-heals
+        # within one 30-min cycle; a false positive only costs one extra lookup).
+        joined_msgs = " ".join(error_msgs).lower()
+        if any(kw in joined_msgs for kw in ("suspended", "not found", "deactivated", "unavailable")):
+            invalidate_user_id(username)
         # Cookie auth failed -> fall back to the free guest token before giving up,
         # so we don't burn paid 6551.io credits and the cookie expiry stays visible.
         if use_auth:
@@ -263,6 +327,12 @@ def fetch_tweets(username, limit=20):
         else:
             raise RuntimeError("GraphQL errors: " + str(errors))
 
+    # No errors but an empty user node: typical signature of a deleted account
+    # when fetching by a (possibly cached) rest_id. Invalidate the cache so the
+    # next run re-resolves the screen name; this run still returns [] as before.
+    if not data.get("data", {}).get("user", {}).get("result"):
+        invalidate_user_id(username)
+
     instructions = (
         data.get("data", {})
         .get("user", {})
@@ -293,13 +363,18 @@ def fetch_tweets(username, limit=20):
             tid = legacy.get("id_str", "")
             text = legacy.get("full_text", "")
 
+            # RT: article 节点挂在内层原推上，转推壳本体没有
+            rt_result = (legacy.get("retweeted_status_result") or {}).get("result") or {}
+            if rt_result.get("__typename") == "TweetWithVisibilityResults":
+                rt_result = rt_result.get("tweet") or {}
+
             # Extract note_tweet (longform)
             note_data = tweet_result.get("note_tweet", {})
             note_results = note_data.get("note_tweet_results", {}).get("result", {})
             note_text = note_results.get("text", "")
 
-            # Extract article (Twitter Article format)
-            article_data = tweet_result.get("article", {})
+            # Extract article (Twitter Article format)；转推时读原推的 article
+            article_data = (rt_result or tweet_result).get("article", {})
             article_result = article_data.get("article_results", {}).get("result", {})
             article_title = article_result.get("title", "")
             article_preview = article_result.get("preview_text", "")
@@ -331,6 +406,15 @@ def fetch_tweets(username, limit=20):
                     "preview_text": article_preview,
                     "rest_id": article_rest_id,
                 }
+
+            if rt_result:
+                rt_legacy = rt_result.get("legacy") or {}
+                rt_user = ((rt_result.get("core") or {}).get("user_results") or {}).get("result") or {}
+                rt_screen = ((rt_user.get("legacy") or {}).get("screen_name")
+                             or (rt_user.get("core") or {}).get("screen_name") or "")
+                if rt_legacy.get("id_str"):
+                    normalized["retweeted_status"] = {"id": rt_legacy["id_str"],
+                                                      "screen_name": rt_screen}
 
             tweets.append(normalized)
 

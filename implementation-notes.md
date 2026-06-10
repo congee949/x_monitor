@@ -95,3 +95,27 @@ Addressed the remaining eval items the user explicitly opted into.
 ### Verification
 - `py_compile` clean (incl. tests). Full suite **15/15 pass** (11 existing + 4 new regression tests for ESC-1/PRE-1/SPLIT-1/visibility-unwrap).
 - Live `run.sh`: all 6 accounts via GraphQL primary path, token pool 5/5.
+
+---
+
+## 2026-06-10 — 调度优化 + 新账号（本轮）
+
+### Design Decisions
+- **告警阈值** `FAIL_ALERT_THRESHOLD = 4`（*/30 cron ≈ 2 小时）：单轮抖动不告警；阈值时只发一次 TG（`alerted` 标记），恢复由 `note_account_success` 删除条目实现清零。不发「已恢复」通知（保持最小面）。
+- **队列保留期** `ARTICLE_RETENTION_DAYS = 7`：只清 `sent` 与终态 `failed`（attempts 用尽）；无可解析时间戳的条目宁可保留。
+- **dry-run 语义**：失败计数不落盘、告警不发送也不标记 `alerted`，与队列「dry-run 不写」保持一致。
+- **cron 间隔保持 */30**：加密到 */15 是时效 vs X 风控暴露的取舍，留给用户拍板，本轮不动。
+
+### Deviations
+- **article 检测从分类后无条件执行移入「新且非 seed」分支**（评估清单外的必要配套）：原位置会 (a) 新账号首轮 seed 时把历史推文的 article 全部入队灌 TG；(b) 与新增的 7 天队列清理组成「清理 sent → 已 seen 推文重检测 → 重新入队 → 重复推送」循环。副作用：`--test` 模式不再顺带入队 article（原行为是入队），视为可接受。
+- **aborninblood 禁用而非删除**：fxtwitter 404；memory.lol 改名史与 Wayback 快照均为零 → 判定录入时即错，保留条目（enabled:false）便于回溯原始出处后改正。
+
+### Open Questions
+- aborninblood 的正确 handle 需要从当初的录入来源回溯，网络侧无候选。
+- 8BTCNews 确认存在但全站仅 1 条推文（空号），保留监控（无害，每轮 2 次 GraphQL 调用），是否换成真正想监控的账号待用户确认。
+
+### 本轮后半（agents 产出集成）
+- **rest_id 持久缓存**（twitter_graphql.py，agent 实现）：`.user_id_cache.json`，命中免 UserByScreenName（768→384 次/天）；失效双触发（suspended/not found 类错误 + 空 user 节点），30 分钟自愈不本轮重试（重试需改公开签名或重建请求，不干净；失败已有 fallback+WARN 可见性）。
+- **RT article 修复**（根因 agent 本地复现验证）：壳 URL → 工具退化到按 article_id 直查 → 两端空 `{}` → 116 字节残片 → 判 empty_article_body。修复：归一化解包 `legacy.retweeted_status_result`（article 取原推 + 暴露 retweeted_status），save_article 记原推 id + author，article_fetch_url 走原作者 status URL（与 10 条 sent 成功样本同构）。旧条目无 author 回退 username 不破坏。
+- **已知未修**（预存，仅标记）：article_fetch_url 无 tweet_id 的 `/i/article/<id>` 回退分支仍是脆弱路径；get_user_id 缓存 miss 且无 cookie 文件时 `_curl(url, None)` 的 AttributeError 隐患（生产有 cookie 不触发，缓存命中后跳过该路径）。
+- 存量修复：dotey 队列 3 条 failed 改原推 id/author 重置 pending 重试（liuren/xiaohu/dongxi_nlp）。

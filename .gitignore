@@ -20,3 +20,5 @@ __pycache__/
 
 # single-run lock
 .monitor.lock
+.user_id_cache.json
+.account_failures.json
