@@ -97,7 +97,8 @@ class AccountIsolationTest(unittest.TestCase):
 
         try:
             with patch.object(twitter_monitor, "CONFIG_PATH", str(config_path)):
-                with patch.object(twitter_monitor, "FAILURES_PATH", str(failures_path)):
+                with patch.object(twitter_monitor, "FAILURES_PATH", str(failures_path)), \
+                     patch.object(twitter_monitor, "update_status_dashboard", return_value=None):
                     with patch.object(twitter_monitor.TokenPool, "load", return_value=None):
                         with patch.object(twitter_monitor.AIClassifier, "load", return_value=FakeAI(False)):
                             with patch.object(twitter_monitor, "load_accounts", return_value=[{"username": "ok1"}, {"username": "broken"}, {"username": "ok2"}]):
@@ -634,6 +635,33 @@ class RichPushTest(unittest.TestCase):
         self.assertNotIn("<tg-collage>", md)
 
 
+class PushCountTest(unittest.TestCase):
+    """推送计数 = 实际送达：失败的发送不计入（防重试双计/故障期虚高）。"""
+
+    def test_failed_send_not_counted_as_pushed(self):
+        tweets = [{"id": "t1", "text": "这是一条长度足够通过分类过滤器的正常推文内容编号一",
+                   "createdAt": "Tue May 12 00:20:00 +0000 2026"},
+                  {"id": "t2", "text": "这是一条长度足够通过分类过滤器的正常推文内容编号二",
+                   "createdAt": "Tue May 12 00:21:00 +0000 2026"}]
+        args = argparse.Namespace(test=False, seed=False, dry_run=False,
+                                  limit=20, max_push_age_minutes=45)
+
+        def flaky_send(token, chat_id, text, link=""):
+            return {"ok": "t2" not in text and "t2" not in link}
+
+        with patch.object(twitter_monitor, "datetime", FixedDatetime), \
+             patch.object(twitter_monitor, "fetch_tweets", return_value=tweets), \
+             patch.object(twitter_monitor, "load_seen", return_value=({"old"}, None)), \
+             patch.object(twitter_monitor, "save_seen", return_value=None), \
+             patch.object(twitter_monitor, "send_telegram", side_effect=flaky_send), \
+             patch.object(twitter_monitor.time, "sleep", return_value=None):
+            new, pushed, _f, _a = twitter_monitor.process_user(
+                pool=None, ai=FakeAI(False), username="u",
+                bot_token="b", chat_id="c", args=args)
+        self.assertEqual(new, 2)
+        self.assertEqual(pushed, 1)  # t2 发送失败，不计入送达
+
+
 class AuthorTldrTest(unittest.TestCase):
     """长推 TL;DR：原文自带优先于 AI 总结；全文折叠进 expandable blockquote。"""
 
@@ -659,6 +687,129 @@ class AuthorTldrTest(unittest.TestCase):
             "dotey", {"id": "10", "note_tweet": {"text": "\U0001f40d" * 2500}}, None)
         self.assertIn("<blockquote expandable>", msg)
         self.assertLess(len(msg.encode("utf-16-le")) // 2, 4096)
+
+
+class DashboardTest(unittest.TestCase):
+    """置顶状态看板：首轮创建+置顶，后续原地编辑，编辑失败重建，跨日清零。"""
+
+    def _run(self, state=None, edit_ok=True, send_mid=777,
+             pushed=2, articles=1, failures=None):
+        import json as _json
+        import tempfile
+        quiet = []
+
+        def fake_quiet(token, payload, method):
+            quiet.append((method, payload))
+            if method == "editMessageText":
+                return {"ok": edit_ok}
+            if method == "sendMessage":
+                return {"ok": True, "result": {"message_id": send_mid}}
+            return {"ok": True}
+
+        with tempfile.TemporaryDirectory() as d:
+            path = f"{d}/.dashboard.json"
+            if state is not None:
+                with open(path, "w") as f:
+                    _json.dump(state, f)
+            with patch.object(twitter_monitor, "DASHBOARD_PATH", path), \
+                 patch.object(twitter_monitor, "_tg_post_quiet", side_effect=fake_quiet):
+                twitter_monitor.update_status_dashboard(
+                    "bot", "chat", [{"username": "a"}, {"username": "b"}],
+                    failures or {}, pushed=pushed, articles=articles, elapsed=16.0)
+            with open(path) as f:
+                saved = _json.load(f)
+        return quiet, saved
+
+    def test_first_run_creates_pins_and_saves_state(self):
+        quiet, saved = self._run()
+        methods = [m for m, p in quiet]
+        self.assertEqual(methods, ["sendMessage", "pinChatMessage"])
+        send_payload = quiet[0][1]
+        self.assertTrue(send_payload["disable_notification"])  # 创建静默
+        self.assertIn("X 监控状态", send_payload["text"])
+        self.assertIn("账号 2/2 正常", send_payload["text"])
+        self.assertEqual(saved["message_id"], 777)
+        self.assertEqual(saved["tweets_today"], 2)
+
+    def test_subsequent_run_edits_in_place_and_accumulates(self):
+        from datetime import datetime, timezone, timedelta
+        today = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+        quiet, saved = self._run(
+            state={"message_id": 5, "date": today, "tweets_today": 10, "articles_today": 3})
+        self.assertEqual([m for m, p in quiet], ["editMessageText"])
+        self.assertEqual(quiet[0][1]["message_id"], 5)
+        self.assertIn("今日 12 条", quiet[0][1]["text"])  # 10 + 2 累计
+        self.assertEqual(saved["tweets_today"], 12)
+        self.assertEqual(saved["message_id"], 5)
+
+    def test_edit_failure_recreates_unpins_and_deletes_old(self):
+        from datetime import datetime, timezone, timedelta
+        today = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+        quiet, saved = self._run(
+            state={"message_id": 5, "date": today, "tweets_today": 0, "articles_today": 0},
+            edit_ok=False, send_mid=9)
+        methods = [m for m, p in quiet]
+        self.assertEqual(methods, ["editMessageText", "sendMessage", "pinChatMessage",
+                                   "unpinChatMessage", "deleteMessage"])
+        self.assertEqual(saved["message_id"], 9)
+
+    def test_date_rollover_resets_counters(self):
+        quiet, saved = self._run(
+            state={"message_id": 5, "date": "2020-01-01",
+                   "tweets_today": 99, "articles_today": 99})
+        self.assertEqual(saved["tweets_today"], 2)   # 只算本轮
+        self.assertEqual(saved["articles_today"], 1)
+
+    def test_failures_listed_in_dashboard(self):
+        quiet, _ = self._run(failures={"a": {"count": 5, "last_error": "Cannot find user"}})
+        text = quiet[0][1]["text"]
+        self.assertIn("账号 1/2 正常", text)
+        self.assertIn("@a 连续 5 轮失败", text)
+
+    def test_ghost_failure_records_excluded(self):
+        # 已不在配置中的账号（被移除/禁用）的失败记录不得污染看板
+        quiet, _ = self._run(failures={"ghost": {"count": 5, "last_error": "x"}})
+        text = quiet[0][1]["text"]
+        self.assertIn("账号 2/2 正常", text)
+        self.assertNotIn("ghost", text)
+
+    def test_dirty_counter_state_self_heals(self):
+        from datetime import datetime, timezone, timedelta
+        today = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+        quiet, saved = self._run(
+            state={"message_id": 5, "date": today,
+                   "tweets_today": "garbage", "articles_today": None})
+        self.assertEqual(saved["tweets_today"], 2)  # 脏值重置后只计本轮
+        self.assertEqual([m for m, p in quiet], ["editMessageText"])
+
+    def test_not_modified_edit_does_not_rebuild(self):
+        import io
+        import urllib.error
+        from datetime import datetime, timezone, timedelta
+        today = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+        calls = []
+
+        def fake_post(token, payload, method="sendMessage"):
+            calls.append(method)
+            raise urllib.error.HTTPError(
+                "url", 400, "Bad Request", {},
+                io.BytesIO(b'{"ok":false,"description":"Bad Request: message is not modified"}'))
+
+        import json as _json
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            path = f"{d}/.dashboard.json"
+            with open(path, "w") as f:
+                _json.dump({"message_id": 5, "date": today,
+                            "tweets_today": 0, "articles_today": 0}, f)
+            with patch.object(twitter_monitor, "DASHBOARD_PATH", path), \
+                 patch.object(twitter_monitor, "_tg_post", side_effect=fake_post):
+                twitter_monitor.update_status_dashboard(
+                    "bot", "chat", [{"username": "a"}], {}, 0, 0, 16.0)
+            with open(path) as f:
+                saved = _json.load(f)
+        self.assertEqual(calls, ["editMessageText"])  # 没有触发删旧重建链
+        self.assertEqual(saved["message_id"], 5)
 
 
 class AlertClosureTest(unittest.TestCase):

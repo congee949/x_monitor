@@ -159,3 +159,14 @@ Addressed the remaining eval items the user explicitly opted into.
 
 ### Open Questions
 - 状态看板（pinned dashboard）用户询问含义后未拍板，未实施。
+
+### 追加（用户拍板）：置顶状态看板
+- `update_status_dashboard()`：`.dashboard.json` 存 message_id + 当日计数（北京时间日界清零）；每轮 editMessageText 原地更新（不触发通知），失败自动重建（静默新发+置顶+清理旧消息）。
+- 只在完整 cron 轮更新（dry_run/test/seed/--user 手动运行不碰），避免子集运行污染计数。
+- 计数语义：tweets_today 累计各轮 total_push；articles_today 累计 process_article_queue 的 processed（含失败尝试，标签写「文章任务」不写「文章」以保持诚实）。
+
+### 看板对抗审查修复（4 条）
+- 幽灵失败记录：main 完整轮修剪不在配置中的 failures 键（--user 子集轮不修剪防误删）+ 看板侧与配置账号求交集双保险。审查发现本地测试污染产生的 "broken" 活体证据。
+- 推送计数改为实际送达：process_user 返回 len(to_push)-len(push_failed)；文章 processed 只计 sent/summarized——故障期重试不再双计、看板不虚高。
+- _tg_post_quiet 把 "message is not modified" 视为成功，杜绝同内容编辑触发删旧重建链。
+- main 的看板调用包 try/except + 计数字段类型自愈（脏状态文件不再让 cron 尾部整轮崩）。

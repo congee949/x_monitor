@@ -77,6 +77,7 @@ ARTICLE_MAX_ATTEMPTS = 3
 ARTICLE_RETENTION_DAYS = 7  # sent/终态 failed 条目保留天数，到期从队列清除（防无限累积）
 RICH_MESSAGE_MAX_CHARS = 30000  # Rich message 上限 32768，留余量；超出回退旧分块路径
 FAILURES_PATH = os.path.join(SCRIPT_DIR, ".account_failures.json")
+DASHBOARD_PATH = os.path.join(SCRIPT_DIR, ".dashboard.json")
 FAIL_ALERT_THRESHOLD = 4  # 账号连续失败轮数达到阈值（*/30 cron ≈ 2 小时）发一次 TG 告警
 ARTICLE_MARKDOWN_CMD = os.environ.get("X_ARTICLE_MARKDOWN_CMD", "").strip()
 ARTICLE_URL_RE = re.compile(
@@ -1109,6 +1110,76 @@ def note_account_failure(failures: dict, username: str, error: str,
     failures[username] = rec
 
 
+def update_status_dashboard(bot_token: str, chat_id: str, accounts: list[dict],
+                            failures: dict, pushed: int, articles: int,
+                            elapsed: float) -> None:
+    """置顶状态看板：一条置顶消息每轮原地编辑（编辑不触发通知，零打扰）。
+
+    message_id 与当日计数存 .dashboard.json；编辑失败（消息被删等）自动
+    重建：新发 + 置顶 + 取消旧置顶并删除旧消息。全程 best-effort。
+    """
+    try:
+        with open(DASHBOARD_PATH) as f:
+            state = json.load(f)
+        if not isinstance(state, dict):
+            state = {}
+    except Exception:
+        state = {}
+
+    now_cn = datetime.now(timezone(timedelta(hours=8)))  # 北京时间（无夏令时）
+    today = now_cn.strftime("%Y-%m-%d")
+    if state.get("date") != today:
+        state["date"] = today
+        state["tweets_today"] = 0
+        state["articles_today"] = 0
+    for k in ("tweets_today", "articles_today"):
+        if not isinstance(state.get(k), int):  # 脏状态自愈，不让看板崩整轮
+            state[k] = 0
+    state["tweets_today"] += pushed
+    state["articles_today"] += articles
+
+    # 只统计仍在配置中的账号：被移除/禁用账号的幽灵失败记录不污染看板
+    known = {a.get("username") for a in accounts}
+    bad = {u: r for u, r in failures.items()
+           if u in known and int(r.get("count", 0)) > 0}
+    lines = [
+        "📊 <b>X 监控状态</b>",
+        f"🕒 上轮 {now_cn.strftime('%m-%d %H:%M')}（北京时间）· {elapsed:.0f}s",
+        f"📤 本轮推送 {pushed} · 今日 {state['tweets_today']} 条 · 文章任务 {state['articles_today']}",
+        f"👀 账号 {len(accounts) - len(bad)}/{len(accounts)} 正常",
+    ]
+    for u, r in sorted(bad.items()):
+        lines.append(f"⚠️ @{u} 连续 {r.get('count')} 轮失败："
+                     f"{html.escape(str(r.get('last_error', ''))[:60])}")
+    text = "\n".join(lines)
+
+    mid = state.get("message_id")
+    if mid:
+        r = _tg_post_quiet(bot_token, {"chat_id": chat_id, "message_id": mid,
+                                       "text": text, "parse_mode": "HTML"},
+                           "editMessageText")
+        if r.get("ok"):
+            _atomic_write(DASHBOARD_PATH, json.dumps(state, ensure_ascii=False, indent=2))
+            return
+        print("  看板编辑失败，重建")
+    r = _tg_post_quiet(bot_token, {"chat_id": chat_id, "text": text,
+                                   "parse_mode": "HTML",
+                                   "disable_notification": True,
+                                   "link_preview_options": {"is_disabled": True}},
+                       "sendMessage")
+    new_mid = (r.get("result") or {}).get("message_id") if r.get("ok") else None
+    if new_mid:
+        _tg_post_quiet(bot_token, {"chat_id": chat_id, "message_id": new_mid},
+                       "pinChatMessage")
+        if mid:
+            _tg_post_quiet(bot_token, {"chat_id": chat_id, "message_id": mid},
+                           "unpinChatMessage")
+            _tg_post_quiet(bot_token, {"chat_id": chat_id, "message_id": mid},
+                           "deleteMessage")
+        state["message_id"] = new_mid
+    _atomic_write(DASHBOARD_PATH, json.dumps(state, ensure_ascii=False, indent=2))
+
+
 def note_account_success(failures: dict, username: str,
                          bot_token: str = "", chat_id: str = "",
                          dry_run: bool = False) -> None:
@@ -1271,9 +1342,21 @@ def _tg_post(token: str, payload: dict, method: str = "sendMessage") -> dict:
 
 
 def _tg_post_quiet(token: str, payload: dict, method: str) -> dict:
-    """编辑/置顶类锦上添花调用：失败只打日志，绝不打断本轮监控。"""
+    """编辑/置顶类锦上添花调用：失败只打日志，绝不打断本轮监控。
+
+    "message is not modified" 视为成功：内容没变不该触发看板的删旧重建。
+    """
     try:
         return _tg_post(token, payload, method=method)
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode("utf-8", "replace")
+        except Exception:
+            body = ""
+        if "message is not modified" in body:
+            return {"ok": True, "not_modified": True}
+        print(f"  {method} 失败（忽略）: {e} {body[:120]}")
+        return {"ok": False}
     except Exception as e:
         print(f"  {method} 失败（忽略）: {e}")
         return {"ok": False}
@@ -1540,7 +1623,8 @@ def process_user(
     save_seen(username, seen, latest_ts)
     print(f"  已记录 seen_ids 共 {len(seen)} 条")
 
-    return len(new_ids), len(to_push), len(filtered), ai_overridden
+    # 推送计数 = 实际送达（尝试数会让失败重试双重计入、故障期看板虚高）
+    return len(new_ids), len(to_push) - len(push_failed), len(filtered), ai_overridden
 
 
 # ── 主流程 ──────────────────────────────────────────
@@ -1730,7 +1814,8 @@ def process_article_queue(ai: AIClassifier, bot_token: str, chat_id: str, dry_ru
                     entry["last_error"] = str(e)[:500]
                     print(f"    Article summary push error: {e}")
             entry["updated_at"] = datetime.now(timezone.utc).isoformat()
-            processed += 1
+            if entry["status"] in ("sent", "summarized"):  # 只计送达，不计失败尝试
+                processed += 1
 
         if changed and not dry_run:
             _atomic_write(queue_path, json.dumps(queue, ensure_ascii=False, indent=2))
@@ -1799,6 +1884,12 @@ def main() -> int:
     total_filter = 0
     total_ai_override = 0
     failures = load_account_failures()
+    if not args.user:
+        # 完整轮才修剪：--user 子集运行下修剪会误删其他账号的失败状态
+        known = {a["username"] for a in accounts}
+        for stale in [u for u in failures if u not in known]:
+            print(f"  清理幽灵失败记录: @{stale}（已不在配置中）")
+            del failures[stale]
 
     for account in accounts:
         username = account["username"]
@@ -1824,6 +1915,7 @@ def main() -> int:
     print(f"\n{'='*40}")
     print(f"  汇总：新推 {total_new} | 推送 {total_push} | 过滤 {total_filter} | AI 否决 {total_ai_override}")
     # Process article queue (auto, uses GraphQL note_tweet — free)
+    article_count = 0
     try:
         article_count = process_article_queue(ai, bot_token, chat_id, args.dry_run)
         if article_count:
@@ -1834,6 +1926,14 @@ def main() -> int:
         print(f"  token 池：{pool.available_count}/{len(pool._tokens)} 可用")
     if not args.dry_run:
         save_account_failures(failures)
+    # 状态看板只在完整 cron 轮更新（seed/test/单账号手动运行不算）
+    if not (args.dry_run or args.test or args.seed or args.user):
+        try:
+            update_status_dashboard(bot_token, chat_id, accounts, failures,
+                                    pushed=total_push, articles=article_count,
+                                    elapsed=time.monotonic() - run_started)
+        except Exception as e:
+            print(f"  看板更新失败（忽略）: {e}")
     print(f"  耗时 {time.monotonic() - run_started:.1f}s")
     return 0
 

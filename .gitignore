@@ -22,3 +22,4 @@ __pycache__/
 .monitor.lock
 .user_id_cache.json
 .account_failures.json
+.dashboard.json
