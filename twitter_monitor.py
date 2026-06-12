@@ -461,11 +461,27 @@ def format_article_summary_messages(username: str, entry: dict, summary: str) ->
     return [f"<b>X Article 摘要 {idx}/{total}</b>\n\n{chunk}" for idx, chunk in enumerate(chunks, 1)]
 
 
-def format_article_summary_rich(username: str, entry: dict, summary: str) -> str:
+def _fold_summary_details(summary: str) -> str:
+    """### 分节的摘要只露「结论 + 首节」，其余折叠进 details（点开展开）。
+
+    只在 rich 路径调用；400 回退时用原始 summary 走旧分块渲染，互不污染。
+    """
+    parts = re.split(r"(?m)^(?=### )", summary)
+    if len(parts) <= 2:  # 没有或只有一个分节，不折叠
+        return summary
+    visible = (parts[0] + parts[1]).rstrip()
+    rest = "".join(parts[2:]).strip()
+    return (f"{visible}\n\n<details><summary>展开论证与细节</summary>\n\n"
+            f"{rest}\n\n</details>")
+
+
+def format_article_summary_rich(username: str, entry: dict, summary: str,
+                                image_urls: list[str] | None = None) -> str:
     """组装 Rich Markdown 摘要（sendRichMessage 用）：克制的头部 + AI 摘要原文。
 
     AI 输出本来就是 Markdown，rich 模式原生渲染标题/列表/引用块，
     不再经过 markdown_to_telegram_html 转换和 3500 字符分块。
+    image_urls：文章配图外链（Telegram 服务端拉取），多图拼 tg-collage。
     """
     title = (entry.get("article_title") or "").strip() or "X Article"
     # 标题来自 X 原文不可控：压掉换行，转义会被 rich markdown 解析的特殊字符
@@ -474,7 +490,16 @@ def format_article_summary_rich(username: str, entry: dict, summary: str) -> str
     link = article_url(entry["article_id"])
     header = (f"## \U0001f4c4 {title}\n"
               f"**@{username}** · [原文]({link})\n\n---\n\n")
-    return header + summary.strip()
+    body = _fold_summary_details(summary.strip())
+    collage = ""
+    if image_urls:
+        urls = image_urls[:4]
+        if len(urls) == 1:
+            collage = f"\n\n![]({urls[0]})"
+        else:
+            blocks = "\n".join(f"![]({u})" for u in urls)
+            collage = f"\n\n<tg-collage>\n\n{blocks}\n\n</tg-collage>"
+    return header + body + collage
 
 
 def format_article_summary_message(username: str, entry: dict, summary: str) -> tuple[str, str]:
@@ -1073,15 +1098,34 @@ def note_account_failure(failures: dict, username: str, error: str,
                 print(f"  失败告警推送 {'OK' if r.get('ok') else 'FAIL'}: @{username}")
                 if r.get("ok"):
                     rec["alerted"] = True
+                    mid = (r.get("result") or {}).get("message_id")
+                    if mid:
+                        # 故障期间置顶常驻可见（私聊置顶天然静默），恢复时取消
+                        rec["alert_msg_id"] = mid
+                        _tg_post_quiet(bot_token, {"chat_id": chat_id, "message_id": mid},
+                                       "pinChatMessage")
             except Exception as e:
                 print(f"  失败告警推送异常: {e}")
     failures[username] = rec
 
 
-def note_account_success(failures: dict, username: str) -> None:
-    """账号本轮成功，清除失败计数（连续性归零）。"""
-    if username in failures:
-        del failures[username]
+def note_account_success(failures: dict, username: str,
+                         bot_token: str = "", chat_id: str = "",
+                         dry_run: bool = False) -> None:
+    """账号本轮成功，清除失败计数；曾告警过的把原告警原地改成已恢复并取消置顶。"""
+    rec = failures.pop(username, None)
+    if not rec or not rec.get("alerted") or dry_run:
+        return
+    mid = rec.get("alert_msg_id")
+    if not (mid and bot_token):
+        return
+    text = (f"✅ <b>已恢复</b>：@{username} 拉取恢复正常\n"
+            f"此前连续 {rec.get('count', '?')} 轮失败："
+            f"{html.escape(str(rec.get('last_error', ''))[:200])}")
+    _tg_post_quiet(bot_token, {"chat_id": chat_id, "message_id": mid,
+                               "text": text, "parse_mode": "HTML"}, "editMessageText")
+    _tg_post_quiet(bot_token, {"chat_id": chat_id, "message_id": mid}, "unpinChatMessage")
+    print(f"  告警闭环: @{username} 已恢复，原告警已更新并取消置顶")
 
 
 def parse_tweet_datetime(t: dict) -> datetime | None:
@@ -1148,6 +1192,17 @@ def is_bad_tldr(summary: str, source_text: str) -> bool:
     return False
 
 
+def extract_author_tldr(text: str) -> str | None:
+    """原文自带 TL;DR 行则直接采用（有就用原文的，没有再 AI 总结）。"""
+    m = re.search(r"(?:^|\n)\s*(?:TL;?DR|太长不看)\s*[:：]\s*(.+)", text, re.IGNORECASE)
+    if not m:
+        return None
+    line = collapse_text(m.group(1).strip())
+    if len(line) < 10:
+        return None
+    return short_preview(line, TLDR_PREVIEW_LIMIT)
+
+
 def summarize_note_tweet(ai: "AIClassifier", username: str, note_text: str) -> str | None:
     if not ai.is_available():
         return None
@@ -1174,14 +1229,24 @@ def format_message(username: str, t: dict, ai: "AIClassifier | None" = None) -> 
     hidden = f'<a href="{link}">​</a>' if link else ""
     note = t.get("note_tweet") or {}
     note_text = note.get("text", "").strip()
+    folded_full = ""
     if note_text:
-        preview = summarize_note_tweet(ai, username, note_text) if ai else None
+        # TL;DR 优先级：原文自带 > AI 总结 > 短预览
+        preview = extract_author_tldr(note_text)
+        if not preview and ai:
+            preview = summarize_note_tweet(ai, username, note_text)
         if preview:
             # Do NOT escape here: format_message escapes `body` once below. Escaping
             # twice turned "&"/"<" in the TL;DR into literal &amp;/&lt; in Telegram.
             body = f"TL;DR：{preview}"
         else:
             body = short_preview(note_text)
+        # 长推全文折叠在 expandable blockquote 里：列表只占几行，点开看全文
+        folded_full = note_text if len(note_text) <= 2800 else note_text[:2800] + "…"
+        # Telegram 按 UTF-16 计长（astral 表情每个 2 单位）：表情密集长推按字符
+        # 截断仍可能超 4096 → HTML 与 plain 降级双双 400 → 推文静默丢失。按单位收缩。
+        while len(folded_full.encode("utf-16-le")) // 2 > 3000 and len(folded_full) > 100:
+            folded_full = folded_full[: int(len(folded_full) * 0.9)] + "…"
     elif t.get("article"):
         body = article_preview_text(t)
     else:
@@ -1190,6 +1255,8 @@ def format_message(username: str, t: dict, ai: "AIClassifier | None" = None) -> 
         text = f'📢 @{username}{hidden}\n\n{html.escape(body)}'
     else:
         text = f'📢 @{username}{hidden}'
+    if folded_full:
+        text += f"\n\n<blockquote expandable>{html.escape(folded_full)}</blockquote>"
     return text, link
 
 
@@ -1201,6 +1268,15 @@ def _tg_post(token: str, payload: dict, method: str = "sendMessage") -> dict:
     )
     with urllib.request.urlopen(req, timeout=15) as r:
         return json.loads(r.read().decode("utf-8"))
+
+
+def _tg_post_quiet(token: str, payload: dict, method: str) -> dict:
+    """编辑/置顶类锦上添花调用：失败只打日志，绝不打断本轮监控。"""
+    try:
+        return _tg_post(token, payload, method=method)
+    except Exception as e:
+        print(f"  {method} 失败（忽略）: {e}")
+        return {"ok": False}
 
 
 def _html_to_plain(text: str) -> str:
@@ -1543,6 +1619,9 @@ def process_article_queue(ai: AIClassifier, bot_token: str, chat_id: str, dry_ru
                     try:
                         r = send_telegram(bot_token, chat_id, msg, link)
                         print(f"    Failure notice push {'OK' if r.get('ok') else 'FAIL'}")
+                        _mid = (r.get("result") or {}).get("message_id")
+                        if _mid:
+                            entry["failure_msg_id"] = _mid  # 重试成功后原地改写闭环
                         time.sleep(1.2)
                     except Exception as e:
                         print(f"    failure notice push error: {e}")
@@ -1567,6 +1646,9 @@ def process_article_queue(ai: AIClassifier, bot_token: str, chat_id: str, dry_ru
                     try:
                         r = send_telegram(bot_token, chat_id, msg, link)
                         print(f"    Failure notice push {'OK' if r.get('ok') else 'FAIL'}")
+                        _mid = (r.get("result") or {}).get("message_id")
+                        if _mid:
+                            entry["failure_msg_id"] = _mid  # 重试成功后原地改写闭环
                         time.sleep(1.2)
                     except Exception as e:
                         print(f"    failure notice push error: {e}")
@@ -1575,7 +1657,8 @@ def process_article_queue(ai: AIClassifier, bot_token: str, chat_id: str, dry_ru
             entry["summary_backend"] = backend
             entry["summary_at"] = datetime.now(timezone.utc).isoformat()
             messages = format_article_summary_messages(username, entry, summary)
-            rich_md = format_article_summary_rich(username, entry, summary)
+            img_urls = extract_article_image_urls(markdown)
+            rich_md = format_article_summary_rich(username, entry, summary, image_urls=img_urls)
             if dry_run:
                 print(f"    DRY RUN rich markdown {len(rich_md)} chars; fallback parts: {len(messages)}")
                 for idx, part in enumerate(messages, 1):
@@ -1592,6 +1675,15 @@ def process_article_queue(ai: AIClassifier, bot_token: str, chat_id: str, dry_ru
                         r = send_telegram_rich(bot_token, chat_id, rich_md, article_link)
                         last_resp = r
                         ok = r.get("ok", False)
+                        if not ok and img_urls and r.get("rich_fallback"):
+                            # 配图外链可能是被拒原因：去图重试一次 rich，再不行才回退分块
+                            print(f"    rich 带图被拒({str(r.get('description', ''))[:60]})，去图重试")
+                            r = send_telegram_rich(
+                                bot_token, chat_id,
+                                format_article_summary_rich(username, entry, summary),
+                                article_link)
+                            last_resp = r
+                            ok = r.get("ok", False)
                         if ok:
                             print("    Article summary rich push OK")
                             time.sleep(1.2)
@@ -1616,6 +1708,18 @@ def process_article_queue(ai: AIClassifier, bot_token: str, chat_id: str, dry_ru
                         entry["status"] = "sent"
                         entry["sent_at"] = datetime.now(timezone.utc).isoformat()
                         delete_article_cache(entry)
+                        _fmid = entry.pop("failure_msg_id", None)
+                        if _fmid:
+                            # 把此前的失败通知原地改写，不留悬空故障消息。
+                            # editMessageText 不传 reply_markup 会移除原按钮，显式带上。
+                            _tg_post_quiet(bot_token, {
+                                "chat_id": chat_id, "message_id": _fmid,
+                                "text": (f"✅ <b>X Article 重试成功</b>：@{html.escape(username)} "
+                                         f"摘要已推送（此前失败 {max(int(entry.get('attempts', 1)) - 1, 1)} 次）"),
+                                "parse_mode": "HTML",
+                                "reply_markup": {"inline_keyboard": [[
+                                    {"text": "\U0001f517 打开原文", "url": article_link}]]},
+                            }, "editMessageText")
                     else:
                         entry["status"] = "failed"
                         entry["failed_stage"] = "telegram_send"
@@ -1711,7 +1815,7 @@ def main() -> int:
             print(f"  @{username} failed: {e}", file=sys.stderr)
             note_account_failure(failures, username, str(e), bot_token, chat_id, args.dry_run)
             continue
-        note_account_success(failures, username)
+        note_account_success(failures, username, bot_token, chat_id, args.dry_run)
         total_new += new
         total_push += pushed
         total_filter += filtered

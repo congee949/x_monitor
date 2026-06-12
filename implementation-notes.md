@@ -143,3 +143,19 @@ Addressed the remaining eval items the user explicitly opted into.
 ### Verification
 - 3-agent 对抗验证（API 合规对照文档原文 / 回归审查 / 18 项边界探针）全 PASS，6 条 minor 加固全部落地。
 - 测试 39→42 全过（Mac 3.14 + 服务器 3.9）；生产 bot 实发 sendRichMessage ok:true（msg 3364，已删）。
+
+---
+
+## 2026-06-12 第三轮 — 拼图/折叠/TLDR/消息闭环（用户拍板清单）
+
+### Design Decisions
+- **TL;DR 优先级**：原文自带（`TL;DR|TLDR|太长不看` 行，≥10 字符）> AI 总结 > 短预览；作者写的不过 is_bad_tldr 质量门（信任作者）。
+- **长推全文折叠**：`<blockquote expandable>`（老 HTML 路径原生支持，已核实文档），全文截 2800 字符防 4096 超限；仅 note_tweet 分支，普通推文/article 推文不变。
+- **配图两级回退**：rich带图 → 被拒去图重 rich → 再败回退分块。理由：图片外链失效不应让整条摘要降级成纯文本。单图用裸 `![](url)`，多图 `<tg-collage>`，沿用 limit=4。
+- **告警闭环**：alert_msg_id 存进 .account_failures.json；恢复时原告警改写成 ✅ 已恢复（含原 count/last_error 摘要）+ unpin。编辑/置顶全部走 `_tg_post_quiet`（best-effort，绝不打断监控）。
+- **失败通知闭环**：failure_msg_id 存队列 entry；3 次失败发 3 条通知只闭环最后一条（前两条悬空，接受——为闭环全部通知需存数组，不值）。
+- **④推文预览修复实为误报**：核实 send_telegram 已有 `url` 钉死 + prefer_large_media，未改动。
+- **告警明细折叠未做**：告警本体只有两行，折叠无意义（item 3 的告警部分裁剪）。
+
+### Open Questions
+- 状态看板（pinned dashboard）用户询问含义后未拍板，未实施。

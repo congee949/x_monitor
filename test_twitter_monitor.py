@@ -160,7 +160,12 @@ class MessageFormattingTest(unittest.TestCase):
         )
         self.assertEqual(link, "https://x.com/dotey/status/2")
         self.assertIn("TL;DR：Stack Overflow 社区提问减少", msg)
-        self.assertLess(len(msg), 300)
+        # 新行为：可见部分仍短，全文折叠在 expandable blockquote 里
+        visible = msg.split("<blockquote expandable>")[0]
+        self.assertLess(len(visible), 300)
+        self.assertIn("<blockquote expandable>", msg)
+        self.assertTrue(msg.rstrip().endswith("</blockquote>"))
+        self.assertLess(len(msg), 4000)  # Telegram 单条上限内
 
     def test_format_message_falls_back_to_short_preview_when_tldr_unavailable(self):
         long_text = "Agent 应用和传统 App + AI 的最大差别，在于执行的主体不同。" * 20
@@ -171,7 +176,9 @@ class MessageFormattingTest(unittest.TestCase):
         )
         self.assertNotIn("TL;DR", msg)
         self.assertIn("Agent 应用和传统 App", msg)
-        self.assertLess(len(msg), 260)
+        visible = msg.split("<blockquote expandable>")[0]
+        self.assertLess(len(visible), 260)
+        self.assertIn("<blockquote expandable>", msg)
 
     def test_format_message_falls_back_when_tldr_quality_is_bad(self):
         long_text = "Stack Overflow 因为大家都用 AI 导致发帖量下降，但公司靠企业知识库和数据授权收入增长。" * 20
@@ -182,7 +189,9 @@ class MessageFormattingTest(unittest.TestCase):
         )
         self.assertNotIn("TL;DR", msg)
         self.assertIn("Stack Overflow 因为大家都用 AI", msg)
-        self.assertLess(len(msg), 260)
+        visible = msg.split("<blockquote expandable>")[0]
+        self.assertLess(len(visible), 260)
+        self.assertIn("<blockquote expandable>", msg)
 
     def test_format_message_article_keeps_short_article_hint(self):
         msg, link = twitter_monitor.format_message(
@@ -486,40 +495,53 @@ class RichPushTest(unittest.TestCase):
         out2 = twitter_monitor.markdown_to_telegram_html("段一\n> \n段二")
         self.assertEqual(out2, "段一\n\n段二")  # 引用空续行保留段落分隔
 
-    def _run_queue(self, rich_response, summary="> 结论\n\n### 节\n正文"):
+    def _run_queue(self, rich_response, summary="> 结论\n\n### 节\n正文",
+                   markdown=None, fetch_err=None, entry_extra=None):
         import json as _json
         import os as _os
         import tempfile
-        calls = {"rich": 0, "legacy": 0}
+        calls = {"rich": 0, "legacy": 0, "rich_mds": [], "quiet": []}
+        responses = rich_response if isinstance(rich_response, list) else [rich_response]
 
-        def fake_rich(token, chat_id, markdown, link=""):
+        def fake_rich(token, chat_id, markdown_, link=""):
             calls["rich"] += 1
-            calls["rich_md"] = markdown
-            return rich_response
+            calls["rich_mds"].append(markdown_)
+            return responses[min(calls["rich"] - 1, len(responses) - 1)]
 
         def fake_legacy(token, chat_id, text, link=""):
             calls["legacy"] += 1
+            return {"ok": True, "result": {"message_id": 999}}
+
+        def fake_quiet(token, payload, method):
+            calls["quiet"].append((method, payload))
             return {"ok": True}
 
+        base = {"article_id": "777", "tweet_id": "1", "author": "u",
+                "article_title": "T", "status": "pending", "attempts": 0,
+                "content": None}
+        if entry_extra:
+            base.update(entry_extra)
+        md = markdown if markdown is not None else ("# 全文\n" + "x" * 300)
+        fetch_ret = (None, fetch_err) if fetch_err else (md, None)
         with tempfile.TemporaryDirectory() as d:
             cache_dir = _os.path.join(d, "cache")
             qpath = _os.path.join(d, "u_queue.json")
             with open(qpath, "w") as f:
-                _json.dump([{"article_id": "777", "tweet_id": "1", "author": "u",
-                             "article_title": "T", "status": "pending", "attempts": 0,
-                             "content": None}], f)
+                _json.dump([base], f)
             with patch.object(twitter_monitor, "ARTICLE_QUEUE_DIR", d), \
                  patch.object(twitter_monitor, "ARTICLE_CACHE_DIR", cache_dir), \
                  patch.object(twitter_monitor, "fetch_article_markdown",
-                              return_value=("# 全文\n" + "x" * 300, None)), \
+                              return_value=fetch_ret), \
                  patch.object(twitter_monitor, "summarize_article",
                               return_value=(summary, "mimo")), \
                  patch.object(twitter_monitor, "send_telegram_rich", side_effect=fake_rich), \
                  patch.object(twitter_monitor, "send_telegram", side_effect=fake_legacy), \
+                 patch.object(twitter_monitor, "_tg_post_quiet", side_effect=fake_quiet), \
                  patch.object(twitter_monitor.time, "sleep", return_value=None):
                 twitter_monitor.process_article_queue(FakeAI(True), "bot", "chat")
             with open(qpath) as f:
                 entry = _json.load(f)[0]
+        calls["rich_md"] = calls["rich_mds"][0] if calls["rich_mds"] else ""
         return calls, entry
 
     def test_queue_rich_success_skips_legacy(self):
@@ -550,6 +572,132 @@ class RichPushTest(unittest.TestCase):
         self.assertEqual(calls["legacy"], 0)
         self.assertEqual(entry["status"], "failed")
         self.assertIn("empty_rendered_summary", entry["last_error"])
+
+    IMG_MD = ("# 全文\n" + "x" * 300 +
+              "\n![](https://pbs.twimg.com/media/a.jpg)\n![](https://pbs.twimg.com/media/b.jpg)\n")
+
+    def test_queue_collage_appended_from_article_images(self):
+        calls, entry = self._run_queue({"ok": True}, markdown=self.IMG_MD)
+        self.assertEqual(entry["status"], "sent")
+        self.assertIn("<tg-collage>", calls["rich_mds"][0])
+        self.assertIn("![](https://pbs.twimg.com/media/a.jpg)", calls["rich_mds"][0])
+
+    def test_queue_image_rejection_retries_rich_without_images(self):
+        # 两级回退：带图 rich 被拒 → 去图 rich 成功 → 不落到 legacy
+        calls, entry = self._run_queue(
+            [{"ok": False, "rich_fallback": True, "error_code": 400, "description": "img bad"},
+             {"ok": True}],
+            markdown=self.IMG_MD)
+        self.assertEqual(calls["rich"], 2)
+        self.assertIn("<tg-collage>", calls["rich_mds"][0])
+        self.assertNotIn("<tg-collage>", calls["rich_mds"][1])
+        self.assertEqual(calls["legacy"], 0)
+        self.assertEqual(entry["status"], "sent")
+
+    def test_queue_failure_notice_closed_on_success(self):
+        # 此前失败留下的通知，在重试成功后被原地改写并清除 id
+        calls, entry = self._run_queue({"ok": True}, entry_extra={"failure_msg_id": 888})
+        methods = [m for m, p in calls["quiet"]]
+        self.assertIn("editMessageText", methods)
+        edit_payload = [p for m, p in calls["quiet"] if m == "editMessageText"][0]
+        self.assertEqual(edit_payload["message_id"], 888)
+        self.assertIn("重试成功", edit_payload["text"])
+        # 改写必须显式回传按钮（不传 reply_markup = Telegram 移除原键盘）
+        self.assertEqual(
+            edit_payload["reply_markup"]["inline_keyboard"][0][0]["url"],
+            "https://x.com/i/article/777")
+        self.assertNotIn("failure_msg_id", entry)
+
+    def test_queue_fetch_failure_captures_notice_msg_id(self):
+        calls, entry = self._run_queue({"ok": True}, fetch_err="markdown_fetch_empty_article_body")
+        self.assertEqual(entry["status"], "failed")
+        self.assertEqual(entry["failure_msg_id"], 999)  # fake_legacy 返回的 message_id
+
+    def test_fold_summary_details(self):
+        s = "> 结论\n\n### 一\nA\n\n### 二\nB\n\n### 三\nC"
+        out = twitter_monitor._fold_summary_details(s)
+        head, folded = out.split("<details><summary>展开论证与细节</summary>")
+        self.assertIn("### 一", head)
+        self.assertNotIn("### 二", head)
+        self.assertIn("### 二", folded)
+        self.assertIn("### 三", folded)
+        self.assertTrue(out.rstrip().endswith("</details>"))
+        # 0-1 个分节不折叠
+        single = "> r\n\n### 一\nA"
+        self.assertEqual(twitter_monitor._fold_summary_details(single), single)
+
+    def test_single_image_uses_bare_block_not_collage(self):
+        entry = {"article_id": "9", "article_title": "T"}
+        md = twitter_monitor.format_article_summary_rich(
+            "u", entry, "正文", image_urls=["https://pbs.twimg.com/media/x.jpg"])
+        self.assertIn("![](https://pbs.twimg.com/media/x.jpg)", md)
+        self.assertNotIn("<tg-collage>", md)
+
+
+class AuthorTldrTest(unittest.TestCase):
+    """长推 TL;DR：原文自带优先于 AI 总结；全文折叠进 expandable blockquote。"""
+
+    def test_author_tldr_preferred_over_ai(self):
+        long_text = ("这是很长的正文内容。" * 40 +
+                     "\nTL;DR: 作者自己写的一句话总结内容足够长超过十个字符")
+        msg, _ = twitter_monitor.format_message(
+            "dotey", {"id": "8", "note_tweet": {"text": long_text}},
+            FakeAI(True, "AI生成的摘要不应该出现在消息里因为原文自带"))
+        self.assertIn("TL;DR：作者自己写的一句话总结", msg)
+        self.assertNotIn("AI生成的摘要", msg)
+        self.assertIn("<blockquote expandable>", msg)
+
+    def test_extract_author_tldr_variants(self):
+        self.assertIsNotNone(twitter_monitor.extract_author_tldr(
+            "正文\n太长不看：中文别名写法的总结也要超过十个字符"))
+        self.assertIsNone(twitter_monitor.extract_author_tldr("没有摘要行的普通正文"))
+        self.assertIsNone(twitter_monitor.extract_author_tldr("TL;DR: 太短"))
+
+    def test_emoji_dense_note_stays_within_utf16_limit(self):
+        # astral 表情每个占 2 个 UTF-16 单位：2500 字符 = 5000 单位，必须被收缩
+        msg, _ = twitter_monitor.format_message(
+            "dotey", {"id": "10", "note_tweet": {"text": "\U0001f40d" * 2500}}, None)
+        self.assertIn("<blockquote expandable>", msg)
+        self.assertLess(len(msg.encode("utf-16-le")) // 2, 4096)
+
+
+class AlertClosureTest(unittest.TestCase):
+    """告警置顶 + 恢复闭环：告警时 pin，恢复时原地改写并 unpin。"""
+
+    def test_alert_pins_then_recovery_edits_and_unpins(self):
+        quiet = []
+
+        def fake_send(token, chat_id, text, link=""):
+            return {"ok": True, "result": {"message_id": 555}}
+
+        def fake_quiet(token, payload, method):
+            quiet.append((method, payload))
+            return {"ok": True}
+
+        failures = {}
+        with patch.object(twitter_monitor, "send_telegram", side_effect=fake_send), \
+             patch.object(twitter_monitor, "_tg_post_quiet", side_effect=fake_quiet):
+            for _ in range(twitter_monitor.FAIL_ALERT_THRESHOLD):
+                twitter_monitor.note_account_failure(failures, "ghost", "err", "bot", "chat")
+            self.assertEqual(failures["ghost"]["alert_msg_id"], 555)
+            self.assertEqual([m for m, p in quiet], ["pinChatMessage"])
+
+            twitter_monitor.note_account_success(failures, "ghost", "bot", "chat")
+        methods = [m for m, p in quiet]
+        self.assertEqual(methods, ["pinChatMessage", "editMessageText", "unpinChatMessage"])
+        edit = [p for m, p in quiet if m == "editMessageText"][0]
+        self.assertEqual(edit["message_id"], 555)
+        self.assertIn("已恢复", edit["text"])
+        self.assertNotIn("ghost", failures)
+
+    def test_recovery_without_alert_is_silent(self):
+        quiet = []
+        failures = {"u": {"count": 2, "alerted": False}}
+        with patch.object(twitter_monitor, "_tg_post_quiet",
+                          side_effect=lambda *a: quiet.append(a)):
+            twitter_monitor.note_account_success(failures, "u", "bot", "chat")
+        self.assertEqual(quiet, [])
+        self.assertNotIn("u", failures)
 
 
 class UserIdCacheTest(unittest.TestCase):
