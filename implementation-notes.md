@@ -119,3 +119,27 @@ Addressed the remaining eval items the user explicitly opted into.
 - **RT article 修复**（根因 agent 本地复现验证）：壳 URL → 工具退化到按 article_id 直查 → 两端空 `{}` → 116 字节残片 → 判 empty_article_body。修复：归一化解包 `legacy.retweeted_status_result`（article 取原推 + 暴露 retweeted_status），save_article 记原推 id + author，article_fetch_url 走原作者 status URL（与 10 条 sent 成功样本同构）。旧条目无 author 回退 username 不破坏。
 - **已知未修**（预存，仅标记）：article_fetch_url 无 tweet_id 的 `/i/article/<id>` 回退分支仍是脆弱路径；get_user_id 缓存 miss 且无 cookie 文件时 `_curl(url, None)` 的 AttributeError 隐患（生产有 cookie 不触发，缓存命中后跳过该路径）。
 - 存量修复：dotey 队列 3 条 failed 改原推 id/author 重置 pending 重试（liuren/xiaohu/dongxi_nlp）。
+
+---
+
+## 2026-06-12 — 文章摘要迁移 sendRichMessage（Rich Markdown 模式）
+
+### Design Decisions
+- **只迁移文章摘要推送**：普通推文/TL;DR/告警/失败通知保持 sendMessage 旧路径（短消息无收益）。
+- **rich-first + 完整回退**：400/404 返回 `rich_fallback` 信号（不抛错、不在 rich 函数内降级），回退到原 HTML 分块路径；429/5xx/网络重试语义与旧函数一致。旧路径整套保留。
+- **守卫 30000 字符**（官方上限 32768，留余量 + 规避 "UTF-8 characters" 按字节计的口径歧义）；超长直接走旧分块。
+- **`skip_entity_detection: True`**：防止头部 `@X用户名` 被自动链接到 Telegram 同名账号（误导链接）；显式 markdown 链接不受影响。
+- AI prompt 放开 `>` 结论引用块 + `###` 三级标题（禁一二级标题和表格）；回退渲染器同步支持（标题整行加粗剥内层、引用斜体、空续行保留段落分隔）。
+- 标题清洗：压换行 + 反斜杠转义 GFM/HTML 特殊字符（X 原文标题不可控）。
+- 顺手堵预存洞：回退渲染为空时不再假 sent（`empty_rendered_summary` 入 failed）。
+
+### Tradeoffs
+- 404 持续探测（方法若未来下线，每篇 candidate 每轮多 1 次调用）：量级个位数/天，验证结论是不值得加状态记忆，不修。
+- rich 成功后补 1.2s 间隔，对齐旧路径节奏。
+
+### Open Questions
+- `is_bad_tldr` 的 `^[*#>\-\s]+` 会拒绝新 prompt 的 `> ` 开头格式——目前无接线，未来若把文章摘要接入该质量门会全军覆没（future-trap，已记录）。
+
+### Verification
+- 3-agent 对抗验证（API 合规对照文档原文 / 回归审查 / 18 项边界探针）全 PASS，6 条 minor 加固全部落地。
+- 测试 39→42 全过（Mac 3.14 + 服务器 3.9）；生产 bot 实发 sendRichMessage ok:true（msg 3364，已删）。

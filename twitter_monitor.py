@@ -75,6 +75,7 @@ ARTICLE_QUEUE_DIR = os.path.join(SCRIPT_DIR, "twitter_articles")
 ARTICLE_CACHE_DIR = os.path.join(ARTICLE_QUEUE_DIR, "cache")
 ARTICLE_MAX_ATTEMPTS = 3
 ARTICLE_RETENTION_DAYS = 7  # sent/终态 failed 条目保留天数，到期从队列清除（防无限累积）
+RICH_MESSAGE_MAX_CHARS = 30000  # Rich message 上限 32768，留余量；超出回退旧分块路径
 FAILURES_PATH = os.path.join(SCRIPT_DIR, ".account_failures.json")
 FAIL_ALERT_THRESHOLD = 4  # 账号连续失败轮数达到阈值（*/30 cron ≈ 2 小时）发一次 TG 告警
 ARTICLE_MARKDOWN_CMD = os.environ.get("X_ARTICLE_MARKDOWN_CMD", "").strip()
@@ -267,9 +268,9 @@ def fetch_article_markdown(username: str, entry: dict) -> tuple[str | None, str 
 
 ARTICLE_SUMMARY_PROMPT = """请把下面这篇文章总结成适合 Telegram 推送的中文摘要。
 
-先给一句话结论，然后分节说明核心观点、论证链条和关键细节。
+先给一句话结论（用引用块 > 开头），然后用三级标题（###）分节说明核心观点、论证链条和关键细节。
 不要输出链接，不要复述作者和标题，不要编造原文没有的信息。
-可以使用 Markdown 粗体、列表和编号。
+可以使用 Markdown 三级标题、粗体、列表、编号和引用块；不要用一级/二级标题和表格。
 """
 
 
@@ -343,7 +344,10 @@ def markdown_to_telegram_html(text: str) -> str:
         if re.fullmatch(r"\x00PRE\d+\x00", line):
             out.append(line)
             continue
+        heading = bool(re.match(r"^#{1,6}\s+", line))
         line = re.sub(r"^#{1,6}\s+", "", line)
+        quote = bool(re.match(r"^>\s*", line))
+        line = re.sub(r"^>\s*", "", line)
         bullet = re.match(r"^[-*]\s+(.+)$", line)
         numbered = re.match(r"^(\d+)\.\s+(.+)$", line)
         prefix = ""
@@ -361,7 +365,16 @@ def markdown_to_telegram_html(text: str) -> str:
         escaped = re.sub(r"\[([^\]]+)\]\((https?://[^\s)]+)\)", r"\1", escaped)
         escaped = re.sub(r"https?://\S+", "", escaped).strip()
         if escaped:
+            # 回退渲染（rich 不可用时）：标题行加粗、引用行斜体，
+            # 与 ARTICLE_SUMMARY_PROMPT 要求的 ###/> 结构对应。
+            # 整行包裹前剥掉行内同名标签（标题整体加粗后内部粗体冗余）。
+            if heading:
+                escaped = "<b>" + escaped.replace("<b>", "").replace("</b>", "") + "</b>"
+            elif quote:
+                escaped = "<i>" + escaped.replace("<i>", "").replace("</i>", "") + "</i>"
             out.append(prefix + escaped)
+        elif quote:
+            out.append("")  # 多段引用的 '>' 空续行保留段落分隔
     result = "\n".join(out).strip()
     for i, block in enumerate(pre_blocks):
         result = result.replace(f"\x00PRE{i}\x00", block)
@@ -446,6 +459,22 @@ def format_article_summary_messages(username: str, entry: dict, summary: str) ->
         return chunks
     total = len(chunks)
     return [f"<b>X Article 摘要 {idx}/{total}</b>\n\n{chunk}" for idx, chunk in enumerate(chunks, 1)]
+
+
+def format_article_summary_rich(username: str, entry: dict, summary: str) -> str:
+    """组装 Rich Markdown 摘要（sendRichMessage 用）：克制的头部 + AI 摘要原文。
+
+    AI 输出本来就是 Markdown，rich 模式原生渲染标题/列表/引用块，
+    不再经过 markdown_to_telegram_html 转换和 3500 字符分块。
+    """
+    title = (entry.get("article_title") or "").strip() or "X Article"
+    # 标题来自 X 原文不可控：压掉换行，转义会被 rich markdown 解析的特殊字符
+    title = re.sub(r"\s+", " ", title)
+    title = re.sub(r"([\[\]()*_#`<>|~])", r"\\\1", title)
+    link = article_url(entry["article_id"])
+    header = (f"## \U0001f4c4 {title}\n"
+              f"**@{username}** · [原文]({link})\n\n---\n\n")
+    return header + summary.strip()
 
 
 def format_article_summary_message(username: str, entry: dict, summary: str) -> tuple[str, str]:
@@ -1164,9 +1193,9 @@ def format_message(username: str, t: dict, ai: "AIClassifier | None" = None) -> 
     return text, link
 
 
-def _tg_post(token: str, payload: dict) -> dict:
+def _tg_post(token: str, payload: dict, method: str = "sendMessage") -> dict:
     req = urllib.request.Request(
-        f"https://api.telegram.org/bot{token}/sendMessage",
+        f"https://api.telegram.org/bot{token}/{method}",
         data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json"},
     )
@@ -1176,6 +1205,65 @@ def _tg_post(token: str, payload: dict) -> dict:
 
 def _html_to_plain(text: str) -> str:
     return html.unescape(re.sub(r"<[^>]+>", "", text))
+
+
+def send_telegram_rich(token: str, chat_id: str, markdown: str, link: str = "") -> dict:
+    """sendRichMessage（Bot API Rich Markdown 模式，上限 32768 字符）。
+
+    重试语义与 send_telegram 一致（429 按 retry_after、5xx/网络退避重试）。
+    与 send_telegram 的关键差异：400/404 不在本函数内降级，而是返回
+    {"ok": False, "rich_fallback": True, ...} 让调用方回退到旧的
+    parse_mode=HTML 分块路径（那条路径自带完整的转义/分块/降级逻辑）。
+    """
+    payload: dict = {
+        "chat_id": chat_id,
+        # skip_entity_detection：不关的话头部 @X用户名 会被自动链接到
+        # Telegram 同名账号（误导）；显式 [文字](url) 链接不受影响
+        "rich_message": {"markdown": markdown, "skip_entity_detection": True},
+    }
+    if link:
+        payload["reply_markup"] = {
+            "inline_keyboard": [[{"text": "\U0001f517 打开原文", "url": link}]]
+        }
+
+    last_err = None
+    for attempt in range(3):
+        try:
+            return _tg_post(token, payload, method="sendRichMessage")
+        except urllib.error.HTTPError as e:
+            last_err = e
+            try:
+                body = e.read().decode("utf-8", "replace")
+            except Exception:
+                body = ""
+            if e.code == 429:
+                retry_after = 3
+                try:
+                    retry_after = int(json.loads(body)["parameters"]["retry_after"])
+                except Exception:
+                    pass
+                time.sleep(min(max(retry_after, 1), 30))
+                continue
+            if e.code >= 500:
+                time.sleep(2 * (attempt + 1))
+                continue
+            if e.code in (400, 404):
+                # 400=内容被拒（标记/嵌套超限等），404=方法未对该 bot 开放
+                desc = ""
+                try:
+                    desc = json.loads(body).get("description", "")
+                except Exception:
+                    desc = body[:200]
+                return {"ok": False, "rich_fallback": True,
+                        "error_code": e.code, "description": desc}
+            raise
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            last_err = e
+            time.sleep(2 * (attempt + 1))
+            continue
+    if last_err:
+        raise last_err
+    raise RuntimeError("send_telegram_rich: exhausted retries")
 
 
 def send_telegram(token: str, chat_id: str, text: str, link: str = "") -> dict:
@@ -1487,25 +1575,43 @@ def process_article_queue(ai: AIClassifier, bot_token: str, chat_id: str, dry_ru
             entry["summary_backend"] = backend
             entry["summary_at"] = datetime.now(timezone.utc).isoformat()
             messages = format_article_summary_messages(username, entry, summary)
+            rich_md = format_article_summary_rich(username, entry, summary)
             if dry_run:
-                print(f"    DRY RUN summary parts: {len(messages)}")
+                print(f"    DRY RUN rich markdown {len(rich_md)} chars; fallback parts: {len(messages)}")
                 for idx, part in enumerate(messages, 1):
                     print(f"      part {idx}: {part[:160]}...")
                 entry["status"] = "summarized"
             else:
                 try:
-                    ok = True
+                    ok = False
                     last_resp = {}
                     article_link = article_url(entry["article_id"])
-                    for idx, part in enumerate(messages, 1):
-                        r = send_telegram(bot_token, chat_id, part, article_link)
+                    # 优先 sendRichMessage（单条 32k、原生渲染 Markdown）；
+                    # 被拒/未开放/超长时回退旧的 HTML 分块多条路径。
+                    if len(rich_md) <= RICH_MESSAGE_MAX_CHARS:
+                        r = send_telegram_rich(bot_token, chat_id, rich_md, article_link)
                         last_resp = r
-                        part_ok = r.get("ok", False)
-                        print(f"    Article summary part {idx}/{len(messages)} push {'OK' if part_ok else 'FAIL'}")
-                        ok = ok and part_ok
-                        time.sleep(1.2)
-                        if not part_ok:
-                            break
+                        ok = r.get("ok", False)
+                        if ok:
+                            print("    Article summary rich push OK")
+                            time.sleep(1.2)
+                        else:
+                            print(f"    rich 推送被拒({str(r.get('description', ''))[:80]})，回退分块 HTML")
+                            time.sleep(1.2)
+                    if not ok:
+                        # 渲染为空（极端：摘要只剩 URL 被剥光）不能假装 sent
+                        ok = bool(messages)
+                        if not messages:
+                            last_resp = {"ok": False, "description": "empty_rendered_summary"}
+                        for idx, part in enumerate(messages, 1):
+                            r = send_telegram(bot_token, chat_id, part, article_link)
+                            last_resp = r
+                            part_ok = r.get("ok", False)
+                            print(f"    Article summary part {idx}/{len(messages)} push {'OK' if part_ok else 'FAIL'}")
+                            ok = ok and part_ok
+                            time.sleep(1.2)
+                            if not part_ok:
+                                break
                     if ok:
                         entry["status"] = "sent"
                         entry["sent_at"] = datetime.now(timezone.utc).isoformat()

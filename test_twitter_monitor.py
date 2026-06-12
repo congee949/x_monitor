@@ -423,6 +423,135 @@ class RetweetArticleTest(unittest.TestCase):
         self.assertEqual(captured["cmd"][-1], "https://x.com/liuren/status/2062808278812520765")
 
 
+class RichPushTest(unittest.TestCase):
+    """sendRichMessage 路径：payload 形状 / 400 回退信号 / 队列 rich-first 与回退。"""
+
+    def test_send_telegram_rich_payload_shape(self):
+        captured = {}
+
+        def fake_post(token, payload, method="sendMessage"):
+            captured["method"] = method
+            captured["payload"] = payload
+            return {"ok": True, "result": {"message_id": 1}}
+
+        with patch.object(twitter_monitor, "_tg_post", side_effect=fake_post):
+            r = twitter_monitor.send_telegram_rich("tok", "42", "# 标题\n\n正文", "https://x.com/i/article/1")
+        self.assertTrue(r["ok"])
+        self.assertEqual(captured["method"], "sendRichMessage")
+        self.assertEqual(captured["payload"]["rich_message"],
+                         {"markdown": "# 标题\n\n正文", "skip_entity_detection": True})
+        self.assertEqual(
+            captured["payload"]["reply_markup"]["inline_keyboard"][0][0]["url"],
+            "https://x.com/i/article/1")
+        self.assertNotIn("parse_mode", captured["payload"])
+        self.assertNotIn("text", captured["payload"])
+
+    def test_send_telegram_rich_400_returns_fallback_signal(self):
+        import io
+        import urllib.error
+
+        def fake_post(token, payload, method="sendMessage"):
+            raise urllib.error.HTTPError(
+                "url", 400, "Bad Request", {},
+                io.BytesIO(b'{"ok":false,"description":"Bad Request: rich message is invalid"}'))
+
+        with patch.object(twitter_monitor, "_tg_post", side_effect=fake_post):
+            r = twitter_monitor.send_telegram_rich("tok", "42", "bad md")
+        self.assertFalse(r["ok"])
+        self.assertTrue(r["rich_fallback"])
+        self.assertEqual(r["error_code"], 400)
+        self.assertIn("invalid", r["description"])
+
+    def test_format_article_summary_rich_header(self):
+        entry = {"article_id": "999", "article_title": "深度长文"}
+        md = twitter_monitor.format_article_summary_rich("dotey", entry, "> 一句话结论\n\n### 第一节\n内容")
+        self.assertIn("## \U0001f4c4 深度长文", md)
+        self.assertIn("**@dotey**", md)
+        self.assertIn("[原文](https://x.com/i/article/999)", md)
+        self.assertIn("\n---\n", md)
+        self.assertTrue(md.endswith("### 第一节\n内容"))
+
+    def test_format_article_summary_rich_escapes_unsafe_title(self):
+        entry = {"article_id": "1", "article_title": "AI [新时代]\n*爆发* #1 <hr>"}
+        md = twitter_monitor.format_article_summary_rich("u", entry, "正文")
+        first_line = md.splitlines()[0]
+        self.assertIn(r"\[新时代\]", first_line)   # 方括号转义
+        self.assertIn(r"\*爆发\*", first_line)      # 星号转义
+        self.assertIn(r"\<hr\>", first_line)        # HTML 标签转义
+        self.assertNotIn("\n*", first_line)          # 换行被压成空格
+
+    def test_fallback_heading_wraps_whole_line_dedup_inner_bold(self):
+        out = twitter_monitor.markdown_to_telegram_html("### 核心观点：**AI 优先**")
+        self.assertEqual(out, "<b>核心观点：AI 优先</b>")
+        out2 = twitter_monitor.markdown_to_telegram_html("段一\n> \n段二")
+        self.assertEqual(out2, "段一\n\n段二")  # 引用空续行保留段落分隔
+
+    def _run_queue(self, rich_response, summary="> 结论\n\n### 节\n正文"):
+        import json as _json
+        import os as _os
+        import tempfile
+        calls = {"rich": 0, "legacy": 0}
+
+        def fake_rich(token, chat_id, markdown, link=""):
+            calls["rich"] += 1
+            calls["rich_md"] = markdown
+            return rich_response
+
+        def fake_legacy(token, chat_id, text, link=""):
+            calls["legacy"] += 1
+            return {"ok": True}
+
+        with tempfile.TemporaryDirectory() as d:
+            cache_dir = _os.path.join(d, "cache")
+            qpath = _os.path.join(d, "u_queue.json")
+            with open(qpath, "w") as f:
+                _json.dump([{"article_id": "777", "tweet_id": "1", "author": "u",
+                             "article_title": "T", "status": "pending", "attempts": 0,
+                             "content": None}], f)
+            with patch.object(twitter_monitor, "ARTICLE_QUEUE_DIR", d), \
+                 patch.object(twitter_monitor, "ARTICLE_CACHE_DIR", cache_dir), \
+                 patch.object(twitter_monitor, "fetch_article_markdown",
+                              return_value=("# 全文\n" + "x" * 300, None)), \
+                 patch.object(twitter_monitor, "summarize_article",
+                              return_value=(summary, "mimo")), \
+                 patch.object(twitter_monitor, "send_telegram_rich", side_effect=fake_rich), \
+                 patch.object(twitter_monitor, "send_telegram", side_effect=fake_legacy), \
+                 patch.object(twitter_monitor.time, "sleep", return_value=None):
+                twitter_monitor.process_article_queue(FakeAI(True), "bot", "chat")
+            with open(qpath) as f:
+                entry = _json.load(f)[0]
+        return calls, entry
+
+    def test_queue_rich_success_skips_legacy(self):
+        calls, entry = self._run_queue({"ok": True})
+        self.assertEqual(calls["rich"], 1)
+        self.assertEqual(calls["legacy"], 0)
+        self.assertEqual(entry["status"], "sent")
+        self.assertIn("## \U0001f4c4 T", calls["rich_md"])  # rich 头部带标题
+
+    def test_queue_rich_rejected_falls_back_to_legacy(self):
+        calls, entry = self._run_queue(
+            {"ok": False, "rich_fallback": True, "error_code": 400, "description": "nope"})
+        self.assertEqual(calls["rich"], 1)
+        self.assertGreaterEqual(calls["legacy"], 1)
+        self.assertEqual(entry["status"], "sent")  # 回退路径仍送达
+
+    def test_queue_oversized_summary_goes_straight_to_legacy(self):
+        calls, entry = self._run_queue({"ok": True}, summary="长" * 30100)
+        self.assertEqual(calls["rich"], 0)  # 超长不走 rich
+        self.assertGreaterEqual(calls["legacy"], 1)
+        self.assertEqual(entry["status"], "sent")
+
+    def test_queue_empty_rendered_fallback_is_failed_not_fake_sent(self):
+        # rich 被拒 + 摘要渲染为空（纯 URL 被剥光）→ 必须 failed，不能假 sent
+        calls, entry = self._run_queue(
+            {"ok": False, "rich_fallback": True, "error_code": 400, "description": "nope"},
+            summary="https://example.com/only-a-link")
+        self.assertEqual(calls["legacy"], 0)
+        self.assertEqual(entry["status"], "failed")
+        self.assertIn("empty_rendered_summary", entry["last_error"])
+
+
 class UserIdCacheTest(unittest.TestCase):
     """user rest_id 持久缓存：miss 写回 / hit 免解析 / 失效自愈 / 损坏容错。"""
 
