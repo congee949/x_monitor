@@ -693,7 +693,7 @@ class DashboardTest(unittest.TestCase):
     """置顶状态看板：首轮创建+置顶，后续原地编辑，编辑失败重建，跨日清零。"""
 
     def _run(self, state=None, edit_ok=True, send_mid=777,
-             pushed=2, articles=1, failures=None):
+             pushed=2, articles=1, failures=None, dt_cls=None):
         import json as _json
         import tempfile
         quiet = []
@@ -712,6 +712,7 @@ class DashboardTest(unittest.TestCase):
                 with open(path, "w") as f:
                     _json.dump(state, f)
             with patch.object(twitter_monitor, "DASHBOARD_PATH", path), \
+                 patch.object(twitter_monitor, "datetime", dt_cls or twitter_monitor.datetime), \
                  patch.object(twitter_monitor, "_tg_post_quiet", side_effect=fake_quiet):
                 twitter_monitor.update_status_dashboard(
                     "bot", "chat", [{"username": "a"}, {"username": "b"}],
@@ -719,6 +720,28 @@ class DashboardTest(unittest.TestCase):
             with open(path) as f:
                 saved = _json.load(f)
         return quiet, saved
+
+    def test_six_am_day_boundary(self):
+        # 日界 = 北京时间 06:00：05:59 仍计入前一天，06:01 翻新天清零
+        from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+        cn = _tz(_td(hours=8))
+
+        def at(hh, mm):
+            class FakeNow(_dt):
+                @classmethod
+                def now(cls, tz=None):
+                    t = _dt(2026, 6, 13, hh, mm, tzinfo=cn)
+                    return t.astimezone(tz) if tz else t.replace(tzinfo=None)
+            return FakeNow
+
+        state = {"message_id": 5, "date": "2026-06-12",
+                 "tweets_today": 7, "articles_today": 0}
+        _, saved = self._run(state=dict(state), dt_cls=at(5, 59))
+        self.assertEqual(saved["tweets_today"], 9)   # 7 + 2，仍是 06-12
+        self.assertEqual(saved["date"], "2026-06-12")
+        _, saved = self._run(state=dict(state), dt_cls=at(6, 1))
+        self.assertEqual(saved["tweets_today"], 2)   # 翻天清零后只计本轮
+        self.assertEqual(saved["date"], "2026-06-13")
 
     def test_first_run_creates_pins_and_saves_state(self):
         quiet, saved = self._run()
@@ -733,7 +756,7 @@ class DashboardTest(unittest.TestCase):
 
     def test_subsequent_run_edits_in_place_and_accumulates(self):
         from datetime import datetime, timezone, timedelta
-        today = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+        today = (datetime.now(timezone(timedelta(hours=8))) - timedelta(hours=6)).strftime("%Y-%m-%d")
         quiet, saved = self._run(
             state={"message_id": 5, "date": today, "tweets_today": 10, "articles_today": 3})
         self.assertEqual([m for m, p in quiet], ["editMessageText"])
@@ -744,7 +767,7 @@ class DashboardTest(unittest.TestCase):
 
     def test_edit_failure_recreates_unpins_and_deletes_old(self):
         from datetime import datetime, timezone, timedelta
-        today = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+        today = (datetime.now(timezone(timedelta(hours=8))) - timedelta(hours=6)).strftime("%Y-%m-%d")
         quiet, saved = self._run(
             state={"message_id": 5, "date": today, "tweets_today": 0, "articles_today": 0},
             edit_ok=False, send_mid=9)
@@ -775,7 +798,7 @@ class DashboardTest(unittest.TestCase):
 
     def test_dirty_counter_state_self_heals(self):
         from datetime import datetime, timezone, timedelta
-        today = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+        today = (datetime.now(timezone(timedelta(hours=8))) - timedelta(hours=6)).strftime("%Y-%m-%d")
         quiet, saved = self._run(
             state={"message_id": 5, "date": today,
                    "tweets_today": "garbage", "articles_today": None})
@@ -786,7 +809,7 @@ class DashboardTest(unittest.TestCase):
         import io
         import urllib.error
         from datetime import datetime, timezone, timedelta
-        today = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d")
+        today = (datetime.now(timezone(timedelta(hours=8))) - timedelta(hours=6)).strftime("%Y-%m-%d")
         calls = []
 
         def fake_post(token, payload, method="sendMessage"):

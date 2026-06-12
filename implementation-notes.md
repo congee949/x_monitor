@@ -170,3 +170,4 @@ Addressed the remaining eval items the user explicitly opted into.
 - 推送计数改为实际送达：process_user 返回 len(to_push)-len(push_failed)；文章 processed 只计 sent/summarized——故障期重试不再双计、看板不虚高。
 - _tg_post_quiet 把 "message is not modified" 视为成功，杜绝同内容编辑触发删旧重建链。
 - main 的看板调用包 try/except + 计数字段类型自愈（脏状态文件不再让 cron 尾部整轮崩）。
+- 看板日界改为北京时间 06:00 起始（用户指定）：逻辑日期 = now_cn - 6h；06:00 前计入前一天。

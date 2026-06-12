@@ -1127,7 +1127,8 @@ def update_status_dashboard(bot_token: str, chat_id: str, accounts: list[dict],
         state = {}
 
     now_cn = datetime.now(timezone(timedelta(hours=8)))  # 北京时间（无夏令时）
-    today = now_cn.strftime("%Y-%m-%d")
+    # 计数日界 = 北京时间每天 06:00（用户指定起始点）：06:00 前计入前一天
+    today = (now_cn - timedelta(hours=6)).strftime("%Y-%m-%d")
     if state.get("date") != today:
         state["date"] = today
         state["tweets_today"] = 0
