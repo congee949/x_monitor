@@ -693,17 +693,25 @@ class DashboardTest(unittest.TestCase):
     """置顶状态看板：首轮创建+置顶，后续原地编辑，编辑失败重建，跨日清零。"""
 
     def _run(self, state=None, edit_ok=True, send_mid=777,
-             pushed=2, articles=1, failures=None, dt_cls=None):
+             pushed=2, articles=1, failures=None, dt_cls=None,
+             chat_ttl=0, getchat_ok=True, send_date=1_700_000_000):
         import json as _json
         import tempfile
         quiet = []
 
         def fake_quiet(token, payload, method):
             quiet.append((method, payload))
+            if method == "getChat":
+                if not getchat_ok:
+                    return {"ok": False}
+                res = {"id": 1}
+                if chat_ttl:
+                    res["message_auto_delete_time"] = chat_ttl
+                return {"ok": True, "result": res}
             if method == "editMessageText":
                 return {"ok": edit_ok}
             if method == "sendMessage":
-                return {"ok": True, "result": {"message_id": send_mid}}
+                return {"ok": True, "result": {"message_id": send_mid, "date": send_date}}
             return {"ok": True}
 
         with tempfile.TemporaryDirectory() as d:
@@ -746,8 +754,8 @@ class DashboardTest(unittest.TestCase):
     def test_first_run_creates_pins_and_saves_state(self):
         quiet, saved = self._run()
         methods = [m for m, p in quiet]
-        self.assertEqual(methods, ["sendMessage", "pinChatMessage"])
-        send_payload = quiet[0][1]
+        self.assertEqual(methods, ["getChat", "sendMessage", "pinChatMessage"])
+        send_payload = quiet[1][1]
         self.assertTrue(send_payload["disable_notification"])  # 创建静默
         self.assertIn("X 监控状态", send_payload["text"])
         self.assertIn("账号 2/2 正常", send_payload["text"])
@@ -759,9 +767,9 @@ class DashboardTest(unittest.TestCase):
         today = (datetime.now(timezone(timedelta(hours=8))) - timedelta(hours=6)).strftime("%Y-%m-%d")
         quiet, saved = self._run(
             state={"message_id": 5, "date": today, "tweets_today": 10, "articles_today": 3})
-        self.assertEqual([m for m, p in quiet], ["editMessageText"])
-        self.assertEqual(quiet[0][1]["message_id"], 5)
-        self.assertIn("今日 12 条", quiet[0][1]["text"])  # 10 + 2 累计
+        self.assertEqual([m for m, p in quiet], ["getChat", "editMessageText"])
+        self.assertEqual(quiet[1][1]["message_id"], 5)
+        self.assertIn("今日 12 条", quiet[1][1]["text"])  # 10 + 2 累计
         self.assertEqual(saved["tweets_today"], 12)
         self.assertEqual(saved["message_id"], 5)
 
@@ -772,8 +780,8 @@ class DashboardTest(unittest.TestCase):
             state={"message_id": 5, "date": today, "tweets_today": 0, "articles_today": 0},
             edit_ok=False, send_mid=9)
         methods = [m for m, p in quiet]
-        self.assertEqual(methods, ["editMessageText", "sendMessage", "pinChatMessage",
-                                   "unpinChatMessage", "deleteMessage"])
+        self.assertEqual(methods, ["getChat", "editMessageText", "sendMessage",
+                                   "pinChatMessage", "unpinChatMessage", "deleteMessage"])
         self.assertEqual(saved["message_id"], 9)
 
     def test_date_rollover_resets_counters(self):
@@ -783,16 +791,19 @@ class DashboardTest(unittest.TestCase):
         self.assertEqual(saved["tweets_today"], 2)   # 只算本轮
         self.assertEqual(saved["articles_today"], 1)
 
+    def _board_text(self, quiet):
+        return next(p["text"] for m, p in quiet if m in ("sendMessage", "editMessageText"))
+
     def test_failures_listed_in_dashboard(self):
         quiet, _ = self._run(failures={"a": {"count": 5, "last_error": "Cannot find user"}})
-        text = quiet[0][1]["text"]
+        text = self._board_text(quiet)
         self.assertIn("账号 1/2 正常", text)
         self.assertIn("@a 连续 5 轮失败", text)
 
     def test_ghost_failure_records_excluded(self):
         # 已不在配置中的账号（被移除/禁用）的失败记录不得污染看板
         quiet, _ = self._run(failures={"ghost": {"count": 5, "last_error": "x"}})
-        text = quiet[0][1]["text"]
+        text = self._board_text(quiet)
         self.assertIn("账号 2/2 正常", text)
         self.assertNotIn("ghost", text)
 
@@ -803,7 +814,7 @@ class DashboardTest(unittest.TestCase):
             state={"message_id": 5, "date": today,
                    "tweets_today": "garbage", "articles_today": None})
         self.assertEqual(saved["tweets_today"], 2)  # 脏值重置后只计本轮
-        self.assertEqual([m for m, p in quiet], ["editMessageText"])
+        self.assertEqual([m for m, p in quiet], ["getChat", "editMessageText"])
 
     def test_not_modified_edit_does_not_rebuild(self):
         import io
@@ -831,8 +842,73 @@ class DashboardTest(unittest.TestCase):
                     "bot", "chat", [{"username": "a"}], {}, 0, 0, 16.0)
             with open(path) as f:
                 saved = _json.load(f)
-        self.assertEqual(calls, ["editMessageText"])  # 没有触发删旧重建链
+        self.assertEqual(calls, ["getChat", "editMessageText"])  # 没有触发删旧重建链
         self.assertEqual(saved["message_id"], 5)
+
+    def test_proactive_rebuild_before_ttl_expiry(self):
+        import time as _t
+        from datetime import datetime, timezone, timedelta
+        today = (datetime.now(timezone(timedelta(hours=8))) - timedelta(hours=6)).strftime("%Y-%m-%d")
+        old = _t.time() - 80000  # 80000s > 0.85 * 86400 = 73440 → 将近到期
+        new_date = old + 80000
+        quiet, saved = self._run(
+            state={"message_id": 5, "date": today, "tweets_today": 0,
+                   "articles_today": 0, "created_at": old},
+            chat_ttl=86400, send_mid=20, send_date=new_date)
+        methods = [m for m, p in quiet]
+        # 主动重建（不编辑旧消息）：getChat → 新发 → 置顶 → 取消旧置顶 → 删旧
+        self.assertEqual(methods, ["getChat", "sendMessage", "pinChatMessage",
+                                   "unpinChatMessage", "deleteMessage"])
+        self.assertEqual(saved["message_id"], 20)
+        self.assertEqual(saved["created_at"], new_date)  # 计时基准刷新
+
+    def test_no_rebuild_when_message_fresh(self):
+        import time as _t
+        from datetime import datetime, timezone, timedelta
+        today = (datetime.now(timezone(timedelta(hours=8))) - timedelta(hours=6)).strftime("%Y-%m-%d")
+        quiet, _ = self._run(
+            state={"message_id": 5, "date": today, "tweets_today": 0,
+                   "articles_today": 0, "created_at": _t.time()},
+            chat_ttl=86400)
+        self.assertEqual([m for m, p in quiet], ["getChat", "editMessageText"])
+
+    def test_no_proactive_rebuild_without_ttl(self):
+        from datetime import datetime, timezone, timedelta
+        today = (datetime.now(timezone(timedelta(hours=8))) - timedelta(hours=6)).strftime("%Y-%m-%d")
+        # 聊天未开 auto-delete：即使消息很老也只编辑，不做无谓重建
+        quiet, _ = self._run(
+            state={"message_id": 5, "date": today, "tweets_today": 0,
+                   "articles_today": 0, "created_at": 0},
+            chat_ttl=0)
+        self.assertEqual([m for m, p in quiet], ["getChat", "editMessageText"])
+
+    def test_corrupt_created_at_self_heals(self):
+        # 脏状态文件里非数值 created_at 不得让 float() 崩整轮（major 修复）
+        from datetime import datetime, timezone, timedelta
+        today = (datetime.now(timezone(timedelta(hours=8))) - timedelta(hours=6)).strftime("%Y-%m-%d")
+        new_date = 1_700_000_000 + 99999
+        quiet, saved = self._run(
+            state={"message_id": 5, "date": today, "tweets_today": 0,
+                   "articles_today": 0, "created_at": "garbage"},
+            chat_ttl=86400, send_mid=22, send_date=new_date)
+        # 视作 0 → age 巨大 → 主动重建并写回干净数值，不崩
+        self.assertIn("sendMessage", [m for m, p in quiet])
+        self.assertEqual(saved["message_id"], 22)
+        self.assertEqual(saved["created_at"], new_date)
+        self.assertIsInstance(saved["created_at"], (int, float))
+
+    def test_ttl_cache_used_when_getchat_fails(self):
+        import time as _t
+        from datetime import datetime, timezone, timedelta
+        today = (datetime.now(timezone(timedelta(hours=8))) - timedelta(hours=6)).strftime("%Y-%m-%d")
+        old = _t.time() - 80000
+        quiet, saved = self._run(
+            state={"message_id": 5, "date": today, "tweets_today": 0,
+                   "articles_today": 0, "created_at": old, "ttl": 86400},
+            getchat_ok=False, send_mid=21)
+        # getChat 失败但沿用缓存 ttl=86400 仍判将近到期 → 重建
+        self.assertIn("sendMessage", [m for m, p in quiet])
+        self.assertEqual(saved["message_id"], 21)
 
 
 class AlertClosureTest(unittest.TestCase):

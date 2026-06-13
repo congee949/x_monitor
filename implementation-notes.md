@@ -171,3 +171,10 @@ Addressed the remaining eval items the user explicitly opted into.
 - _tg_post_quiet 把 "message is not modified" 视为成功，杜绝同内容编辑触发删旧重建链。
 - main 的看板调用包 try/except + 计数字段类型自愈（脏状态文件不再让 cron 尾部整轮崩）。
 - 看板日界改为北京时间 06:00 起始（用户指定）：逻辑日期 = now_cn - 6h；06:00 前计入前一天。
+
+### 看板规避聊天 auto-delete（用户开了 1 天自动删除）
+- 问题：auto-delete 按消息「发送时刻」计时，editMessageText 不重置 → 看板必在 24h 后被删。
+- 方案：每轮 getChat 读 message_auto_delete_time（实测私聊可读，=86400）存 state；看板存活到 TTL 的 85%（DASHBOARD_REBUILD_FRACTION）时主动重建新看板+置顶，旧的留给 auto-delete 清理。自适应：用户改 TTL 自动跟随；无 TTL 则不主动重建只靠自愈。
+- created_at 取 sendMessage 返回的 result.date（Telegram UTC epoch），与 time.time()(UTC epoch) 同基准。
+- 审查修复(major)：created_at 非数值（脏状态文件）时 float() 容错视作 0，与计数字段同款自愈，防每轮崩在 _atomic_write 前导致永久瘫痪+丢计数。
+- 实测：首轮升级把旧看板(无 created_at)重建为 3415 并置顶，state 含 ttl/created_at，getChat 确认 pinned==3415。
