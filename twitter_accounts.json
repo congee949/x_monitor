@@ -34,5 +34,9 @@
   {
     "username": "dontbesilent",
     "enabled": true
+  },
+  {
+    "username": "karpathy",
+    "enabled": true
   }
 ]
