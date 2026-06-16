@@ -38,7 +38,7 @@ except ImportError:
 
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(SCRIPT_DIR, "cc98_config.json")
+CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
 ACCOUNTS_PATH = os.path.join(SCRIPT_DIR, "twitter_accounts.json")
 TOKENS_PATH = os.path.join(SCRIPT_DIR, "twitter_tokens.json")
 AI_CONFIG_PATH = os.path.join(SCRIPT_DIR, "twitter_ai.json")

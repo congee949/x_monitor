@@ -1,6 +1,6 @@
 # --- secrets / tokens (never commit) ---
 env.sh
-cc98_config.json
+config.json
 twitter_tokens.json
 twitter_ai.json
 .auth_cookies.json
