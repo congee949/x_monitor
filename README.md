@@ -76,7 +76,7 @@ flowchart TD
 
 ## 配置
 
-**`cc98_config.json`** — Telegram 凭据：
+**`config.json`** — Telegram 凭据：
 ```json
 { "telegram_bot_token": "<bot token>", "telegram_chat_id": "<chat id>" }
 ```
