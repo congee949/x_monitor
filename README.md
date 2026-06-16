@@ -60,7 +60,7 @@ flowchart TD
 
 | 文件 | 内容 |
 |---|---|
-| `cc98_config.json` | Telegram bot token / chat id（沿用历史文件名） |
+| `config.json` | Telegram bot token / chat id（沿用历史文件名） |
 | `twitter_ai.json` | AI 后端配置与 API key |
 | `.auth_cookies.json` | Twitter 登录 cookie（手工维护） |
 | `twitter_seen/`、`twitter_articles/` | 已见推文 ID、文章队列与缓存 |
