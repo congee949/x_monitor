@@ -140,6 +140,10 @@ python3 test_twitter_monitor.py    # 纯 mock，零网络
 | `v1.4` | 置顶状态看板 |
 | `v1.4.1` | 看板当日计数以北京时间 06:00 为界 |
 | `v1.5` | 看板自适应规避聊天 auto-delete |
+| `v1.5.1` | 添加项目 README |
+| `v1.5.2` | 新增监控账号 @karpathy |
+| `v1.5.3` | 新增监控账号 @MacroMargin |
+| `v1.6.0` | 普通推文升级 `sendRichMessage`（`send_tweet` rich-first + 长推 `details` 折叠）；配置文件改名 `config.json`；移除空号账号 |
 
 回滚：`git checkout v1.3` 查看，`git diff v1.2 v1.3` 看变更，[tags 页](https://github.com/congee949/x_monitor/tags)可下载任意版本。
 
