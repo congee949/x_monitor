@@ -8,10 +8,6 @@
     "enabled": true
   },
   {
-    "username": "aleabitoreddit",
-    "enabled": true
-  },
-  {
     "username": "dotey",
     "enabled": true
   },
@@ -24,10 +20,6 @@
     "enabled": true
   },
   {
-    "username": "8BTCNews",
-    "enabled": true
-  },
-  {
     "username": "aborninblood",
     "enabled": false
   },
@@ -37,6 +29,10 @@
   },
   {
     "username": "karpathy",
+    "enabled": true
+  },
+  {
+    "username": "MacroMargin",
     "enabled": true
   }
 ]
