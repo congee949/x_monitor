@@ -45,7 +45,7 @@
 ### Open Questions / Follow-ups
 - ART-1 (article queue persists once per account at loop end) is mitigated by atomic writes but not fully fixed; a mid-account crash can still re-push the in-flight article. Per-entry persistence after each terminal transition is the remaining hardening.
 - ESC-1 (TL;DR double-escape) / PRE-1 (code-fence <pre>) / SPLIT-1 (split mid-tag) are cosmetic-to-medium formatting bugs left for a follow-up; none silently drop messages now that send_telegram has a plain-text 400 fallback.
-- SEC-3: cc98_config.json / twitter_ai.json hold secrets in cleartext on the VPS — confirm chmod 600 and whether the bot token equals the (now-redacted, to-be-rotated) Taoli98Bot token.
+- SEC-3: config.json / twitter_ai.json hold secrets in cleartext on the VPS — confirm chmod 600 and whether the bot token equals the (now-redacted, to-be-rotated) Taoli98Bot token.
 
 ---
 
@@ -74,7 +74,7 @@ Fixed the three priority bugs flagged in the 2026-06-02 multi-agent eval. All we
 Addressed the remaining eval items the user explicitly opted into.
 
 ### CAT1 — Security + cleanup
-- `chmod 600` on `.auth_cookies.json`, `cc98_config.json`, `twitter_ai.json` (were 644; dir is 700 so low risk, done as defense-in-depth).
+- `chmod 600` on `.auth_cookies.json`, `config.json`, `twitter_ai.json` (were 644; dir is 700 so low risk, done as defense-in-depth).
 - Removed dead `vista8_monitor.py` (git-tracked) and untracked clutter (`*.bak*`, `*.before-*`, `vista8_seen_ids.json`). `.gitignore` already excludes secrets/state/backups.
 
 ### CAT2 — Cookie SPOF investigation (conclusion)
