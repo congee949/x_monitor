@@ -144,7 +144,7 @@ class ArticleFormattingTest(unittest.TestCase):
 
 class MessageFormattingTest(unittest.TestCase):
     def test_format_message_includes_normal_tweet_preview(self):
-        msg, link = twitter_monitor.format_message(
+        msg, _rich, link = twitter_monitor.format_message(
             "vista8",
             {"id": "1", "text": "这是一条普通推文，用来验证 iOS 通知栏里能直接看到内容，而不是只看到账号名。"},
         )
@@ -154,7 +154,7 @@ class MessageFormattingTest(unittest.TestCase):
 
     def test_format_message_uses_tldr_for_note_tweet(self):
         long_text = "Stack Overflow 因为大家都用 AI 导致发帖量下降，但公司靠企业知识库和数据授权收入增长。" * 20
-        msg, link = twitter_monitor.format_message(
+        msg, _rich, link = twitter_monitor.format_message(
             "dotey",
             {"id": "2", "text": long_text[:200], "note_tweet": {"text": long_text}},
             FakeAI(True, "Stack Overflow 社区提问减少，但公司靠企业知识库和数据授权从 AI 浪潮中赚钱。"),
@@ -170,7 +170,7 @@ class MessageFormattingTest(unittest.TestCase):
 
     def test_format_message_falls_back_to_short_preview_when_tldr_unavailable(self):
         long_text = "Agent 应用和传统 App + AI 的最大差别，在于执行的主体不同。" * 20
-        msg, _ = twitter_monitor.format_message(
+        msg, _rich, _ = twitter_monitor.format_message(
             "dotey",
             {"id": "3", "text": long_text[:200], "note_tweet": {"text": long_text}},
             FakeAI(False),
@@ -183,7 +183,7 @@ class MessageFormattingTest(unittest.TestCase):
 
     def test_format_message_falls_back_when_tldr_quality_is_bad(self):
         long_text = "Stack Overflow 因为大家都用 AI 导致发帖量下降，但公司靠企业知识库和数据授权收入增长。" * 20
-        msg, _ = twitter_monitor.format_message(
+        msg, _rich, _ = twitter_monitor.format_message(
             "dotey",
             {"id": "5", "text": long_text[:200], "note_tweet": {"text": long_text}},
             FakeAI(True, "* However, Stack Overflow&#x27;"),
@@ -195,7 +195,7 @@ class MessageFormattingTest(unittest.TestCase):
         self.assertIn("<blockquote expandable>", msg)
 
     def test_format_message_article_keeps_short_article_hint(self):
-        msg, link = twitter_monitor.format_message(
+        msg, _rich, link = twitter_monitor.format_message(
             "dotey",
             {
                 "id": "4",
@@ -218,7 +218,7 @@ class LatentFixRegressionTest(unittest.TestCase):
         # ESC-1: a TL;DR containing '&' must render as a single &amp;, not &amp;amp;.
         ai = FakeAI(available=True,
                     summary="这是一个包含 A & B 与符号的中文摘要内容长度足够通过质量检查测试")
-        msg, _ = twitter_monitor.format_message("dotey", {"id": "1", "note_tweet": {"text": "x" * 80}}, ai)
+        msg, _rich, _ = twitter_monitor.format_message("dotey", {"id": "1", "note_tweet": {"text": "x" * 80}}, ai)
         self.assertNotIn("&amp;amp;", msg)
         self.assertIn("&amp;", msg)
 
@@ -668,7 +668,7 @@ class AuthorTldrTest(unittest.TestCase):
     def test_author_tldr_preferred_over_ai(self):
         long_text = ("这是很长的正文内容。" * 40 +
                      "\nTL;DR: 作者自己写的一句话总结内容足够长超过十个字符")
-        msg, _ = twitter_monitor.format_message(
+        msg, _rich, _ = twitter_monitor.format_message(
             "dotey", {"id": "8", "note_tweet": {"text": long_text}},
             FakeAI(True, "AI生成的摘要不应该出现在消息里因为原文自带"))
         self.assertIn("TL;DR：作者自己写的一句话总结", msg)
@@ -683,7 +683,7 @@ class AuthorTldrTest(unittest.TestCase):
 
     def test_emoji_dense_note_stays_within_utf16_limit(self):
         # astral 表情每个占 2 个 UTF-16 单位：2500 字符 = 5000 单位，必须被收缩
-        msg, _ = twitter_monitor.format_message(
+        msg, _rich, _ = twitter_monitor.format_message(
             "dotey", {"id": "10", "note_tweet": {"text": "\U0001f40d" * 2500}}, None)
         self.assertIn("<blockquote expandable>", msg)
         self.assertLess(len(msg.encode("utf-16-le")) // 2, 4096)
@@ -1029,6 +1029,87 @@ class UserIdCacheTest(unittest.TestCase):
              patch.object(self.tg, "_curl", lambda *a, **k: empty):
             self.assertEqual(self.tg.fetch_tweets("ghost", limit=5), [])  # 行为不变
         self.assertEqual(self._read_cache(), {})
+
+
+class SendTweetTest(unittest.TestCase):
+    """普通推文统一推送入口 send_tweet：rich-first（html 字段）→ HTML 分块回退。"""
+
+    TWEET = {"id": "9", "text": "一条足够长的普通推文内容，用来覆盖 send_tweet 的推送路径测试"}
+
+    def test_rich_success_skips_html_fallback(self):
+        calls = {"rich": 0, "legacy": 0, "html": ""}
+
+        def fake_rich(token, chat_id, markdown="", link="", *, html=""):
+            calls["rich"] += 1
+            calls["html"] = html
+            return {"ok": True, "result": {"message_id": 1}}
+
+        def fake_legacy(token, chat_id, text, link=""):
+            calls["legacy"] += 1
+            return {"ok": True}
+
+        with patch.object(twitter_monitor, "send_telegram_rich", side_effect=fake_rich), \
+             patch.object(twitter_monitor, "send_telegram", side_effect=fake_legacy):
+            r = twitter_monitor.send_tweet("tok", "42", "vista8", self.TWEET)
+        self.assertTrue(r["ok"])
+        self.assertEqual(calls["rich"], 1)
+        self.assertEqual(calls["legacy"], 0)          # rich 成功不回退
+        self.assertIn("\U0001f4e2 @vista8", calls["html"])  # 走 html 字段（非 markdown）
+
+    def test_rich_rejected_falls_back_to_html(self):
+        calls = {"legacy": 0}
+
+        def fake_rich(token, chat_id, markdown="", link="", *, html=""):
+            return {"ok": False, "rich_fallback": True}
+
+        def fake_legacy(token, chat_id, text, link=""):
+            calls["legacy"] += 1
+            return {"ok": True, "result": {"message_id": 2}}
+
+        with patch.object(twitter_monitor, "send_telegram_rich", side_effect=fake_rich), \
+             patch.object(twitter_monitor, "send_telegram", side_effect=fake_legacy):
+            r = twitter_monitor.send_tweet("tok", "42", "vista8", self.TWEET)
+        self.assertTrue(r["ok"])
+        self.assertEqual(calls["legacy"], 1)          # rich_fallback → 回退 HTML
+
+    def test_rich_hard_failure_does_not_fall_back(self):
+        # ok=False 但非 rich_fallback（如 429 重试穷尽）→ 直接返回，不二次发送
+        calls = {"legacy": 0}
+
+        def fake_rich(token, chat_id, markdown="", link="", *, html=""):
+            return {"ok": False}
+
+        def fake_legacy(token, chat_id, text, link=""):
+            calls["legacy"] += 1
+            return {"ok": True}
+
+        with patch.object(twitter_monitor, "send_telegram_rich", side_effect=fake_rich), \
+             patch.object(twitter_monitor, "send_telegram", side_effect=fake_legacy):
+            r = twitter_monitor.send_tweet("tok", "42", "vista8", self.TWEET)
+        self.assertFalse(r["ok"])
+        self.assertEqual(calls["legacy"], 0)          # 硬失败不回退（避免重复发送）
+
+    def test_oversized_note_rich_html_capped_within_limit(self):
+        # format_message 把超大 note 的 rich 折叠截在 RICH_MESSAGE_MAX_CHARS 内，
+        # 所以 send_tweet 仍走 rich，不会产出超限内容
+        calls = {"rich": 0, "legacy": 0, "html_len": 0}
+
+        def fake_rich(token, chat_id, markdown="", link="", *, html=""):
+            calls["rich"] += 1
+            calls["html_len"] = len(html)
+            return {"ok": True}
+
+        def fake_legacy(token, chat_id, text, link=""):
+            calls["legacy"] += 1
+            return {"ok": True}
+
+        big = {"id": "9", "note_tweet": {"text": "长" * 40000}}
+        with patch.object(twitter_monitor, "send_telegram_rich", side_effect=fake_rich), \
+             patch.object(twitter_monitor, "send_telegram", side_effect=fake_legacy):
+            r = twitter_monitor.send_tweet("tok", "42", "vista8", big, None)
+        self.assertEqual(calls["rich"], 1)
+        self.assertEqual(calls["legacy"], 0)
+        self.assertLessEqual(calls["html_len"], twitter_monitor.RICH_MESSAGE_MAX_CHARS)
 
 
 if __name__ == "__main__":

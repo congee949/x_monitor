@@ -38,7 +38,7 @@ except ImportError:
 
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(SCRIPT_DIR, "cc98_config.json")
+CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
 ACCOUNTS_PATH = os.path.join(SCRIPT_DIR, "twitter_accounts.json")
 TOKENS_PATH = os.path.join(SCRIPT_DIR, "twitter_tokens.json")
 AI_CONFIG_PATH = os.path.join(SCRIPT_DIR, "twitter_ai.json")
@@ -1317,13 +1317,24 @@ def summarize_note_tweet(ai: "AIClassifier", username: str, note_text: str) -> s
     return short_preview(summary, TLDR_PREVIEW_LIMIT)
 
 
-def format_message(username: str, t: dict, ai: "AIClassifier | None" = None) -> tuple[str, str]:
+def format_message(
+    username: str, t: dict, ai: "AIClassifier | None" = None
+) -> tuple[str, str, str]:
+    """Build both the HTML fallback message and the rich-message variant.
+
+    Returns (html_text, rich_html, link). The HTML `text` is unchanged from the
+    legacy path (folded_full capped at ~2800 chars / 3000 UTF-16 units to stay
+    under the 4096 sendMessage limit) and feeds send_telegram on rich fallback.
+    rich_html targets sendRichMessage's html field (RICH_MESSAGE_MAX_CHARS budget)
+    and folds the full note text with a much larger cap so long tweets show in full.
+    """
     tid = t.get("id") or t.get("conversation_id_str") or ""
     link = f"https://x.com/{username}/status/{tid}" if tid else ""
     hidden = f'<a href="{link}">​</a>' if link else ""
     note = t.get("note_tweet") or {}
     note_text = note.get("text", "").strip()
     folded_full = ""
+    folded_full_rich = ""
     if note_text:
         # TL;DR 优先级：原文自带 > AI 总结 > 短预览
         preview = extract_author_tldr(note_text)
@@ -1341,6 +1352,11 @@ def format_message(username: str, t: dict, ai: "AIClassifier | None" = None) -> 
         # 截断仍可能超 4096 → HTML 与 plain 降级双双 400 → 推文静默丢失。按单位收缩。
         while len(folded_full.encode("utf-16-le")) // 2 > 3000 and len(folded_full) > 100:
             folded_full = folded_full[: int(len(folded_full) * 0.9)] + "…"
+        # Rich 路径折叠用远大的上限（约 28000 字符，留 header/摘要余量保持
+        # 在 RICH_MESSAGE_MAX_CHARS 之下）：sendRichMessage 单条 32768。
+        folded_full_rich = note_text if len(note_text) <= 28000 else note_text[:28000] + "…"
+        while len(folded_full_rich.encode("utf-16-le")) // 2 > 28000 and len(folded_full_rich) > 100:
+            folded_full_rich = folded_full_rich[: int(len(folded_full_rich) * 0.9)] + "…"
     elif t.get("article"):
         body = article_preview_text(t)
     else:
@@ -1351,7 +1367,17 @@ def format_message(username: str, t: dict, ai: "AIClassifier | None" = None) -> 
         text = f'📢 @{username}{hidden}'
     if folded_full:
         text += f"\n\n<blockquote expandable>{html.escape(folded_full)}</blockquote>"
-    return text, link
+    # Rich HTML variant: tweet body/note is raw user content → html.escape it and
+    # send via the rich `html` field (NOT markdown), so < > * _ # | $ [ ] etc.
+    # can't be parsed as rich syntax or inject nested blocks. The 「打开原文」
+    # button comes from the wrapper.
+    if body:
+        rich_html = f'📢 @{username}\n\n{html.escape(body)}'
+    else:
+        rich_html = f'📢 @{username}'
+    if folded_full_rich:
+        rich_html += f"\n\n<details><summary>全文</summary>\n\n{html.escape(folded_full_rich)}\n\n</details>"
+    return text, rich_html, link
 
 
 def _tg_post(token: str, payload: dict, method: str = "sendMessage") -> dict:
@@ -1389,20 +1415,26 @@ def _html_to_plain(text: str) -> str:
     return html.unescape(re.sub(r"<[^>]+>", "", text))
 
 
-def send_telegram_rich(token: str, chat_id: str, markdown: str, link: str = "") -> dict:
-    """sendRichMessage（Bot API Rich Markdown 模式，上限 32768 字符）。
+def send_telegram_rich(token: str, chat_id: str, markdown: str = "", link: str = "",
+                       *, html: str = "") -> dict:
+    """sendRichMessage（Bot API Rich Message，上限 32768 字符）。
 
+    传 markdown 走 Rich Markdown 字段；传 html=… 走 Rich HTML 字段（恰传其一）。
+    原始用户内容（推文正文 / AI 标题）走 html 字段 + html.escape 更安全，避免
+    < > * _ # | $ [ ] 等被当 markdown 语法解析或注入嵌套块；文章摘要仍用 markdown。
     重试语义与 send_telegram 一致（429 按 retry_after、5xx/网络退避重试）。
     与 send_telegram 的关键差异：400/404 不在本函数内降级，而是返回
     {"ok": False, "rich_fallback": True, ...} 让调用方回退到旧的
     parse_mode=HTML 分块路径（那条路径自带完整的转义/分块/降级逻辑）。
     """
-    payload: dict = {
-        "chat_id": chat_id,
-        # skip_entity_detection：不关的话头部 @X用户名 会被自动链接到
-        # Telegram 同名账号（误导）；显式 [文字](url) 链接不受影响
-        "rich_message": {"markdown": markdown, "skip_entity_detection": True},
-    }
+    # skip_entity_detection：不关的话头部 @X用户名 会被自动链接到 Telegram
+    # 同名账号（误导）；显式链接（markdown [文字](url) / html <a href>）不受影响。
+    rich: dict = {"skip_entity_detection": True}
+    if html:
+        rich["html"] = html
+    else:
+        rich["markdown"] = markdown
+    payload: dict = {"chat_id": chat_id, "rich_message": rich}
     if link:
         payload["reply_markup"] = {
             "inline_keyboard": [[{"text": "\U0001f517 打开原文", "url": link}]]
@@ -1503,6 +1535,27 @@ def send_telegram(token: str, chat_id: str, text: str, link: str = "") -> dict:
     if last_err:
         raise last_err
     raise RuntimeError("send_telegram: exhausted retries")
+
+
+def send_tweet(
+    token: str, chat_id: str, username: str, t: dict, ai: "AIClassifier | None" = None
+) -> dict:
+    """统一推文推送入口：rich-first → HTML fallback。
+
+    username/t/ai 与原 format_message 调用点（process_user 循环）的实参一致。
+    返回发送响应 dict，调用方仍用 r.get("ok") 做 push_failed/seen 判定。
+    - rich 优先：rich_html 不超 RICH_MESSAGE_MAX_CHARS 时走 send_telegram_rich
+      的 html 字段；成功直接返回；非 rich_fallback 的失败（如 429 已重试穷尽）原样返回。
+    - rich 被拒（rich_fallback）或超长 → 回退现有 HTML 路径 send_telegram。
+    """
+    html_text, rich_html, link = format_message(username, t, ai)
+    if len(rich_html) <= RICH_MESSAGE_MAX_CHARS:
+        r = send_telegram_rich(token, chat_id, link=link, html=rich_html)
+        if r.get("ok"):
+            return r
+        if not r.get("rich_fallback"):
+            return r
+    return send_telegram(token, chat_id, html_text, link)
 
 
 # ── 单用户处理 ──────────────────────────────────────
@@ -1607,16 +1660,19 @@ def process_user(
 
     push_failed: set[str] = set()
     for t, _reason in to_push:
-        msg, link = format_message(username, t, ai)
         tid = str(t.get("id") or "")
         if args.dry_run:
+            html_text, rich_html, link = format_message(username, t, ai)
             print("----- DRY RUN -----")
-            print(msg)
+            print("[rich_html]")
+            print(rich_html)
+            print("[html_text]")
+            print(html_text)
             print(f"link: {link}")
             print()
         else:
             try:
-                r = send_telegram(bot_token, chat_id, msg, link)
+                r = send_tweet(bot_token, chat_id, username, t, ai)
                 ok = r.get("ok", False)
                 print(f"    推送 {'OK' if ok else 'FAIL'}: {t.get('id')}")
                 if not ok:
