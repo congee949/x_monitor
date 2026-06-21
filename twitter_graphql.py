@@ -216,11 +216,20 @@ def get_user_id(screen_name):
 def fetch_tweets(username, limit=20):
     """Fetch user tweets, return normalized format list.
 
-    Return format compatible with original 6551.io API:
+    Return format compatible with original 6551.io API (additive fields added):
     - id: str (tweet ID)
     - text: str (full text)
     - created_at: str (timestamp)
-    - entities: dict (contains urls)
+    - entities: dict (contains urls + basic media)
+    - extended_entities: dict (raw, for full video variants)
+    - media: list[dict]  # convenient processed list:
+        each item: {
+          "type": "photo"|"video"|"animated_gif",
+          "url": str,           # photo or fallback
+          "video_url": str|None,# best mp4 for video/gif
+          "width", "height",
+          "duration_ms", "bitrate"
+        }
     - note_tweet: dict (longform content, if present)
     - article: dict (Twitter Article, if present)
     - user: dict (user info)
@@ -380,13 +389,59 @@ def fetch_tweets(username, limit=20):
             article_preview = article_result.get("preview_text", "")
             article_rest_id = article_result.get("rest_id", "")
 
-            entities = legacy.get("entities", {})
+            entities = legacy.get("entities", {}) or {}
+            extended_entities = legacy.get("extended_entities", {}) or {}
+
+            # ========== Media extraction (photos, videos, animated_gif) ==========
+            # Raw GraphQL provides media in entities.media and (richer) extended_entities.media
+            # We build a convenient 'media' list with direct usable URLs.
+            # Photos: use 'url'
+            # Videos/GIFs: use 'video_url' (best mp4 variant)
+            media = []
+            raw_media = (extended_entities.get("media") or entities.get("media") or [])
+            for m in raw_media:
+                if not isinstance(m, dict):
+                    continue
+                item = {
+                    "type": m.get("type"),  # photo / video / animated_gif
+                    "url": m.get("media_url_https") or m.get("media_url"),
+                    "width": None,
+                    "height": None,
+                    "duration_ms": None,
+                    "bitrate": None,
+                    "video_url": None,
+                }
+
+                # original size if available
+                orig = m.get("original_info") or {}
+                if orig.get("width"):
+                    item["width"] = orig.get("width")
+                    item["height"] = orig.get("height")
+                else:
+                    large = (m.get("sizes") or {}).get("large") or {}
+                    item["width"] = large.get("w")
+                    item["height"] = large.get("h")
+
+                if item["type"] in ("video", "animated_gif"):
+                    vi = m.get("video_info") or {}
+                    item["duration_ms"] = vi.get("duration_millis")
+                    variants = vi.get("variants") or []
+                    mp4s = [v for v in variants
+                            if v.get("content_type") == "video/mp4" and v.get("url")]
+                    if mp4s:
+                        best = max(mp4s, key=lambda v: v.get("bitrate") or 0)
+                        item["video_url"] = best.get("url")
+                        item["bitrate"] = best.get("bitrate")
+
+                media.append(item)
 
             normalized = {
                 "id": tid,
                 "text": text,
                 "created_at": legacy.get("created_at", ""),
                 "entities": entities,
+                "extended_entities": extended_entities,
+                "media": media,  # new: easy-to-use list with direct media URLs
                 "user": {
                     "screen_name": username,
                     "id_str": uid,
