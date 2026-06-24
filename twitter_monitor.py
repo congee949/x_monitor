@@ -310,9 +310,10 @@ def summarize_article(ai: "AIClassifier", username: str, entry: dict, markdown: 
     image_urls = extract_article_image_urls(markdown)
     images = fetch_article_images(image_urls) if image_urls else []
     source_url = article_url(entry["article_id"])
+    author = entry.get("author") or username  # RT 的 article 归原作者，不是转推本博主
     prompt = (
         f"{ARTICLE_SUMMARY_PROMPT}\n\n"
-        f"以下元信息仅供理解，摘要中不要复述：作者 @{username}；标题 {entry.get('article_title') or '未知'}；原文 {source_url}\n\n"
+        f"以下元信息仅供理解，摘要中不要复述：作者 @{author}；标题 {entry.get('article_title') or '未知'}；原文 {source_url}\n\n"
         f"文章 Markdown：\n{markdown[:30000]}"
     )
     if images:
@@ -490,8 +491,11 @@ def format_article_summary_rich(username: str, entry: dict, summary: str,
     title = re.sub(r"\s+", " ", title)
     title = re.sub(r"([\[\]()*_#`<>|~])", r"\\\1", title)
     link = article_url(entry["article_id"])
+    # RT 的 article 归原作者（entry["author"]，save_article 已存），不是转推的本博主
+    # （username = 队列归属账号）。旧条目无 author 键时回退 username。
+    author = entry.get("author") or username
     header = (f"## \U0001f4c4 {title}\n"
-              f"**@{username}** · [原文]({link})\n\n---\n\n")
+              f"**@{author}** · [原文]({link})\n\n---\n\n")
     body = _fold_summary_details(summary.strip())
     collage = ""
     if image_urls:
@@ -513,9 +517,10 @@ def format_article_failure_message(username: str, entry: dict, reason: str) -> t
     link = article_url(entry["article_id"])
     title = entry.get("article_title") or "X Article"
     attempts = entry.get("attempts", 0)
+    author = entry.get("author") or username  # RT 的 article 归原作者，不是转推本博主
     msg = (
         f"⚠️ <b>X Article 处理失败</b>\n\n"
-        f"作者：@{html.escape(username)}\n"
+        f"作者：@{html.escape(author)}\n"
         f"主题：<b>{html.escape(title)}</b>\n"
         f"链接：{html.escape(link)}\n"
         f"阶段：{html.escape(entry.get('failed_stage', 'unknown'))}\n"
@@ -894,13 +899,21 @@ class AIClassifier:
         return None, "all_image_ai_failed"
 
     def complete(self, prompt: str, max_tokens: int = 1200, temperature: float = 0.2) -> tuple[str | None, str]:
-        """按顺序尝试各后端生成文本。"""
+        """按顺序尝试各后端生成文本。
+
+        空结果视为失败、继续下一后端：mimo/gemini 都是推理模型，token 预算不够时
+        会把额度全花在隐藏推理上、content 返回空串（不抛异常）。旧逻辑把第一个
+        不抛异常的后端结果直接返回，空串也算成功 → 永远轮不到 gemini 兜底。
+        """
         for backend in self._backends:
             try:
-                return backend.complete(prompt, max_tokens=max_tokens, temperature=temperature), backend.name
+                result = backend.complete(prompt, max_tokens=max_tokens, temperature=temperature)
             except Exception as e:
                 print(f"    AI [{backend.name}] 摘要失败: {e}")
                 continue
+            if result and result.strip():
+                return result, backend.name
+            print(f"    AI [{backend.name}] 返回空内容，尝试下一后端")
         return None, "all_ai_failed"
 
 
@@ -1307,7 +1320,10 @@ def summarize_note_tweet(ai: "AIClassifier", username: str, note_text: str) -> s
         f"作者：@{username}\n"
         f"长推正文：\n{note_text[:4000]}"
     )
-    summary, backend = ai.complete(prompt, max_tokens=220, temperature=0.2)
+    # 2000 而非 220：mimo-v2.5 / gemini-3.5-flash 都是推理模型，220 token 会被隐藏
+    # 推理吃光（finish_reason=length，content 空 / 截断片段）→ TL;DR 退化成截断。
+    # 实测 2000 下两个后端都能产出完整一行 TL;DR（推理 ~150-300 + 正文 ~50-100）。
+    summary, backend = ai.complete(prompt, max_tokens=2000, temperature=0.2)
     if not summary:
         return None
     summary = collapse_text(re.sub(r"^TL;?DR[:：]\s*", "", summary, flags=re.IGNORECASE))
@@ -1315,6 +1331,28 @@ def summarize_note_tweet(ai: "AIClassifier", username: str, note_text: str) -> s
         print(f"    AI [{backend}] TL;DR 质量不足，使用短预览")
         return None
     return short_preview(summary, TLDR_PREVIEW_LIMIT)
+
+
+RT_PREFIX_RE = re.compile(r"^(RT @[A-Za-z0-9_]+:)[ \t]*")
+
+
+def _break_rt_prefix(text: str) -> str:
+    """转推正文 'RT @用户名: 正文' → 'RT @用户名:\\n\\n正文'：转推归属与正文分两段。"""
+    return RT_PREFIX_RE.sub(r"\1\n\n", text, count=1)
+
+
+def _rich_preserve(text: str) -> str:
+    """Rich 消息 html 字段保留原推结构：转义后换行转 <br>、连续空格转 &nbsp;。
+
+    Rich HTML 默认把源码里的换行和连续空格压扁成一行（官方文档原话
+    'all the text above was on the same line'）——这就是「全文」变一坨的原因。
+    <br> 与 &nbsp; 都在 Rich HTML 支持的标签/命名实体范围内。先 escape 再加标签，
+    顺序保证加进去的 <br>/&nbsp; 不被二次转义。
+    """
+    esc = html.escape(text)
+    esc = esc.replace("\n", "<br>")
+    esc = re.sub(r" {2,}", lambda m: "&nbsp;" * len(m.group()), esc)
+    return esc
 
 
 def format_message(
@@ -1332,9 +1370,10 @@ def format_message(
     link = f"https://x.com/{username}/status/{tid}" if tid else ""
     hidden = f'<a href="{link}">​</a>' if link else ""
     note = t.get("note_tweet") or {}
-    note_text = note.get("text", "").strip()
+    note_text = _break_rt_prefix(note.get("text", "").strip())  # RT 归属换行（全文/长推用）
     folded_full = ""
     folded_full_rich = ""
+    rich_full = ""
     if note_text:
         # TL;DR 优先级：原文自带 > AI 总结 > 短预览
         preview = extract_author_tldr(note_text)
@@ -1345,38 +1384,42 @@ def format_message(
             # twice turned "&"/"<" in the TL;DR into literal &amp;/&lt; in Telegram.
             body = f"TL;DR：{preview}"
         else:
-            body = short_preview(note_text)
+            # short_preview 会折叠 RT 换行，所以折叠后再补一次（无 TL;DR 的长转推也分行）
+            body = _break_rt_prefix(short_preview(note_text))
         # 长推全文折叠在 expandable blockquote 里：列表只占几行，点开看全文
         folded_full = note_text if len(note_text) <= 2800 else note_text[:2800] + "…"
         # Telegram 按 UTF-16 计长（astral 表情每个 2 单位）：表情密集长推按字符
         # 截断仍可能超 4096 → HTML 与 plain 降级双双 400 → 推文静默丢失。按单位收缩。
         while len(folded_full.encode("utf-16-le")) // 2 > 3000 and len(folded_full) > 100:
             folded_full = folded_full[: int(len(folded_full) * 0.9)] + "…"
-        # Rich 路径折叠用远大的上限（约 28000 字符，留 header/摘要余量保持
-        # 在 RICH_MESSAGE_MAX_CHARS 之下）：sendRichMessage 单条 32768。
+        # Rich 路径折叠用远大的上限（约 28000 字符）：sendRichMessage 单条 32768。
+        # 但 _rich_preserve 的 <br>/&nbsp; 会让长度膨胀，故按「渲染后」UTF-16 长度
+        # 收缩到 27000 单位以内，留 header/body/标签余量保持在 RICH_MESSAGE_MAX_CHARS 下。
         folded_full_rich = note_text if len(note_text) <= 28000 else note_text[:28000] + "…"
-        while len(folded_full_rich.encode("utf-16-le")) // 2 > 28000 and len(folded_full_rich) > 100:
+        rich_full = _rich_preserve(folded_full_rich)
+        while len(rich_full.encode("utf-16-le")) // 2 > 27000 and len(folded_full_rich) > 100:
             folded_full_rich = folded_full_rich[: int(len(folded_full_rich) * 0.9)] + "…"
+            rich_full = _rich_preserve(folded_full_rich)
     elif t.get("article"):
         body = article_preview_text(t)
     else:
-        body = short_preview(t.get("text", ""))
+        body = _break_rt_prefix(short_preview(t.get("text", "")))  # 普通转推：RT 归属换行
     if body:
         text = f'📢 @{username}{hidden}\n\n{html.escape(body)}'
     else:
         text = f'📢 @{username}{hidden}'
     if folded_full:
         text += f"\n\n<blockquote expandable>{html.escape(folded_full)}</blockquote>"
-    # Rich HTML variant: tweet body/note is raw user content → html.escape it and
-    # send via the rich `html` field (NOT markdown), so < > * _ # | $ [ ] etc.
-    # can't be parsed as rich syntax or inject nested blocks. The 「打开原文」
-    # button comes from the wrapper.
+    # Rich HTML variant: tweet body/note is raw user content → _rich_preserve it
+    # (escape + <br> + &nbsp;) and send via the rich `html` field (NOT markdown),
+    # so < > * _ # | $ [ ] etc. can't be parsed as rich syntax / inject nested
+    # blocks，同时保留原推的换行与空格。「打开原文」按钮来自 wrapper。
     if body:
-        rich_html = f'📢 @{username}\n\n{html.escape(body)}'
+        rich_html = f'📢 @{username}\n\n{_rich_preserve(body)}'
     else:
         rich_html = f'📢 @{username}'
-    if folded_full_rich:
-        rich_html += f"\n\n<details><summary>全文</summary>\n\n{html.escape(folded_full_rich)}\n\n</details>"
+    if rich_full:
+        rich_html += f"\n\n<details><summary>全文</summary>\n\n{rich_full}\n\n</details>"
     return text, rich_html, link
 
 
@@ -1630,6 +1673,11 @@ def process_user(
             article_id = detect_article(t)
             if article_id:
                 save_article(username, article_id, t)
+                # DEDUP-1：带 article 的推文只走摘要队列，不再作为普通/长推重复推送。
+                # 否则博主转推他人 article 时，转推壳会以本博主名义再推一条长推
+                # （misattributed），形成「长推 + 摘要」两条消息（见 Issue 4）。
+                # tid 已加入 new_ids → 仍会被标记 seen，下轮不重复检测。
+                continue
             if not is_within_push_window(t, args.max_push_age_minutes):
                 print(f"    skip stale: {tid}")
                 continue
@@ -1877,7 +1925,7 @@ def process_article_queue(ai: AIClassifier, bot_token: str, chat_id: str, dry_ru
                             # editMessageText 不传 reply_markup 会移除原按钮，显式带上。
                             _tg_post_quiet(bot_token, {
                                 "chat_id": chat_id, "message_id": _fmid,
-                                "text": (f"✅ <b>X Article 重试成功</b>：@{html.escape(username)} "
+                                "text": (f"✅ <b>X Article 重试成功</b>：@{html.escape(entry.get('author') or username)} "
                                          f"摘要已推送（此前失败 {max(int(entry.get('attempts', 1)) - 1, 1)} 次）"),
                                 "parse_mode": "HTML",
                                 "reply_markup": {"inline_keyboard": [[

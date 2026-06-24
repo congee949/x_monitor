@@ -1112,5 +1112,194 @@ class SendTweetTest(unittest.TestCase):
         self.assertLessEqual(calls["html_len"], twitter_monitor.RICH_MESSAGE_MAX_CHARS)
 
 
+class _FakeBackend:
+    def __init__(self, name, result=None, exc=None):
+        self.name = name
+        self._result = result
+        self._exc = exc
+
+    def complete(self, prompt, max_tokens=1200, temperature=0.2):
+        if self._exc:
+            raise self._exc
+        return self._result
+
+
+class AIClassifierCompleteTest(unittest.TestCase):
+    """Issue 1: 推理模型 token 耗尽返回空串时，必须继续下一后端而不是当成功。"""
+
+    def test_empty_backend_falls_through_to_next(self):
+        ai = twitter_monitor.AIClassifier([
+            _FakeBackend("mimo", result=""),          # 推理吃光 token → 空 content
+            _FakeBackend("gemini", result="好摘要"),
+        ])
+        self.assertEqual(ai.complete("p"), ("好摘要", "gemini"))
+
+    def test_whitespace_only_treated_as_empty(self):
+        ai = twitter_monitor.AIClassifier([
+            _FakeBackend("mimo", result="  \n  "),
+            _FakeBackend("gemini", result="ok"),
+        ])
+        self.assertEqual(ai.complete("p"), ("ok", "gemini"))
+
+    def test_all_empty_returns_none(self):
+        ai = twitter_monitor.AIClassifier([
+            _FakeBackend("mimo", result=""),
+            _FakeBackend("gemini", result=None),
+        ])
+        self.assertEqual(ai.complete("p"), (None, "all_ai_failed"))
+
+    def test_raising_backend_skipped(self):
+        ai = twitter_monitor.AIClassifier([
+            _FakeBackend("mimo", exc=RuntimeError("boom")),
+            _FakeBackend("gemini", result="ok"),
+        ])
+        self.assertEqual(ai.complete("p"), ("ok", "gemini"))
+
+
+class NoteTweetSummaryBudgetTest(unittest.TestCase):
+    """Issue 1: summarize_note_tweet 必须给推理模型足够 token（防回退到 220）。"""
+
+    def test_uses_large_token_budget(self):
+        captured = {}
+
+        class RecAI:
+            def is_available(self):
+                return True
+
+            def complete(self, prompt, max_tokens=1200, temperature=0.2):
+                captured["max_tokens"] = max_tokens
+                return "这是一条足够长且全是中文的摘要内容用来通过质量门控检查。", "rec"
+
+        out = twitter_monitor.summarize_note_tweet(RecAI(), "dotey", "原始长推正文" * 50)
+        self.assertGreaterEqual(captured["max_tokens"], 1000)
+        self.assertTrue(out)
+
+
+class RtBreakTest(unittest.TestCase):
+    """Issue 3: 转推 'RT @用户名: 正文' 在归属后换行。"""
+
+    def test_break_rt_prefix_inserts_blank_line(self):
+        self.assertEqual(twitter_monitor._break_rt_prefix("RT @someone: 正文内容"),
+                         "RT @someone:\n\n正文内容")
+
+    def test_break_rt_prefix_noop_without_prefix(self):
+        self.assertEqual(twitter_monitor._break_rt_prefix("普通推文 @someone 你好"),
+                         "普通推文 @someone 你好")
+        self.assertEqual(twitter_monitor._break_rt_prefix("RT 没有冒号"),
+                         "RT 没有冒号")
+
+    def test_format_message_regular_rt_breaks_in_both_paths(self):
+        msg, rich, _ = twitter_monitor.format_message(
+            "dotey", {"id": "1", "text": "RT @paulwalker: 这是被转发的正文内容需要单独成段显示出来。"})
+        self.assertIn("RT @paulwalker:\n\n", msg)         # HTML 回退：原生换行
+        self.assertIn("RT @paulwalker:<br><br>", rich)    # rich：<br>
+
+    def test_format_message_long_rt_breaks_teaser_when_no_tldr(self):
+        # 长转推无 TL;DR 时，teaser 也要折行（note 分支折叠后补 _break_rt_prefix）
+        note = "RT @bigaccount: " + "这是一条很长的转推正文内容。" * 30
+        msg, _rich, _ = twitter_monitor.format_message(
+            "dotey", {"id": "9", "note_tweet": {"text": note}}, None)
+        teaser = msg.split("<blockquote expandable>")[0]
+        self.assertIn("RT @bigaccount:\n\n", teaser)
+
+
+class RichPreserveTest(unittest.TestCase):
+    """Issue 2: rich 全文保留换行(<br>)与连续空格(&nbsp;)，HTML 回退用原生换行。"""
+
+    def test_format_message_rich_preserves_note_structure(self):
+        note = "第一行\n第二行\n  缩进两格的行\n普通"
+        msg, rich, _ = twitter_monitor.format_message(
+            "dotey", {"id": "2", "note_tweet": {"text": note}}, None)
+        self.assertIn("第一行<br>第二行<br>", rich)
+        self.assertIn("&nbsp;&nbsp;缩进两格的行", rich)
+        self.assertIn("<details><summary>全文</summary>", rich)
+        self.assertIn("<blockquote expandable>", msg)      # 回退路径不变
+        self.assertNotIn("<br>", msg)                      # 回退用原生换行
+
+    def test_rich_full_within_budget_with_newline_expansion(self):
+        # 每行很短 + 大量换行：<br> 膨胀最狠的情形，仍须收缩到 RICH_MESSAGE_MAX_CHARS 内
+        note = "\n".join(["行"] * 20000)
+        _msg, rich, _ = twitter_monitor.format_message(
+            "dotey", {"id": "3", "note_tweet": {"text": note}}, None)
+        self.assertLessEqual(len(rich), twitter_monitor.RICH_MESSAGE_MAX_CHARS)
+        self.assertIn("<br>", rich)
+
+
+class ArticleAttributionTest(unittest.TestCase):
+    """Issue 4b: 转推他人 article 的摘要必须署原作者，而不是转推的本博主。"""
+
+    def test_summary_rich_uses_original_author(self):
+        entry = {"article_id": "999", "article_title": "标题", "author": "liuren"}
+        md = twitter_monitor.format_article_summary_rich("dotey", entry, "正文")
+        self.assertIn("**@liuren**", md)
+        self.assertNotIn("@dotey", md)
+
+    def test_summary_rich_falls_back_to_username(self):
+        entry = {"article_id": "999", "article_title": "标题"}  # 旧条目无 author
+        md = twitter_monitor.format_article_summary_rich("dotey", entry, "正文")
+        self.assertIn("**@dotey**", md)
+
+    def test_failure_message_uses_original_author(self):
+        entry = {"article_id": "9", "article_title": "标题",
+                 "author": "liuren", "failed_stage": "fetch_markdown"}
+        msg, _ = twitter_monitor.format_article_failure_message("dotey", entry, "原因")
+        self.assertIn("@liuren", msg)
+        self.assertNotIn("@dotey", msg)
+
+    def test_summarize_article_prompt_names_original_author(self):
+        # summarize_article 平时被 mock，单独验证 entry["author"] 真的进了 AI prompt
+        captured = {}
+
+        class CaptureAI:
+            def is_available(self):
+                return True
+
+            def complete(self, prompt, max_tokens=1200, temperature=0.2):
+                captured["prompt"] = prompt
+                return "摘要正文", "cap"
+
+            def complete_with_images(self, prompt, images, max_tokens=1200, temperature=0.2):
+                captured["prompt"] = prompt
+                return "摘要正文", "cap"
+
+        entry = {"article_id": "2062806260563771392", "article_title": "测试文章",
+                 "author": "liuren"}
+        with patch.object(twitter_monitor, "fetch_article_images", return_value=[]):
+            summary, _backend = twitter_monitor.summarize_article(
+                CaptureAI(), "dotey", entry, "# 测试文章\n\n正文内容，无图片。")
+        self.assertEqual(summary, "摘要正文")
+        self.assertIn("作者 @liuren", captured["prompt"])
+        self.assertNotIn("@dotey", captured["prompt"])
+
+
+class ArticleDedupPushTest(unittest.TestCase):
+    """Issue 4a: 带 article 的推文只入队，不再作为普通推文重复推送。"""
+
+    ARTICLE_TWEET = {
+        "id": "art-1",
+        "text": "新文章发布 https://x.com/i/article/777 欢迎阅读全文内容",
+        "createdAt": "Tue May 12 00:20:00 +0000 2026",
+    }
+
+    def test_article_tweet_queued_not_pushed(self):
+        sent, saved = [], []
+        args = argparse.Namespace(test=False, seed=False, dry_run=False,
+                                  limit=20, max_push_age_minutes=45)
+        with patch.object(twitter_monitor, "datetime", FixedDatetime), \
+             patch.object(twitter_monitor, "fetch_tweets", return_value=[self.ARTICLE_TWEET]), \
+             patch.object(twitter_monitor, "load_seen", return_value=({"old"}, None)), \
+             patch.object(twitter_monitor, "save_seen", return_value=None), \
+             patch.object(twitter_monitor, "save_article", side_effect=lambda u, a, t: saved.append(a)), \
+             patch.object(twitter_monitor, "send_tweet",
+                          side_effect=lambda *a, **k: (sent.append(a), {"ok": True})[1]), \
+             patch.object(twitter_monitor.time, "sleep", return_value=None):
+            new, pushed, filt, ov = twitter_monitor.process_user(
+                pool=None, ai=FakeAI(False), username="dotey",
+                bot_token="b", chat_id="c", args=args)
+        self.assertEqual(saved, ["777"])   # article 入队
+        self.assertEqual(sent, [])         # 但没有作为普通推文推送
+        self.assertEqual(pushed, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
