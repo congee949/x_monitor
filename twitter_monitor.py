@@ -110,6 +110,14 @@ def detect_article(tweet: dict) -> str | None:
     return None
 
 
+def _quote_comment_text(tweet: dict) -> str:
+    """引用推文中博主自己的评论：note_tweet 优先否则壳 text，去尾部 t.co 短链 + 收缩。"""
+    text = (tweet.get("note_tweet") or {}).get("text") or tweet.get("text") or ""
+    text = re.sub(r"\s*https?://t\.co/\w+\s*$", "", text)  # 去尾部 t.co 短链
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:200]
+
+
 def save_article(username: str, article_id: str, tweet: dict) -> None:
     """保存检测到的 Article 到队列文件。"""
     os.makedirs(ARTICLE_QUEUE_DIR, exist_ok=True)
@@ -127,18 +135,24 @@ def save_article(username: str, article_id: str, tweet: dict) -> None:
     note = tweet.get("note_tweet") or {}
     note_text = note.get("text", "").strip()
     article_data = tweet.get("article") or {}
-    # RT 时记原推 id + 原作者：抓取必须走原作者 status URL（壳 URL 无 article
-    # 节点，工具会退化到按 article_id 直查的空 {} 路径 → empty_article_body）
+    # RT/引用时记原推 id + 原作者：抓取必须走原作者 status URL（壳 URL 无 article
+    # 节点，工具会退化到按 article_id 直查的空 {} 路径 → empty_article_body）。
+    # 优先级转推 > 引用（与解析器 article 取值一致）。
     rt = tweet.get("retweeted_status") or {}
+    quoted = tweet.get("quoted_status") or {}
+    origin = rt or quoted
+    # quote_comment 仅引用（quoted 有、rt 无）时设：博主自己的评论作摘要引子。
+    quote_comment = _quote_comment_text(tweet) if (quoted and not rt) else ""
     entry = {
         "article_id": article_id,
-        "tweet_id": rt.get("id") or tweet.get("id"),
-        "author": rt.get("screen_name") or username,
+        "tweet_id": origin.get("id") or tweet.get("id"),
+        "author": origin.get("screen_name") or username,
         "detected_at": datetime.now(timezone.utc).isoformat(),
         "tweet_text": (tweet.get("text") or "")[:200],
         "note_tweet_text": note_text,
         "article_title": article_data.get("title", ""),
         "article_preview": article_data.get("preview_text", ""),
+        "quote_comment": quote_comment,
         "status": "pending",
         "content": None,
     }
@@ -458,10 +472,18 @@ def split_telegram_html(text: str, limit: int = 3500) -> list[str]:
 def format_article_summary_messages(username: str, entry: dict, summary: str) -> list[str]:
     rendered_summary = markdown_to_telegram_html(summary)
     chunks = split_telegram_html(rendered_summary)
-    if len(chunks) <= 1:
-        return chunks
-    total = len(chunks)
-    return [f"<b>X Article 摘要 {idx}/{total}</b>\n\n{chunk}" for idx, chunk in enumerate(chunks, 1)]
+    if len(chunks) > 1:
+        total = len(chunks)
+        chunks = [f"<b>X Article 摘要 {idx}/{total}</b>\n\n{chunk}" for idx, chunk in enumerate(chunks, 1)]
+    # 引用文章：博主评论作引子（与 rich 摘要一致），HTML 转义，仅引用且渲染非空时加。
+    # chunks 为空（摘要被剥光）不加引子，保留 process_article_queue「渲染为空判 failed
+    # 不假 sent」的防线（否则空摘要会被引子撑成非空、误判已送达）。
+    comment = (entry.get("quote_comment") or "").strip()
+    if comment and chunks:
+        comment = re.sub(r"\s+", " ", comment)
+        lead_in = f"> @{html.escape(username)} 引用：{html.escape(comment)}\n\n"
+        chunks = [lead_in + chunks[0]] + chunks[1:]
+    return chunks
 
 
 def _fold_summary_details(summary: str) -> str:
@@ -494,6 +516,13 @@ def format_article_summary_rich(username: str, entry: dict, summary: str,
     # RT 的 article 归原作者（entry["author"]，save_article 已存），不是转推的本博主
     # （username = 队列归属账号）。旧条目无 author 键时回退 username。
     author = entry.get("author") or username
+    # 引用文章：博主评论作引子，单条消息顶部一行 rich blockquote（username = 引用者）。
+    lead_in = ""
+    comment = (entry.get("quote_comment") or "").strip()
+    if comment:
+        comment = re.sub(r"\s+", " ", comment)  # 折成一行
+        comment = re.sub(r"([\[\]()*_#`<>|~])", r"\\\1", comment)  # 同标题转义
+        lead_in = f"> @{username} 引用：{comment}\n\n"
     header = (f"## \U0001f4c4 {title}\n"
               f"**@{author}** · [原文]({link})\n\n---\n\n")
     body = _fold_summary_details(summary.strip())
@@ -505,7 +534,7 @@ def format_article_summary_rich(username: str, entry: dict, summary: str,
         else:
             blocks = "\n".join(f"![]({u})" for u in urls)
             collage = f"\n\n<tg-collage>\n\n{blocks}\n\n</tg-collage>"
-    return header + body + collage
+    return lead_in + header + body + collage
 
 
 def format_article_summary_message(username: str, entry: dict, summary: str) -> tuple[str, str]:
@@ -518,7 +547,13 @@ def format_article_failure_message(username: str, entry: dict, reason: str) -> t
     title = entry.get("article_title") or "X Article"
     attempts = entry.get("attempts", 0)
     author = entry.get("author") or username  # RT 的 article 归原作者，不是转推本博主
+    lead_in = ""  # 引用文章：博主评论作引子（HTML 转义），与 rich 摘要保持一致
+    comment = (entry.get("quote_comment") or "").strip()
+    if comment:
+        comment = re.sub(r"\s+", " ", comment)
+        lead_in = f"> @{html.escape(username)} 引用：{html.escape(comment)}\n\n"
     msg = (
+        f"{lead_in}"
         f"⚠️ <b>X Article 处理失败</b>\n\n"
         f"作者：@{html.escape(author)}\n"
         f"主题：<b>{html.escape(title)}</b>\n"
@@ -1671,6 +1706,12 @@ def process_user(
             # 放在 seen 判断之前会让 seed/新账号首轮灌入历史文章，且已 seen 推文
             # 会把被 7 天清理删掉的 sent 条目重新入队造成重复推送。
             article_id = detect_article(t)
+            if not article_id:
+                # 节点兜底：引用文章的壳推 entities.urls 为空，detect_article 必漏，
+                # 但归一化后挂了 article 节点 → 用其 rest_id 入队，避免裸推漏掉。
+                art = t.get("article") or {}
+                if art.get("rest_id"):
+                    article_id = art["rest_id"]
             if article_id:
                 save_article(username, article_id, t)
                 # DEDUP-1：带 article 的推文只走摘要队列，不再作为普通/长推重复推送。

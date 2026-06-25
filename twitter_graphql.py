@@ -377,13 +377,28 @@ def fetch_tweets(username, limit=20):
             if rt_result.get("__typename") == "TweetWithVisibilityResults":
                 rt_result = rt_result.get("tweet") or {}
 
+            # Quote: quoted_status_result 在 tweet_result 顶层（非 legacy 下），形状同推文
+            quoted_result = (tweet_result.get("quoted_status_result") or {}).get("result") or {}
+            if quoted_result.get("__typename") == "TweetWithVisibilityResults":
+                quoted_result = quoted_result.get("tweet") or {}
+            # 引用作者无法解析（被引推文删除/封禁/隐藏，legacy 在但 core 被剥）时，
+            # 既不取其 article 也不设 quoted_status，退化为普通推文——否则空 screen_name
+            # 会把引用文章错署到本博主并拼出坏 fetch URL（x.com/本博主/status/被引id）。
+            q_legacy = quoted_result.get("legacy") or {}
+            q_user = ((quoted_result.get("core") or {}).get("user_results") or {}).get("result") or {}
+            q_screen = ((q_user.get("legacy") or {}).get("screen_name")
+                        or (q_user.get("core") or {}).get("screen_name") or "")
+            if not (q_legacy.get("id_str") and q_screen):
+                quoted_result = {}
+
             # Extract note_tweet (longform)
             note_data = tweet_result.get("note_tweet", {})
             note_results = note_data.get("note_tweet_results", {}).get("result", {})
             note_text = note_results.get("text", "")
 
-            # Extract article (Twitter Article format)；转推时读原推的 article
-            article_data = (rt_result or tweet_result).get("article", {})
+            # Extract article (Twitter Article format)；转推/引用时读原推的 article
+            # 优先级：转推 > 引用 > 本体
+            article_data = (rt_result or quoted_result or tweet_result).get("article", {})
             article_result = article_data.get("article_results", {}).get("result", {})
             article_title = article_result.get("title", "")
             article_preview = article_result.get("preview_text", "")
@@ -455,7 +470,10 @@ def fetch_tweets(username, limit=20):
             if note_text:
                 normalized["note_tweet"] = {"text": note_text}
 
-            if article_title or article_preview:
+            # rest_id 是去重/缓存/抓取键：无 id 的 article 节点既不可入队也无法 fetch。
+            # 不挂节点 → 与 process_user 的节点兜底（按 rest_id）和 format_message 的
+            # t["article"] 判定一致，避免「有标题无 rest_id」漏检后裸推误署名。
+            if article_rest_id and (article_title or article_preview):
                 normalized["article"] = {
                     "title": article_title,
                     "preview_text": article_preview,
@@ -470,6 +488,12 @@ def fetch_tweets(username, limit=20):
                 if rt_legacy.get("id_str"):
                     normalized["retweeted_status"] = {"id": rt_legacy["id_str"],
                                                       "screen_name": rt_screen}
+
+            # 引用：作者可解析时才设 quoted_status（quoted_result 已在上方按可用性归零，
+            # 非空即代表 id 与 screen_name 均有效；被引推文删除/作者不可解析时为空 → 不设）。
+            if quoted_result:
+                normalized["quoted_status"] = {"id": q_legacy["id_str"],
+                                               "screen_name": q_screen}
 
             tweets.append(normalized)
 

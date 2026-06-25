@@ -433,6 +433,238 @@ class RetweetArticleTest(unittest.TestCase):
         self.assertEqual(captured["cmd"][-1], "https://x.com/liuren/status/2062808278812520765")
 
 
+class QuoteArticleTest(unittest.TestCase):
+    """引用他人 X Article：单条摘要、署名原作者、博主评论作引子；壳推无 URL 也要入队。
+
+    live 样本 @karpathy 引用 @trq212 文章：article rest_id=2052796100608974848，
+    被引推文 id=2052809885763747935，原作者 trq212，karpathy 评论无 article URL、
+    entities.urls 为空。
+    """
+
+    # 归一化之后的引用推文（article 取自被引推、quoted_status 已展开）
+    QUOTE_TWEET = {
+        "id": "2052810000000000000",
+        "text": "this is a great writeup on tokenization https://t.co/abc123",
+        "entities": {"urls": []},  # 壳推无 article URL（live 实测）
+        "article": {"title": "Tokenization deep dive", "preview_text": "预览",
+                    "rest_id": "2052796100608974848"},
+        "quoted_status": {"id": "2052809885763747935", "screen_name": "trq212"},
+    }
+
+    def test_normalizer_unwraps_quoted_article(self):
+        import json as _json
+        import twitter_graphql as tg
+        quoted_original = {
+            "__typename": "Tweet",
+            "legacy": {"id_str": "2052809885763747935", "full_text": "原文壳"},
+            "core": {"user_results": {"result": {"legacy": {"screen_name": "trq212"}}}},
+            "article": {"article_results": {"result": {
+                "title": "Tokenization deep dive", "preview_text": "预览",
+                "rest_id": "2052796100608974848"}}},
+        }
+        synthetic = {"data": {"user": {"result": {"timeline_v2": {"timeline": {"instructions": [
+            {"entries": [
+                {"content": {"itemContent": {"tweet_results": {"result": {
+                    "__typename": "Tweet",
+                    "legacy": {"id_str": "2052810000000000000",
+                               "full_text": "great writeup https://t.co/abc123",
+                               "created_at": "Fri Jun 05 17:30:00 +0000 2026",
+                               "entities": {"urls": []}},
+                    # quoted_status_result 在 tweet_result 顶层，非 legacy 下
+                    "quoted_status_result": {"result": quoted_original}}}}}},
+            ]}]}}}}}}
+        with patch.object(tg, "_auth_headers", lambda: None), \
+             patch.object(tg, "_get_guest_token", lambda: "gt"), \
+             patch.object(tg, "get_user_id", lambda u: "123"), \
+             patch.object(tg, "_curl", lambda *a, **k: _json.dumps(synthetic)):
+            tweets = tg.fetch_tweets("karpathy", limit=20)
+        self.assertEqual(len(tweets), 1)
+        self.assertEqual(tweets[0]["article"]["title"], "Tokenization deep dive")  # 取被引文章
+        self.assertEqual(tweets[0]["article"]["rest_id"], "2052796100608974848")
+        self.assertEqual(tweets[0]["quoted_status"],
+                         {"id": "2052809885763747935", "screen_name": "trq212"})
+
+    def test_normalizer_deleted_quote_degrades_gracefully(self):
+        import json as _json
+        import twitter_graphql as tg
+        synthetic = {"data": {"user": {"result": {"timeline_v2": {"timeline": {"instructions": [
+            {"entries": [
+                {"content": {"itemContent": {"tweet_results": {"result": {
+                    "__typename": "Tweet",
+                    "legacy": {"id_str": "2052810000000000000",
+                               "full_text": "引用了一条已删除推文",
+                               "created_at": "Fri Jun 05 17:30:00 +0000 2026"},
+                    "quoted_status_result": {}}}}}},  # 被引推文删除 → 空
+            ]}]}}}}}}
+        with patch.object(tg, "_auth_headers", lambda: None), \
+             patch.object(tg, "_get_guest_token", lambda: "gt"), \
+             patch.object(tg, "get_user_id", lambda u: "123"), \
+             patch.object(tg, "_curl", lambda *a, **k: _json.dumps(synthetic)):
+            tweets = tg.fetch_tweets("karpathy", limit=20)
+        self.assertEqual(len(tweets), 1)
+        self.assertNotIn("article", tweets[0])
+        self.assertNotIn("quoted_status", tweets[0])
+
+    def test_save_article_quote_attributes_original_and_sets_comment(self):
+        import json as _json
+        import os as _os
+        import tempfile
+        with tempfile.TemporaryDirectory() as d, \
+             patch.object(twitter_monitor, "ARTICLE_QUEUE_DIR", d):
+            twitter_monitor.save_article("karpathy", "2052796100608974848", self.QUOTE_TWEET)
+            with open(_os.path.join(d, "karpathy_queue.json")) as f:
+                entry = _json.load(f)[0]
+        self.assertEqual(entry["tweet_id"], "2052809885763747935")  # 被引推，不是壳
+        self.assertEqual(entry["author"], "trq212")
+        self.assertEqual(entry["article_id"], "2052796100608974848")
+        # 评论取壳 text，尾部 t.co 短链已去掉
+        self.assertEqual(entry["quote_comment"], "this is a great writeup on tokenization")
+        self.assertEqual(twitter_monitor.article_fetch_url("karpathy", entry),
+                         "https://x.com/trq212/status/2052809885763747935")
+
+    def test_save_article_retweet_has_no_quote_comment(self):
+        import json as _json
+        import os as _os
+        import tempfile
+        rt_tweet = {
+            "id": "2062952690750021934",
+            "text": "RT @liuren: https://t.co/oa1PZY0g9C",
+            "article": {"title": "测试文章", "preview_text": "预览", "rest_id": "2062806260563771392"},
+            "retweeted_status": {"id": "2062808278812520765", "screen_name": "liuren"},
+        }
+        with tempfile.TemporaryDirectory() as d, \
+             patch.object(twitter_monitor, "ARTICLE_QUEUE_DIR", d):
+            twitter_monitor.save_article("dotey", "2062806260563771392", rt_tweet)
+            with open(_os.path.join(d, "dotey_queue.json")) as f:
+                entry = _json.load(f)[0]
+        self.assertEqual(entry["author"], "liuren")  # 原作者
+        self.assertEqual(entry["quote_comment"], "")  # 转推无评论引子
+
+    def test_save_article_self_article_has_no_quote_comment(self):
+        import json as _json
+        import os as _os
+        import tempfile
+        self_tweet = {
+            "id": "300",
+            "text": "我自己的文章 https://x.com/i/article/300",
+            "article": {"title": "自文", "preview_text": "p", "rest_id": "300"},
+        }
+        with tempfile.TemporaryDirectory() as d, \
+             patch.object(twitter_monitor, "ARTICLE_QUEUE_DIR", d):
+            twitter_monitor.save_article("dotey", "300", self_tweet)
+            with open(_os.path.join(d, "dotey_queue.json")) as f:
+                entry = _json.load(f)[0]
+        self.assertEqual(entry["author"], "dotey")  # 自文归本博主
+        self.assertEqual(entry["quote_comment"], "")
+
+    def test_process_user_node_fallback_enqueues_and_suppresses_push(self):
+        """引用文章壳推无 URL → 节点兜底入队 article，且不作为普通推送。"""
+        saved = []
+        sent = []
+        # 壳推：text/entities 无 article URL，但归一化挂了 article 节点
+        quote_tweet = {
+            "id": "2052810000000000000",
+            "text": "great writeup https://t.co/abc123",
+            "entities": {"urls": []},
+            "createdAt": "Tue May 12 00:20:00 +0000 2026",
+            "article": {"title": "Tokenization deep dive", "preview_text": "p",
+                        "rest_id": "2052796100608974848"},
+            "quoted_status": {"id": "2052809885763747935", "screen_name": "trq212"},
+        }
+        args = argparse.Namespace(test=False, seed=False, dry_run=False,
+                                  limit=20, max_push_age_minutes=45)
+        with patch.object(twitter_monitor, "datetime", FixedDatetime), \
+             patch.object(twitter_monitor, "fetch_tweets", return_value=[quote_tweet]), \
+             patch.object(twitter_monitor, "load_seen", return_value=({"old"}, None)), \
+             patch.object(twitter_monitor, "save_seen", return_value=None), \
+             patch.object(twitter_monitor, "save_article",
+                          side_effect=lambda u, a, t: saved.append(a)), \
+             patch.object(twitter_monitor, "send_telegram",
+                          side_effect=lambda *a, **k: sent.append(a) or {"ok": True}), \
+             patch.object(twitter_monitor.time, "sleep", return_value=None):
+            new_count, push_count, filter_count, ai_overridden = twitter_monitor.process_user(
+                pool=None, ai=FakeAI(False), username="karpathy",
+                bot_token="bot", chat_id="chat", args=args)
+        self.assertEqual(saved, ["2052796100608974848"])  # 节点兜底入队
+        self.assertEqual(push_count, 0)  # 未作为普通推送
+        self.assertEqual(sent, [])
+
+    def _normalize_single(self, tweet_result):
+        import json as _json
+        import twitter_graphql as tg
+        synthetic = {"data": {"user": {"result": {"timeline_v2": {"timeline": {"instructions": [
+            {"entries": [{"content": {"itemContent": {"tweet_results": {
+                "result": tweet_result}}}}]}]}}}}}}
+        with patch.object(tg, "_auth_headers", lambda: None), \
+             patch.object(tg, "_get_guest_token", lambda: "gt"), \
+             patch.object(tg, "get_user_id", lambda u: "123"), \
+             patch.object(tg, "_curl", lambda *a, **k: _json.dumps(synthetic)):
+            return tg.fetch_tweets("u", limit=20)
+
+    def test_normalizer_drops_article_without_rest_id(self):
+        """article 节点有标题但 rest_id 空 → 不挂 article 节点（无 id 不可入队/抓取），
+        与 process_user 节点兜底 + format_message 的 t['article'] 判定一致，杜绝裸推。"""
+        tweets = self._normalize_single({
+            "__typename": "Tweet",
+            "legacy": {"id_str": "400", "full_text": "无 id 的文章",
+                       "created_at": "Fri Jun 05 17:30:00 +0000 2026", "entities": {"urls": []}},
+            "article": {"article_results": {"result": {
+                "title": "有标题但无 rest_id", "preview_text": "p", "rest_id": ""}}}})
+        self.assertEqual(len(tweets), 1)
+        self.assertNotIn("article", tweets[0])
+
+    def test_normalizer_drops_unresolvable_quote_author(self):
+        """被引推文 legacy 在但作者 core 被剥（screen_name 空）→ 既不取其 article
+        也不设 quoted_status，退化普通推（否则错署本博主 + 坏 fetch URL）。"""
+        quoted_no_author = {
+            "__typename": "Tweet",
+            "legacy": {"id_str": "2052809885763747935", "full_text": "原文壳"},
+            "core": {},  # 作者节点被剥
+            "article": {"article_results": {"result": {
+                "title": "Tokenization deep dive", "preview_text": "预览",
+                "rest_id": "2052796100608974848"}}}}
+        tweets = self._normalize_single({
+            "__typename": "Tweet",
+            "legacy": {"id_str": "2052810000000000000", "full_text": "引用",
+                       "created_at": "Fri Jun 05 17:30:00 +0000 2026", "entities": {"urls": []}},
+            "quoted_status_result": {"result": quoted_no_author}})
+        self.assertEqual(len(tweets), 1)
+        self.assertNotIn("quoted_status", tweets[0])
+        self.assertNotIn("article", tweets[0])
+
+    def test_normalizer_quote_without_article_sets_quoted_status(self):
+        """引用普通推文（有作者无 article）→ quoted_status 设上、article 不设。
+        证明 quote 展开真的跑了（与 baseline 区分：baseline 两者皆无）。"""
+        quoted_plain = {
+            "__typename": "Tweet",
+            "legacy": {"id_str": "999", "full_text": "被引普通推"},
+            "core": {"user_results": {"result": {"legacy": {"screen_name": "someone"}}}}}
+        tweets = self._normalize_single({
+            "__typename": "Tweet",
+            "legacy": {"id_str": "1000", "full_text": "我的评论",
+                       "created_at": "Fri Jun 05 17:30:00 +0000 2026", "entities": {"urls": []}},
+            "quoted_status_result": {"result": quoted_plain}})
+        self.assertEqual(tweets[0]["quoted_status"], {"id": "999", "screen_name": "someone"})
+        self.assertNotIn("article", tweets[0])
+
+    def test_quote_comment_survives_html_fallback(self):
+        """rich 被拒回退 HTML 分块时，引用评论引子不能丢（与 rich 摘要一致）。"""
+        entry = {"article_id": "2052796100608974848", "author": "trq212",
+                 "article_title": "Tokenization deep dive",
+                 "quote_comment": "this is a great writeup on tokenization"}
+        msgs = twitter_monitor.format_article_summary_messages("karpathy", entry, "**结论**\n正文")
+        self.assertTrue(msgs)
+        self.assertIn("@karpathy 引用：this is a great writeup", msgs[0])
+        # 无评论条目不加引子（行为不变）
+        plain = {"article_id": "1", "author": "dotey", "article_title": "T"}
+        msgs2 = twitter_monitor.format_article_summary_messages("dotey", plain, "**结论**\n正文")
+        self.assertNotIn("引用：", msgs2[0])
+        # 渲染为空时仍返回空：引子不撑空，保留「渲染为空判 failed」防线
+        self.assertEqual(
+            twitter_monitor.format_article_summary_messages(
+                "karpathy", entry, "https://example.com/only-a-link"), [])
+
+
 class RichPushTest(unittest.TestCase):
     """sendRichMessage 路径：payload 形状 / 400 回退信号 / 队列 rich-first 与回退。"""
 
@@ -489,6 +721,33 @@ class RichPushTest(unittest.TestCase):
         self.assertIn(r"\*爆发\*", first_line)      # 星号转义
         self.assertIn(r"\<hr\>", first_line)        # HTML 标签转义
         self.assertNotIn("\n*", first_line)          # 换行被压成空格
+
+    def test_format_article_summary_rich_quote_comment_lead_in(self):
+        # 引用文章：引子归引用者(username=karpathy)，正文署名原作者(trq212)，单条消息
+        entry = {"article_id": "2052796100608974848", "article_title": "Tokenization deep dive",
+                 "author": "trq212", "quote_comment": "this is a great writeup"}
+        md = twitter_monitor.format_article_summary_rich("karpathy", entry, "> 结论\n\n正文")
+        self.assertTrue(md.startswith("> @karpathy 引用：this is a great writeup"))
+        self.assertIn("## \U0001f4c4 Tokenization deep dive", md)
+        self.assertIn("**@trq212**", md)   # 署名原作者，不是引用者
+
+    def test_format_article_summary_rich_escapes_quote_comment(self):
+        entry = {"article_id": "1", "article_title": "标题", "author": "trq212",
+                 "quote_comment": "see [this]\n*bold* <hr>"}
+        md = twitter_monitor.format_article_summary_rich("karpathy", entry, "正文")
+        lead = md.splitlines()[0]
+        self.assertIn(r"\[this\]", lead)    # 同标题转义
+        self.assertIn(r"\*bold\*", lead)
+        self.assertIn(r"\<hr\>", lead)
+        self.assertNotIn("\n", lead)        # 折成一行
+
+    def test_format_article_summary_rich_no_lead_in_without_comment(self):
+        # 转推/自文无 quote_comment → 无引子，行为不变
+        entry = {"article_id": "999", "article_title": "深度长文", "author": "liuren"}
+        md = twitter_monitor.format_article_summary_rich("dotey", entry, "正文")
+        self.assertFalse(md.startswith(">"))
+        self.assertTrue(md.startswith("## \U0001f4c4 深度长文"))
+        self.assertIn("**@liuren**", md)
 
     def test_fallback_heading_wraps_whole_line_dedup_inner_bold(self):
         out = twitter_monitor.markdown_to_telegram_html("### 核心观点：**AI 优先**")
