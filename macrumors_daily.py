@@ -2,7 +2,7 @@
 """MacRumors 每日资讯 → Telegram 中文摘要日报（头条图文卡片 + 可折叠汇总）。
 
 数据源是 MacRumors 官方 RSS（每小时更新，自带 guid 去重锚点），无需爬取。
-复用同目录 twitter_monitor 的 AIClassifier（mimo→gemini 回退）与官方 Bot API。
+复用同目录 twitter_monitor 的 AIClassifier 与官方 Bot API。
 
 输出（纯 Bot API，不依赖外部托管）：
   1) 前 CARD_MAX 条有配图的头条 —— 每条一张 sendPhoto 卡片：
@@ -177,7 +177,7 @@ def parse_ai_json(text: str) -> dict:
 def translate(ai, items: list[dict], batch: int = 8) -> None:
     """分批翻译并直接写回每条的 zh_title/zh_summary，缺失回退英文原标题。
 
-    分批是因为 mimo 在大请求（如 16 条）上会偶发返回不可解析内容；每批从 0 编号、重试 3 次。
+    分批是因为推理模型在大请求（如 16 条）上会偶发返回不可解析内容；每批从 0 编号、重试 3 次。
     """
     for it in items:
         it["zh_title"], it["zh_summary"] = it["title"], ""

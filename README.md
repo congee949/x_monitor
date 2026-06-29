@@ -87,8 +87,7 @@ flowchart TD
 ```json
 {
   "backends": [
-    { "name": "mimo", "type": "openai", "api_base": "<url>", "api_key": "<key>", "model": "<model>", "timeout": 30 },
-    { "name": "gemini", "type": "gemini", "api_base": "<url>", "api_key": "<key>", "model": "<model>", "timeout": 15 }
+    { "name": "gemini", "type": "gemini", "api_base": "https://generativelanguage.googleapis.com/v1beta", "api_key": "<key>", "model": "gemini-3.5-flash", "timeout": 15 }
   ],
   "article_markdown_cmd": "/usr/local/bin/x-article-to-markdown"
 }

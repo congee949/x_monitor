@@ -936,7 +936,7 @@ class AIClassifier:
     def complete(self, prompt: str, max_tokens: int = 1200, temperature: float = 0.2) -> tuple[str | None, str]:
         """按顺序尝试各后端生成文本。
 
-        空结果视为失败、继续下一后端：mimo/gemini 都是推理模型，token 预算不够时
+        空结果视为失败、继续下一后端：推理模型 token 预算不够时
         会把额度全花在隐藏推理上、content 返回空串（不抛异常）。旧逻辑把第一个
         不抛异常的后端结果直接返回，空串也算成功 → 永远轮不到 gemini 兜底。
         """
@@ -1396,7 +1396,7 @@ def summarize_note_tweet(ai: "AIClassifier", username: str, note_text: str) -> s
         f"作者：@{username}\n"
         f"长推正文：\n{note_text[:4000]}"
     )
-    # 2000 而非 220：mimo-v2.5 / gemini-3.5-flash 都是推理模型，220 token 会被隐藏
+    # 2000 而非 220：推理模型（如 gemini-3.5-flash）220 token 会被隐藏推理吃掉
     # 推理吃光（finish_reason=length，content 空 / 截断片段）→ TL;DR 退化成截断。
     # 实测 2000 下两个后端都能产出完整一行 TL;DR（推理 ~150-300 + 正文 ~50-100）。
     summary, backend = ai.complete(prompt, max_tokens=2000, temperature=0.2)
