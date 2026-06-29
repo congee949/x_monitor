@@ -1,4 +1,5 @@
 import argparse
+import json
 import sys
 import unittest
 from datetime import datetime, timezone
@@ -1558,6 +1559,90 @@ class ArticleDedupPushTest(unittest.TestCase):
         self.assertEqual(saved, ["777"])   # article 入队
         self.assertEqual(sent, [])         # 但没有作为普通推文推送
         self.assertEqual(pushed, 0)
+
+
+class PushRetryTest(unittest.TestCase):
+    """推送失败跨轮重试：push_retry 绕过 push-age 窗口，成功后清除。"""
+
+    STALE_TWEET = {
+        "id": "retry-me",
+        "text": "这是一条长度足够通过分类过滤器的正常推文内容等待重试",
+        "createdAt": "Mon May 11 15:55:43 +0000 2026",
+    }
+
+    def test_push_retry_bypasses_stale_window_and_clears_on_success(self):
+        sent = []
+        saved_retry = {}
+        args = argparse.Namespace(test=False, seed=False, dry_run=False,
+                                  limit=20, max_push_age_minutes=45)
+
+        def fake_send(token, chat_id, username, t, ai=None):
+            sent.append(t["id"])
+            return {"ok": True}
+
+        with patch.object(twitter_monitor, "datetime", FixedDatetime), \
+             patch.object(twitter_monitor, "fetch_tweets", return_value=[self.STALE_TWEET]), \
+             patch.object(twitter_monitor, "load_seen", return_value=({"old"}, None)), \
+             patch.object(twitter_monitor, "load_push_retry", return_value={"retry-me"}), \
+             patch.object(twitter_monitor, "save_seen", return_value=None), \
+             patch.object(twitter_monitor, "save_push_retry",
+                          side_effect=lambda u, r: saved_retry.update({"retry": set(r)})), \
+             patch.object(twitter_monitor, "send_tweet", side_effect=fake_send), \
+             patch.object(twitter_monitor.time, "sleep", return_value=None):
+            new, pushed, _f, _a = twitter_monitor.process_user(
+                pool=None, ai=FakeAI(False), username="u",
+                bot_token="b", chat_id="c", args=args)
+
+        self.assertEqual(new, 1)
+        self.assertEqual(pushed, 1)
+        self.assertEqual(sent, ["retry-me"])
+        self.assertEqual(saved_retry.get("retry"), set())
+
+    def test_push_failure_persists_retry_and_stays_unseen(self):
+        saved = {}
+        saved_retry = {}
+        args = argparse.Namespace(test=False, seed=False, dry_run=False,
+                                  limit=20, max_push_age_minutes=45)
+        tweet = {
+            "id": "fail-tweet",
+            "text": "这是一条长度足够通过分类过滤器的正常推文内容编号失败",
+            "createdAt": "Tue May 12 00:20:00 +0000 2026",
+        }
+
+        with patch.object(twitter_monitor, "datetime", FixedDatetime), \
+             patch.object(twitter_monitor, "fetch_tweets", return_value=[tweet]), \
+             patch.object(twitter_monitor, "load_seen", return_value=({"old"}, None)), \
+             patch.object(twitter_monitor, "load_push_retry", return_value=set()), \
+             patch.object(twitter_monitor, "save_seen",
+                          side_effect=lambda u, s, last_post_ts=None: saved.update({"seen": set(s)})), \
+             patch.object(twitter_monitor, "save_push_retry",
+                          side_effect=lambda u, r: saved_retry.update({"retry": set(r)})), \
+             patch.object(twitter_monitor, "send_tweet", return_value={"ok": False}), \
+             patch.object(twitter_monitor.time, "sleep", return_value=None):
+            twitter_monitor.process_user(
+                pool=None, ai=FakeAI(False), username="u",
+                bot_token="b", chat_id="c", args=args)
+
+        self.assertNotIn("fail-tweet", saved.get("seen", set()))
+        self.assertEqual(saved_retry.get("retry"), {"fail-tweet"})
+
+
+class GraphqlCurlTest(unittest.TestCase):
+    def test_curl_file_not_found_returns_empty(self):
+        import twitter_graphql as tg
+        with patch.object(tg.subprocess, "run", side_effect=FileNotFoundError):
+            self.assertEqual(tg._curl("https://example.com", {"A": "b"}), "")
+
+    def test_get_user_id_without_cookie_uses_guest(self):
+        import twitter_graphql as tg
+        with patch.object(tg, "_auth_headers", return_value=None), \
+             patch.object(tg, "_load_user_id_cache", return_value={}), \
+             patch.object(tg, "_get_guest_token", return_value="gt"), \
+             patch.object(tg, "_curl", return_value=json.dumps({
+                 "data": {"user": {"result": {"rest_id": "123"}}}
+             })), \
+             patch.object(tg, "_save_user_id_cache", return_value=None):
+            self.assertEqual(tg.get_user_id("someone"), "123")
 
 
 if __name__ == "__main__":

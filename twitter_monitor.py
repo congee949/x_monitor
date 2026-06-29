@@ -1112,6 +1112,47 @@ def save_seen(username: str, seen: set[str], last_post_ts: str | None = None) ->
                                    ensure_ascii=False, indent=2))
 
 
+def get_push_retry_path(username: str) -> str:
+    os.makedirs(SEEN_DIR, exist_ok=True)
+    return os.path.join(SEEN_DIR, f"{username}_retry.json")
+
+
+def load_push_retry(username: str) -> set[str]:
+    path = get_push_retry_path(username)
+    if not os.path.exists(path):
+        return set()
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return {str(x) for x in data}
+        if isinstance(data, dict):
+            return {str(x) for x in data.get("ids", [])}
+    except Exception:
+        pass
+    return set()
+
+
+def save_push_retry(username: str, retry: set[str]) -> None:
+    path = get_push_retry_path(username)
+    if not retry:
+        if os.path.exists(path):
+            os.remove(path)
+        return
+    _atomic_write(path, json.dumps(sorted(retry), ensure_ascii=False, indent=2))
+
+
+def _alert_seen_save_failure(bot_token: str, chat_id: str, username: str, error: Exception) -> None:
+    """seen 写盘失败时发 TG 告警，避免推送已送达但状态未落盘时无人知晓。"""
+    if not (bot_token and chat_id):
+        return
+    text = (f"🚨 <b>seen 写盘失败</b>：@{html.escape(username)}\n"
+            f"推送可能已送达但下轮会重复推。请检查磁盘空间。\n"
+            f"<code>{html.escape(str(error)[:300])}</code>")
+    _tg_post_quiet(bot_token, {"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
+                   "sendMessage")
+
+
 def load_account_failures() -> dict:
     """读取账号连续失败状态 {username: {count, alerted, last_error, last_failed_at}}。"""
     try:
@@ -1660,6 +1701,7 @@ def process_user(
         return 0, 0, 0, 0
 
     seen, last_post_iso = load_seen(username)
+    push_retry = load_push_retry(username)
 
     new_ids: set[str] = set()
     to_push: list[tuple[dict, str]] = []
@@ -1719,6 +1761,10 @@ def process_user(
                 # （misattributed），形成「长推 + 摘要」两条消息（见 Issue 4）。
                 # tid 已加入 new_ids → 仍会被标记 seen，下轮不重复检测。
                 continue
+            if tid in push_retry:
+                # 上轮 TG 推送失败：绕过 push-age 窗口重试，避免超龄后静默标 seen 丢推。
+                to_push.append((t, "push_retry"))
+                continue
             if not is_within_push_window(t, args.max_push_age_minutes):
                 print(f"    skip stale: {tid}")
                 continue
@@ -1776,9 +1822,18 @@ def process_user(
         seen |= {str(t.get("id")) for t in tweets if t.get("id")}
     else:
         # REL-1/FMT-1: only mark a tweet seen if its push did NOT fail. Failed sends
-        # stay unseen so the next cron run retries them (bounded by the push-age
-        # window) instead of being silently dropped forever.
+        # stay in push_retry and bypass push-age on the next run instead of being
+        # silently dropped when they go stale.
         seen |= (new_ids - push_failed)
+
+    pushed_ok = {str(t.get("id") or "") for t, _ in to_push} - push_failed
+    push_retry = (push_retry | push_failed) - pushed_ok
+    if not args.dry_run:
+        try:
+            save_push_retry(username, push_retry)
+        except OSError as e:
+            _alert_seen_save_failure(bot_token, chat_id, username, e)
+            raise
 
     latest_ts = last_post_iso
     for t in tweets:
@@ -1788,7 +1843,11 @@ def process_user(
             if not latest_ts or iso > latest_ts:
                 latest_ts = iso
 
-    save_seen(username, seen, latest_ts)
+    try:
+        save_seen(username, seen, latest_ts)
+    except OSError as e:
+        _alert_seen_save_failure(bot_token, chat_id, username, e)
+        raise
     print(f"  已记录 seen_ids 共 {len(seen)} 条")
 
     # 推送计数 = 实际送达（尝试数会让失败重试双重计入、故障期看板虚高）
@@ -1819,6 +1878,11 @@ def _article_entry_expired(entry: dict, now: datetime | None = None) -> bool:
     return (now - ts) > timedelta(days=ARTICLE_RETENTION_DAYS)
 
 
+def _save_article_queue(queue_path: str, queue: list, dry_run: bool = False) -> None:
+    if not dry_run:
+        _atomic_write(queue_path, json.dumps(queue, ensure_ascii=False, indent=2))
+
+
 def process_article_queue(ai: AIClassifier, bot_token: str, chat_id: str, dry_run: bool = False) -> int:
     """处理 Article 队列：抓 Markdown、AI 摘要、推送，成功后删除缓存。"""
     if not os.path.exists(ARTICLE_QUEUE_DIR):
@@ -1846,8 +1910,8 @@ def process_article_queue(ai: AIClassifier, bot_token: str, chat_id: str, dry_ru
 
         candidates = [a for a in queue if a.get("status") in ("pending", "failed", "fetched") and a.get("attempts", 0) < ARTICLE_MAX_ATTEMPTS]
         if not candidates:
-            if changed and not dry_run:
-                _atomic_write(queue_path, json.dumps(queue, ensure_ascii=False, indent=2))
+            if changed:
+                _save_article_queue(queue_path, queue, dry_run)
             continue
         print(f"  @{username}: {len(candidates)} article jobs")
 
@@ -1857,6 +1921,7 @@ def process_article_queue(ai: AIClassifier, bot_token: str, chat_id: str, dry_ru
             entry["attempts"] = int(entry.get("attempts", 0)) + 1
             entry["updated_at"] = datetime.now(timezone.utc).isoformat()
             changed = True
+            _save_article_queue(queue_path, queue, dry_run)
 
             markdown, err = fetch_article_markdown(username, entry)
             if err:
@@ -1877,6 +1942,7 @@ def process_article_queue(ai: AIClassifier, bot_token: str, chat_id: str, dry_ru
                         time.sleep(1.2)
                     except Exception as e:
                         print(f"    failure notice push error: {e}")
+                _save_article_queue(queue_path, queue, dry_run)
                 continue
 
             md_path = cache_article_markdown(aid, markdown)
@@ -1904,6 +1970,7 @@ def process_article_queue(ai: AIClassifier, bot_token: str, chat_id: str, dry_ru
                         time.sleep(1.2)
                     except Exception as e:
                         print(f"    failure notice push error: {e}")
+                _save_article_queue(queue_path, queue, dry_run)
                 continue
 
             entry["summary_backend"] = backend
@@ -1984,9 +2051,7 @@ def process_article_queue(ai: AIClassifier, bot_token: str, chat_id: str, dry_ru
             entry["updated_at"] = datetime.now(timezone.utc).isoformat()
             if entry["status"] in ("sent", "summarized"):  # 只计送达，不计失败尝试
                 processed += 1
-
-        if changed and not dry_run:
-            _atomic_write(queue_path, json.dumps(queue, ensure_ascii=False, indent=2))
+            _save_article_queue(queue_path, queue, dry_run)
     return processed
 
 

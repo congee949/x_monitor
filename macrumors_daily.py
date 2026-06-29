@@ -24,6 +24,11 @@ import urllib.error
 from datetime import datetime, timezone, timedelta
 from email.utils import parsedate_to_datetime
 
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+
 import twitter_monitor as tm
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -121,10 +126,17 @@ def load_seen() -> tuple[set, bool]:
 
 def save_seen(seen: set) -> None:
     keep = list(seen)[-600:]
-    tmp = SEEN_PATH + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(keep, f, ensure_ascii=False)
-    os.replace(tmp, SEEN_PATH)
+    tm._atomic_write(SEEN_PATH, json.dumps(keep, ensure_ascii=False))
+
+
+def mark_guids_seen(seen: set, guids: list[str], dry: bool = False) -> None:
+    """每成功送达一批条目后立即落盘，避免中途崩溃重复推送。"""
+    if dry or not guids:
+        return
+    for g in guids:
+        if g:
+            seen.add(g)
+    save_seen(seen)
 
 
 def build_prompt(items: list[dict]) -> str:
@@ -393,6 +405,15 @@ def send_html(token: str, chat_id: str, text: str) -> None:
 
 def main() -> int:
     dry = "--dry-run" in sys.argv
+
+    if fcntl is not None and not dry:
+        lock_fp = open(os.path.join(SCRIPT_DIR, ".macrumors.lock"), "w")
+        try:
+            fcntl.flock(lock_fp, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("上一轮 macrumors 仍在运行，跳过本次", file=sys.stderr)
+            return 0
+
     # 复用 twitter_monitor 的配置路径（项目真源），避免文件被改名后再次断裂
     with open(tm.CONFIG_PATH) as f:
         cfg = json.load(f)
@@ -460,21 +481,25 @@ def main() -> int:
         try:
             send_card(token, chat_id, it, header if idx == 0 else "")
             sent_cards.add(it["guid"])
+            mark_guids_seen(seen, all_guids([it]), dry=dry)
             time.sleep(1)
         except Exception as e:
             print(f"卡片发送失败（回落到文字）: {it['link']} -> {e}", file=sys.stderr)
 
     rest = [it for it in push if it["guid"] not in sent_cards]
+    rest_sent = False
     if rest:
         rest_header = f"📋 <b>其余资讯（{len(rest)} 条）</b>" if sent_cards else header
-        for msg in build_html_messages(rest, rest_header, truncated):
-            send_html(token, chat_id, msg)
-            time.sleep(1)
+        try:
+            for msg in build_html_messages(rest, rest_header, truncated):
+                send_html(token, chat_id, msg)
+                time.sleep(1)
+            rest_sent = True
+            mark_guids_seen(seen, all_guids(rest), dry=dry)
+        except Exception as e:
+            print(f"文字汇总发送失败，未标 seen（下轮重试）: {e}", file=sys.stderr)
 
-    for guid in all_guids(push):
-        seen.add(guid)
-    save_seen(seen)
-    print(f"已推送 {len(push)} 条（卡片 {len(sent_cards)} + 文字汇总 {len(rest)} 条）")
+    print(f"已推送 {len(push)} 条（卡片 {len(sent_cards)} + 文字汇总 {len(rest) if rest_sent else 0} 条）")
     return 0
 
 

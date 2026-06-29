@@ -34,16 +34,34 @@ GUEST_TOKEN_TTL = 10000
 AUTH_MODE = "cookie"
 
 
-def _curl(url, headers, method="GET", timeout=15):
+def _curl(url, headers=None, method="GET", timeout=15):
     """Use curl to avoid Python httpx TLS fingerprint issues."""
     cmd = ["curl", "-s", "--max-time", str(timeout)]
     if method == "POST":
         cmd += ["-X", "POST"]
-    for k, v in headers.items():
-        cmd += ["-H", f"{k}: {v}"]
+    if headers:
+        for k, v in headers.items():
+            cmd += ["-H", f"{k}: {v}"]
     cmd.append(url)
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 5)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 5)
+    except FileNotFoundError:
+        print("  [GraphQL] curl 未安装或不在 PATH")
+        return ""
+    except subprocess.TimeoutExpired:
+        print(f"  [GraphQL] curl 超时 ({timeout}s): {url[:80]}")
+        return ""
     return result.stdout
+
+
+def _gql_query_id_stale(errors):
+    """Heuristic: GraphQL errors that often mean hardcoded queryId drift."""
+    joined = " ".join(e.get("message", "") for e in (errors or [])).lower()
+    return any(k in joined for k in (
+        "unauthorized", "queryid", "query id", "persistedquery",
+        "bad request", "graphql validation", "not found for query",
+        "could not authenticate", "authorization",
+    ))
 
 
 def _get_guest_token():
@@ -185,16 +203,31 @@ def get_user_id(screen_name):
         QUERY_USER_BY_SCREEN_NAME, quote(variables), quote(features)
     )
 
-    resp = _curl(url, ah)
-    try:
-        data = json.loads(resp)
-        uid = data.get("data", {}).get("user", {}).get("result", {}).get("rest_id")
-        if uid:
-            cache[screen_name.lower()] = uid
-            _save_user_id_cache(cache)
-            return uid
-    except Exception:
-        pass
+    if ah:
+        resp = _curl(url, ah)
+        try:
+            data = json.loads(resp)
+            uid = data.get("data", {}).get("user", {}).get("result", {}).get("rest_id")
+            if uid:
+                cache[screen_name.lower()] = uid
+                _save_user_id_cache(cache)
+                return uid
+            errors = data.get("errors")
+            if errors and _gql_query_id_stale(errors) and refresh_query_ids():
+                url = "https://x.com/i/api/graphql/{}/UserByScreenName?variables={}&features={}".format(
+                    QUERY_USER_BY_SCREEN_NAME, quote(variables), quote(features))
+                resp = _curl(url, ah)
+                try:
+                    data = json.loads(resp)
+                    uid = data.get("data", {}).get("user", {}).get("result", {}).get("rest_id")
+                    if uid:
+                        cache[screen_name.lower()] = uid
+                        _save_user_id_cache(cache)
+                        return uid
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     # Fallback to guest token
     gt = _get_guest_token()
@@ -315,6 +348,16 @@ def fetch_tweets(username, limit=20):
             except json.JSONDecodeError:
                 raise RuntimeError("GraphQL response not JSON (guest fallback): " + resp[:200])
             errors = data.get("errors")
+            if errors and _gql_query_id_stale(errors) and refresh_query_ids():
+                print("  [GraphQL] query ID 可能过期，已从 x.com JS 刷新并重试")
+                url = "https://x.com/i/api/graphql/{}/UserTweets?variables={}&features={}".format(
+                    QUERY_USER_TWEETS, quote(variables), quote(features))
+                resp = _curl(url, _gql_headers(gt2), timeout=20)
+                try:
+                    data = json.loads(resp)
+                    errors = data.get("errors")
+                except json.JSONDecodeError:
+                    raise RuntimeError("GraphQL response not JSON (after query refresh): " + resp[:200])
             if errors:
                 raise RuntimeError("GraphQL errors (auth+guest fallback): " + str(errors))
         # Guest mode hit a transient internal error -> retry once with a fresh token.
@@ -333,6 +376,19 @@ def fetch_tweets(username, limit=20):
                     raise RuntimeError("GraphQL response not JSON (after retry): " + resp[:200])
             else:
                 raise RuntimeError("GraphQL errors: " + str(errors))
+        elif _gql_query_id_stale(errors) and refresh_query_ids():
+            print("  [GraphQL] query ID 可能过期，已从 x.com JS 刷新并重试")
+            url = "https://x.com/i/api/graphql/{}/UserTweets?variables={}&features={}".format(
+                QUERY_USER_TWEETS, quote(variables), quote(features))
+            headers = ah if use_auth else _gql_headers(gt)
+            resp = _curl(url, headers, timeout=20)
+            try:
+                data = json.loads(resp)
+            except json.JSONDecodeError:
+                raise RuntimeError("GraphQL response not JSON (after query refresh): " + resp[:200])
+            errors = data.get("errors")
+            if errors:
+                raise RuntimeError("GraphQL errors (after query refresh): " + str(errors))
         else:
             raise RuntimeError("GraphQL errors: " + str(errors))
 
