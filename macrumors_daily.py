@@ -114,18 +114,61 @@ def bucket_of(it: dict) -> str:
     return OTHER
 
 
+def _guid_ts(guid: str) -> "datetime | None":
+    """尝试从 MacRumors URL/permalink 中提取发布日期；失败返回 None。
+
+    MacRumors RSS 的 guid 通常是带日期的 permalink，例如：
+    https://www.macrumors.com/2026/06/30/some-article-title/
+    """
+    if not guid:
+        return None
+    m = re.search(r"/(\d{4})/(\d{1,2})/(\d{1,2})/", guid)
+    if m:
+        try:
+            return datetime(
+                int(m.group(1)), int(m.group(2)), int(m.group(3)),
+                tzinfo=timezone.utc,
+            )
+        except ValueError:
+            pass
+    return None
+
+
 def load_seen() -> tuple[set, bool]:
+    """返回 (seen_set, seen_existed)。
+
+    文件损坏时视为「seen 存在但为空」，避免进入 first-run 模式把 24h 前新闻永久吞掉。
+    """
     if not os.path.exists(SEEN_PATH):
         return set(), False
     try:
         with open(SEEN_PATH) as f:
             return set(json.load(f)), True
     except Exception:
-        return set(), False
+        return set(), True
 
 
 def save_seen(seen: set) -> None:
-    keep = list(seen)[-600:]
+    """保留最近 600 个 GUID。按 GUID 内嵌时间戳排序；无法提取时间戳的按已有文件顺序追加在后。"""
+    existing_order: dict[str, int] = {}
+    if os.path.exists(SEEN_PATH):
+        try:
+            with open(SEEN_PATH) as f:
+                for i, g in enumerate(json.load(f)):
+                    existing_order[str(g)] = i
+        except Exception:
+            pass
+
+    def sort_key(guid: str) -> tuple[float, float]:
+        ts = _guid_ts(guid)
+        # 有时间戳的按时间戳升序；无时间戳的按文件顺序排在最后，新条目追加在末尾
+        return (
+            ts.timestamp() if ts is not None else float("inf"),
+            existing_order.get(guid, float("inf")),
+        )
+
+    sorted_guids = sorted(seen, key=sort_key)
+    keep = sorted_guids[-600:]
     tm._atomic_write(SEEN_PATH, json.dumps(keep, ensure_ascii=False))
 
 

@@ -24,6 +24,7 @@ import html
 import shlex
 import subprocess
 import re
+import signal
 import sys
 import time
 import urllib.error
@@ -86,6 +87,14 @@ ARTICLE_URL_RE = re.compile(
     re.IGNORECASE,
 )
 ARTICLE_API_ENDPOINT = f"{API_BASE}/open/twitter_article_by_id"
+
+# Article queue crash-safety / run-overrun guards
+ARTICLE_MARKDOWN_TIMEOUT = 30  # seconds; reduced from 90 to avoid cron overruns
+MAX_ARTICLES_PER_RUN = 5
+ARTICLE_QUEUE_TIME_BUDGET_SECONDS = 25 * 60  # align with SIGALRM global timeout
+ARTICLE_QUEUE_MIN_REMAINING_SECONDS = 5 * 60
+ARTICLE_PROCESSING_STALL_MINUTES = 30
+_ARTICLE_QUEUE_RUN_START: float | None = None
 
 
 def detect_article(tweet: dict) -> str | None:
@@ -250,7 +259,7 @@ def fetch_article_markdown(username: str, entry: dict) -> tuple[str | None, str 
     url = article_fetch_url(username, entry)
     try:
         cmd = shlex.split(cmd_template) + [url]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=ARTICLE_MARKDOWN_TIMEOUT)
     except Exception as e:
         return None, f"markdown_fetch_exception:{e}"
     if result.returncode != 0:
@@ -338,7 +347,7 @@ def summarize_article(ai: "AIClassifier", username: str, entry: dict, markdown: 
     else:
         summary, backend_name = ai.complete(prompt, max_tokens=4000, temperature=0.2)
     if not summary:
-        return None, "ai_summary_empty"
+        return None, backend_name or "ai_summary_empty"
     return summary.strip(), backend_name
 
 
@@ -1026,18 +1035,21 @@ class TokenExhausted(Exception):
 def fetch_tweets(pool: TokenPool, username: str, limit: int = 20) -> list[dict]:
     """拉取用户推文。优先用 GraphQL（免费），fallback 到 6551.io。"""
     # Try GraphQL first (free, no API key)
+    graphql_failed = False
     if HAS_GRAPHQL:
         try:
             tweets = twitter_graphql.fetch_tweets(username, limit=limit)
-            if tweets:
-                print(f"  [GraphQL] 拉取 {len(tweets)} 条推文")
-                return tweets
+            print(f"  [GraphQL] 拉取 {len(tweets)} 条推文")
+            return tweets
         except Exception as e:
             print(f"  [GraphQL] 失败: {e}，回退到 6551.io")
+            graphql_failed = True
 
     # Fallback: 6551.io API (requires token)
     if pool is None:
-        raise TokenExhausted("GraphQL 失败且无 6551.io token")
+        if graphql_failed:
+            raise TokenExhausted("GraphQL 失败且无 6551.io token")
+        return []
 
     body = json.dumps({
         "username": username,
@@ -1092,24 +1104,89 @@ def get_seen_path(username: str) -> str:
     return os.path.join(SEEN_DIR, f"{username}.json")
 
 
+SEEN_RECOVERY_DIR = os.path.join(SEEN_DIR, ".seen_recovery")
+
+
+def get_seen_backup_path(username: str) -> str:
+    os.makedirs(SEEN_RECOVERY_DIR, exist_ok=True)
+    return os.path.join(SEEN_RECOVERY_DIR, f"{username}.json")
+
+
+def _read_seen_file(path: str) -> tuple[set[str], str | None]:
+    with open(path) as f:
+        data = json.load(f)
+    return set(data.get("ids", [])), data.get("last_post_ts")
+
+
 def load_seen(username: str) -> tuple[set[str], str | None]:
     path = get_seen_path(username)
+    backup_path = get_seen_backup_path(username)
+
+    # 1. 若存在 recovery 备份，合并/恢复主文件（P0-3 save_seen 写盘失败恢复）。
+    if os.path.exists(backup_path):
+        try:
+            backup_ids, backup_ts = _read_seen_file(backup_path)
+        except Exception:
+            backup_ids, backup_ts = set(), None
+
+        main_ids, main_ts = set(), None
+        main_ok = False
+        if os.path.exists(path):
+            try:
+                main_ids, main_ts = _read_seen_file(path)
+                main_ok = True
+            except Exception:
+                main_ok = False
+
+        if main_ok:
+            merged_ids = main_ids | backup_ids
+            merged_ts = main_ts
+            if backup_ts and (not merged_ts or backup_ts > merged_ts):
+                merged_ts = backup_ts
+            try:
+                save_seen(username, merged_ids, merged_ts)
+                os.remove(backup_path)
+            except Exception:
+                # 落盘/删除失败时保留备份，下次继续恢复；内存中仍返回合并结果
+                pass
+            return merged_ids, merged_ts
+        else:
+            # 主文件缺失或损坏：用备份重建主文件
+            try:
+                save_seen(username, backup_ids, backup_ts)
+                os.remove(backup_path)
+            except Exception:
+                pass
+            return backup_ids, backup_ts
+
+    # 2. 首次运行
     if not os.path.exists(path):
         return set(), None
+
+    # 3. 主文件损坏且无备份：返回 corrupted 标记，让 process_user 进入安全推送模式（P0-5）
     try:
-        with open(path) as f:
-            data = json.load(f)
-        return set(data.get("ids", [])), data.get("last_post_ts")
+        return _read_seen_file(path)
     except Exception:
-        return set(), None
+        return set(), "corrupted"
 
 
 def save_seen(username: str, seen: set[str], last_post_ts: str | None = None) -> None:
     path = get_seen_path(username)
     kept = sorted(seen, reverse=True)[:500]
-    _atomic_write(path, json.dumps({"ids": kept, "updated": datetime.now().isoformat(),
-                                    "last_post_ts": last_post_ts},
-                                   ensure_ascii=False, indent=2))
+    payload = json.dumps({"ids": kept, "updated": datetime.now().isoformat(),
+                          "last_post_ts": last_post_ts},
+                         ensure_ascii=False, indent=2)
+    try:
+        _atomic_write(path, payload)
+    except OSError as e:
+        # 写主文件失败时先把当前内存状态写入 recovery 备份，防止已送达推文因超窗丢失（P0-3）
+        backup_path = get_seen_backup_path(username)
+        try:
+            _atomic_write(backup_path, payload)
+            print(f"  seen 写盘失败，已写入恢复备份 {backup_path}: {e}")
+        except Exception as be:
+            print(f"  seen 恢复备份也失败: {be}")
+        raise
 
 
 def get_push_retry_path(username: str) -> str:
@@ -1149,6 +1226,16 @@ def _alert_seen_save_failure(bot_token: str, chat_id: str, username: str, error:
     text = (f"🚨 <b>seen 写盘失败</b>：@{html.escape(username)}\n"
             f"推送可能已送达但下轮会重复推。请检查磁盘空间。\n"
             f"<code>{html.escape(str(error)[:300])}</code>")
+    _tg_post_quiet(bot_token, {"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
+                   "sendMessage")
+
+
+def _alert_ai_all_failed(bot_token: str, chat_id: str, username: str) -> None:
+    """AI 推广识别全部后端失败时告警，避免 suspicious 推文被错误放行。"""
+    if not (bot_token and chat_id):
+        return
+    text = (f"⚠️ <b>AI 推广识别全部后端失败</b>：@{html.escape(username)}\n"
+            f"本轮 suspicious 推文已降级为 filter，避免推广内容漏推。")
     _tg_post_quiet(bot_token, {"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
                    "sendMessage")
 
@@ -1365,7 +1452,7 @@ def is_bad_tldr(summary: str, source_text: str) -> bool:
         return True
     if re.search(r"&[#a-zA-Z0-9]+;", summary):
         return True
-    if re.match(r"^[*#>\-\s]+", summary):
+    if re.fullmatch(r"^[*#>\-\s]+$", summary):
         return True
     source_has_cjk = bool(re.search(r"[一-鿿]", source_text))
     if source_has_cjk:
@@ -1703,12 +1790,22 @@ def process_user(
     seen, last_post_iso = load_seen(username)
     push_retry = load_push_retry(username)
 
+    # P0-5：seen 文件损坏且无备份时进入安全推送模式
+    seen_corrupted = (last_post_iso == "corrupted")
+    if seen_corrupted:
+        print("  seen 文件损坏且无备份，进入安全推送模式（本轮新推文可推送，放宽时间窗）")
+        last_post_iso = None
+
     new_ids: set[str] = set()
     to_push: list[tuple[dict, str]] = []
     filtered: list[tuple[dict, str]] = []
     ai_overridden = 0
+    ai_all_failed_alerted = False
 
-    auto_seed = not seen and not args.test and not args.seed
+    push_age_minutes = args.max_push_age_minutes
+    auto_seed = not seen and not args.test and not args.seed and not seen_corrupted
+    if seen_corrupted:
+        push_age_minutes = max(args.max_push_age_minutes, 1440)
     if auto_seed:
         print("  seen 为空，自动 seed（只记录，不推送）")
 
@@ -1726,6 +1823,14 @@ def process_user(
                 status = "filter"
                 reason = f"{reason}|ai:{ai_reason}"
                 print(f"    AI 确认推广 [{reason}] {text[:50]}")
+            elif ai_reason == "all_ai_failed":
+                # P0-4：AI 全部失败时 fail-closed，按 filter 处理
+                status = "filter"
+                reason = f"{reason}|ai:{ai_reason}"
+                print(f"    AI 全部失败，suspicious 推文降级为 filter: {text[:50]}")
+                if not ai_all_failed_alerted:
+                    ai_all_failed_alerted = True
+                    _alert_ai_all_failed(bot_token, chat_id, username)
             else:
                 status = "pass"
                 ai_overridden += 1
@@ -1765,7 +1870,7 @@ def process_user(
                 # 上轮 TG 推送失败：绕过 push-age 窗口重试，避免超龄后静默标 seen 丢推。
                 to_push.append((t, "push_retry"))
                 continue
-            if not is_within_push_window(t, args.max_push_age_minutes):
+            if not is_within_push_window(t, push_age_minutes):
                 print(f"    skip stale: {tid}")
                 continue
             if status == "pass":
@@ -1883,6 +1988,39 @@ def _save_article_queue(queue_path: str, queue: list, dry_run: bool = False) -> 
         _atomic_write(queue_path, json.dumps(queue, ensure_ascii=False, indent=2))
 
 
+def _revert_stalled_processing(queue: list, username: str, now: datetime | None = None) -> bool:
+    """Crash recovery: entries stuck in 'processing' for too long are retried."""
+    now = now or datetime.now(timezone.utc)
+    stall = timedelta(minutes=ARTICLE_PROCESSING_STALL_MINUTES)
+    changed = False
+    for entry in queue:
+        if entry.get("status") != "processing":
+            continue
+        ts_str = entry.get("updated_at") or entry.get("detected_at") or ""
+        try:
+            ts = datetime.fromisoformat(ts_str)
+        except (ValueError, TypeError):
+            continue
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        if (now - ts) > stall:
+            entry["status"] = "pending"
+            entry["last_error"] = "stalled_processing_reverted"
+            entry["updated_at"] = now.isoformat()
+            changed = True
+            print(f"  @{username}: article {entry.get('article_id')} processing 超时 {ARTICLE_PROCESSING_STALL_MINUTES}min，回退为 pending")
+    return changed
+
+
+def _article_queue_time_remaining() -> float:
+    """Seconds left in the current monitor run; infinity when not tracking."""
+    start = _ARTICLE_QUEUE_RUN_START
+    if start is None:
+        return float("inf")
+    elapsed = time.monotonic() - start
+    return ARTICLE_QUEUE_TIME_BUDGET_SECONDS - elapsed
+
+
 def process_article_queue(ai: AIClassifier, bot_token: str, chat_id: str, dry_run: bool = False) -> int:
     """处理 Article 队列：抓 Markdown、AI 摘要、推送，成功后删除缓存。"""
     if not os.path.exists(ARTICLE_QUEUE_DIR):
@@ -1908,7 +2046,13 @@ def process_article_queue(ai: AIClassifier, bot_token: str, chat_id: str, dry_ru
         if changed:
             print(f"  @{username}: 清理 {before - len(queue)} 条过期文章记录")
 
-        candidates = [a for a in queue if a.get("status") in ("pending", "failed", "fetched") and a.get("attempts", 0) < ARTICLE_MAX_ATTEMPTS]
+        if _revert_stalled_processing(queue, username):
+            changed = True
+
+        candidates = [a for a in queue if a.get("status") in ("pending", "failed", "fetched", "processing") and a.get("attempts", 0) < ARTICLE_MAX_ATTEMPTS]
+        # Prefer fresh, oldest-detected entries; cap per run to avoid cron overruns.
+        candidates.sort(key=lambda a: (int(a.get("attempts", 0)), a.get("detected_at") or a.get("updated_at") or ""))
+        candidates = candidates[:MAX_ARTICLES_PER_RUN]
         if not candidates:
             if changed:
                 _save_article_queue(queue_path, queue, dry_run)
@@ -1916,6 +2060,10 @@ def process_article_queue(ai: AIClassifier, bot_token: str, chat_id: str, dry_ru
         print(f"  @{username}: {len(candidates)} article jobs")
 
         for entry in candidates:
+            if _article_queue_time_remaining() < ARTICLE_QUEUE_MIN_REMAINING_SECONDS:
+                print(f"  @{username}: 剩余时间不足 {ARTICLE_QUEUE_MIN_REMAINING_SECONDS}s，停止处理新 article，留到下一轮")
+                break
+
             aid = entry["article_id"]
             entry["status"] = "processing"
             entry["attempts"] = int(entry.get("attempts", 0)) + 1
@@ -2048,6 +2196,8 @@ def process_article_queue(ai: AIClassifier, bot_token: str, chat_id: str, dry_ru
                     entry["failed_stage"] = "telegram_send"
                     entry["last_error"] = str(e)[:500]
                     print(f"    Article summary push error: {e}")
+                # Persist terminal state as soon as the send attempt finishes.
+                _save_article_queue(queue_path, queue, dry_run)
             entry["updated_at"] = datetime.now(timezone.utc).isoformat()
             if entry["status"] in ("sent", "summarized"):  # 只计送达，不计失败尝试
                 processed += 1
@@ -2071,104 +2221,145 @@ def main() -> int:
 
     # LOCK-1: prevent an overrunning run from overlapping the next cron tick (which
     # causes double-sends + last-writer-wins state clobber). Non-blocking; skip if held.
+    _lock_fp = None
     if fcntl is not None:
         _lock_fp = open(os.path.join(SCRIPT_DIR, ".monitor.lock"), "w")
         try:
             fcntl.flock(_lock_fp, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             print("上一轮 monitor 仍在运行，跳过本次", file=sys.stderr)
+            _lock_fp.close()
             return 0
 
-    # 每轮起止时间戳：日志此前无任何时间标记，无法事后审计运行时长/定位轮次
-    run_started = time.monotonic()
-    print(f"\n==== monitor run {datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S %z')} ====")
+    # P0-1: global wall-clock timeout so a hung task cannot hold the flock forever
+    # and starve subsequent cron ticks.
+    def _timeout_handler(signum, frame):
+        print("ERROR: monitor 运行超过 25 分钟全局超时，强制退出", file=sys.stderr)
+        if _lock_fp is not None:
+            try:
+                fcntl.flock(_lock_fp, fcntl.LOCK_UN)
+            except Exception:
+                pass
+            try:
+                _lock_fp.close()
+            except Exception:
+                pass
+        sys.exit(1)
 
-    with open(CONFIG_PATH) as f:
-        cfg = json.load(f)
-    bot_token = args.bot_token or cfg["telegram_bot_token"]
-    chat_id = args.chat_id or cfg["telegram_chat_id"]
+    if hasattr(signal, "SIGALRM"):
+        signal.signal(signal.SIGALRM, _timeout_handler)
+        signal.alarm(25 * 60)
 
-    # Load token pool for 6551.io fallback (optional if GraphQL works)
     try:
-        pool = TokenPool.load()
-    except SystemExit:
-        if HAS_GRAPHQL:
-            print("  TokenPool 不可用，仅使用 GraphQL 数据源")
-            pool = None
-        else:
-            raise
-    ai = AIClassifier.load()
+        # 每轮起止时间戳：日志此前无任何时间标记，无法事后审计运行时长/定位轮次
+        run_started = time.monotonic()
+        global _ARTICLE_QUEUE_RUN_START
+        _ARTICLE_QUEUE_RUN_START = run_started
+        print(f"\n==== monitor run {datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S %z')} ====")
 
-    accounts = load_accounts()
-    if args.user:
-        accounts = [a for a in accounts if a["username"] == args.user]
+        with open(CONFIG_PATH) as f:
+            cfg = json.load(f)
+        bot_token = args.bot_token or cfg["telegram_bot_token"]
+        chat_id = args.chat_id or cfg["telegram_chat_id"]
+
+        # Load token pool for 6551.io fallback (optional if GraphQL works)
+        try:
+            pool = TokenPool.load()
+        except SystemExit:
+            if HAS_GRAPHQL:
+                print("  TokenPool 不可用，仅使用 GraphQL 数据源")
+                pool = None
+            else:
+                raise
+        ai = AIClassifier.load()
+
+        accounts = load_accounts()
+        if args.user:
+            accounts = [a for a in accounts if a["username"] == args.user]
+            if not accounts:
+                print(f"用户 {args.user} 不在配置中或未启用", file=sys.stderr)
+                return 1
+
         if not accounts:
-            print(f"用户 {args.user} 不在配置中或未启用", file=sys.stderr)
+            print("没有启用的账号", file=sys.stderr)
             return 1
 
-    if not accounts:
-        print("没有启用的账号", file=sys.stderr)
-        return 1
+        print(f"Twitter 监控：{len(accounts)} 个账号")
 
-    print(f"Twitter 监控：{len(accounts)} 个账号")
+        total_new = 0
+        total_push = 0
+        total_filter = 0
+        total_ai_override = 0
+        failures = load_account_failures()
+        if not args.user:
+            # 完整轮才修剪：--user 子集运行下修剪会误删其他账号的失败状态
+            known = {a["username"] for a in accounts}
+            for stale in [u for u in failures if u not in known]:
+                print(f"  清理幽灵失败记录: @{stale}（已不在配置中）")
+                del failures[stale]
 
-    total_new = 0
-    total_push = 0
-    total_filter = 0
-    total_ai_override = 0
-    failures = load_account_failures()
-    if not args.user:
-        # 完整轮才修剪：--user 子集运行下修剪会误删其他账号的失败状态
-        known = {a["username"] for a in accounts}
-        for stale in [u for u in failures if u not in known]:
-            print(f"  清理幽灵失败记录: @{stale}（已不在配置中）")
-            del failures[stale]
+        for account in accounts:
+            username = account["username"]
+            try:
+                new, pushed, filtered, ai_ov = process_user(
+                    pool=pool, ai=ai, username=username,
+                    bot_token=bot_token, chat_id=chat_id, args=args,
+                )
+            except TokenExhausted as e:
+                print(f"  @{username}: {e}", file=sys.stderr)
+                note_account_failure(failures, username, str(e), bot_token, chat_id, args.dry_run)
+                continue
+            except Exception as e:
+                print(f"  @{username} failed: {e}", file=sys.stderr)
+                note_account_failure(failures, username, str(e), bot_token, chat_id, args.dry_run)
+                continue
+            note_account_success(failures, username, bot_token, chat_id, args.dry_run)
+            total_new += new
+            total_push += pushed
+            total_filter += filtered
+            total_ai_override += ai_ov
 
-    for account in accounts:
-        username = account["username"]
+        print(f"\n{'='*40}")
+        print(f"  汇总：新推 {total_new} | 推送 {total_push} | 过滤 {total_filter} | AI 否决 {total_ai_override}")
+        # Process article queue (auto, uses GraphQL note_tweet — free)
+        article_count = 0
         try:
-            new, pushed, filtered, ai_ov = process_user(
-                pool=pool, ai=ai, username=username,
-                bot_token=bot_token, chat_id=chat_id, args=args,
-            )
-        except TokenExhausted as e:
-            print(f"  @{username}: {e}", file=sys.stderr)
-            note_account_failure(failures, username, str(e), bot_token, chat_id, args.dry_run)
-            continue
+            article_count = process_article_queue(ai, bot_token, chat_id, args.dry_run)
+            if article_count:
+                print(f"  Articles processed: {article_count}")
         except Exception as e:
-            print(f"  @{username} failed: {e}", file=sys.stderr)
-            note_account_failure(failures, username, str(e), bot_token, chat_id, args.dry_run)
-            continue
-        note_account_success(failures, username, bot_token, chat_id, args.dry_run)
-        total_new += new
-        total_push += pushed
-        total_filter += filtered
-        total_ai_override += ai_ov
-
-    print(f"\n{'='*40}")
-    print(f"  汇总：新推 {total_new} | 推送 {total_push} | 过滤 {total_filter} | AI 否决 {total_ai_override}")
-    # Process article queue (auto, uses GraphQL note_tweet — free)
-    article_count = 0
-    try:
-        article_count = process_article_queue(ai, bot_token, chat_id, args.dry_run)
-        if article_count:
-            print(f"  Articles processed: {article_count}")
-    except Exception as e:
-        print(f"  Article queue error: {e}")
-    if pool is not None:
-        print(f"  token 池：{pool.available_count}/{len(pool._tokens)} 可用")
-    if not args.dry_run:
-        save_account_failures(failures)
-    # 状态看板只在完整 cron 轮更新（seed/test/单账号手动运行不算）
-    if not (args.dry_run or args.test or args.seed or args.user):
-        try:
-            update_status_dashboard(bot_token, chat_id, accounts, failures,
-                                    pushed=total_push, articles=article_count,
-                                    elapsed=time.monotonic() - run_started)
-        except Exception as e:
-            print(f"  看板更新失败（忽略）: {e}")
-    print(f"  耗时 {time.monotonic() - run_started:.1f}s")
-    return 0
+            print(f"  Article queue error: {e}")
+        if pool is not None:
+            print(f"  token 池：{pool.available_count}/{len(pool._tokens)} 可用")
+        if not args.dry_run:
+            try:
+                save_account_failures(failures)
+            except OSError as e:
+                print(f"  保存账号失败状态失败（忽略）: {e}", file=sys.stderr)
+        # 状态看板只在完整 cron 轮更新（seed/test/单账号手动运行不算）
+        if not (args.dry_run or args.test or args.seed or args.user):
+            try:
+                update_status_dashboard(bot_token, chat_id, accounts, failures,
+                                        pushed=total_push, articles=article_count,
+                                        elapsed=time.monotonic() - run_started)
+            except Exception as e:
+                print(f"  看板更新失败（忽略）: {e}")
+        print(f"  耗时 {time.monotonic() - run_started:.1f}s")
+        return 0
+    finally:
+        # P0-1: always cancel the global timeout and release the flock lock so a
+        # hung/hard-killed predecessor cannot starve subsequent cron ticks.
+        if hasattr(signal, "SIGALRM"):
+            signal.alarm(0)
+        if _lock_fp is not None:
+            try:
+                fcntl.flock(_lock_fp, fcntl.LOCK_UN)
+            except Exception:
+                pass
+            try:
+                _lock_fp.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

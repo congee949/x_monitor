@@ -1627,6 +1627,205 @@ class PushRetryTest(unittest.TestCase):
         self.assertEqual(saved_retry.get("retry"), {"fail-tweet"})
 
 
+class SaveSeenRecoveryTest(unittest.TestCase):
+    """P0-3: save_seen 写盘失败时创建 recovery 备份；load_seen 合并/重建主文件。"""
+
+    def test_save_seen_failure_creates_backup_and_load_merges(self):
+        import json as _json
+        import os as _os
+        import tempfile
+        username = "p03_user"
+        with tempfile.TemporaryDirectory() as d:
+            seen_dir = _os.path.join(d, "twitter_seen")
+            recovery_dir = _os.path.join(seen_dir, ".seen_recovery")
+            main_path = _os.path.join(seen_dir, f"{username}.json")
+            backup_path = _os.path.join(recovery_dir, f"{username}.json")
+            _os.makedirs(seen_dir, exist_ok=True)
+            with open(main_path, "w") as f:
+                _json.dump({"ids": ["c"], "last_post_ts": "2026-05-11T12:00:00+00:00"}, f)
+
+            def fake_atomic_write(path, data):
+                if path == main_path:
+                    raise OSError("disk full")
+                # Allow recovery backup (and any other path) to succeed
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(data)
+                    f.flush()
+                    _os.fsync(f.fileno())
+
+            with patch.object(twitter_monitor, "SEEN_DIR", seen_dir), \
+                 patch.object(twitter_monitor, "SEEN_RECOVERY_DIR", recovery_dir), \
+                 patch.object(twitter_monitor, "_atomic_write", side_effect=fake_atomic_write):
+                with self.assertRaises(OSError):
+                    twitter_monitor.save_seen(username, {"a", "b"})
+
+            self.assertTrue(_os.path.exists(backup_path))
+            with open(backup_path) as f:
+                backup_data = _json.load(f)
+            self.assertEqual(set(backup_data["ids"]), {"a", "b"})
+
+            # load_seen 应合并主文件与 recovery 备份，并重建主文件
+            with patch.object(twitter_monitor, "SEEN_DIR", seen_dir), \
+                 patch.object(twitter_monitor, "SEEN_RECOVERY_DIR", recovery_dir):
+                ids, ts = twitter_monitor.load_seen(username)
+            self.assertEqual(ids, {"a", "b", "c"})
+            self.assertTrue(_os.path.exists(main_path))
+            self.assertFalse(_os.path.exists(backup_path))
+            self.assertEqual(ts, "2026-05-11T12:00:00+00:00")
+
+
+class AIFailClosedTest(unittest.TestCase):
+    """P0-4: confirm_promo 全部 AI 失败时 fail-closed；process_user 降级为 filter。"""
+
+    class FailingBackend:
+        name = "fail-backend"
+
+        def classify(self, username: str, text: str):
+            raise RuntimeError("api down")
+
+    def test_confirm_promo_all_failed_returns_fail_closed(self):
+        ai = twitter_monitor.AIClassifier([self.FailingBackend()])
+        self.assertEqual(ai.confirm_promo("u", "text"), (False, "all_ai_failed"))
+
+        empty_ai = twitter_monitor.AIClassifier([])
+        self.assertEqual(empty_ai.confirm_promo("u", "text"), (False, "all_ai_failed"))
+
+    def test_process_user_suspicious_all_ai_failed_goes_to_filtered(self):
+        args = argparse.Namespace(test=False, seed=False, dry_run=False,
+                                  limit=20, max_push_age_minutes=45)
+        suspicious_tweet = {
+            "id": "s1",
+            "text": "byteplus seedance 2.0 api 文档访问体验开通模型冲 200 立即体验方舟平台",
+            "createdAt": "Tue May 12 00:20:00 +0000 2026",
+        }
+        ai = twitter_monitor.AIClassifier([self.FailingBackend()])
+        pushed_ids = []
+
+        def fake_send_tweet(token, chat_id, username, t, ai=None):
+            pushed_ids.append(t["id"])
+            return {"ok": True}
+
+        with patch.object(twitter_monitor, "datetime", FixedDatetime), \
+             patch.object(twitter_monitor, "fetch_tweets", return_value=[suspicious_tweet]), \
+             patch.object(twitter_monitor, "load_seen", return_value=({"old"}, None)), \
+             patch.object(twitter_monitor, "save_seen", return_value=None), \
+             patch.object(twitter_monitor, "send_tweet", side_effect=fake_send_tweet), \
+             patch.object(twitter_monitor, "_alert_ai_all_failed", return_value=None), \
+             patch.object(twitter_monitor.time, "sleep", return_value=None):
+            new, pushed, filt, ov = twitter_monitor.process_user(
+                pool=None, ai=ai, username="u",
+                bot_token="b", chat_id="c", args=args)
+        self.assertEqual(new, 1)
+        self.assertEqual(pushed, 0)
+        self.assertEqual(filt, 1)
+        self.assertEqual(ov, 0)
+        self.assertEqual(pushed_ids, [])
+
+
+class LoadSeenCorruptedTest(unittest.TestCase):
+    """P0-5: load_seen 文件损坏时不自动 seed；process_user 放宽 push age。"""
+
+    def test_load_seen_corrupted_returns_empty_and_marker(self):
+        import json as _json
+        import os as _os
+        import tempfile
+        username = "p05_user"
+        with tempfile.TemporaryDirectory() as d:
+            main_path = _os.path.join(d, f"{username}.json")
+            with open(main_path, "w") as f:
+                f.write("not json")
+            recovery_dir = _os.path.join(d, ".seen_recovery")
+            with patch.object(twitter_monitor, "SEEN_DIR", d), \
+                 patch.object(twitter_monitor, "SEEN_RECOVERY_DIR", recovery_dir):
+                ids, ts = twitter_monitor.load_seen(username)
+            self.assertEqual(ids, set())
+            self.assertEqual(ts, "corrupted")
+
+    def test_process_user_corrupted_seen_relaxes_push_age(self):
+        args = argparse.Namespace(test=False, seed=False, dry_run=False,
+                                  limit=20, max_push_age_minutes=45)
+        # 1.5 小时前，正常 45min 窗口会跳过；seen_corrupted 放宽到 1440min 后应推送
+        stale_tweet = {
+            "id": "old1",
+            "text": "这是一条长度足够通过分类过滤器的正常推文内容，在 seen 损坏时应放宽时间窗推送",
+            "createdAt": "Mon May 11 23:00:00 +0000 2026",
+        }
+        pushed_ids = []
+
+        def fake_send_tweet(token, chat_id, username, t, ai=None):
+            pushed_ids.append(t["id"])
+            return {"ok": True}
+
+        with patch.object(twitter_monitor, "datetime", FixedDatetime), \
+             patch.object(twitter_monitor, "fetch_tweets", return_value=[stale_tweet]), \
+             patch.object(twitter_monitor, "load_seen", return_value=(set(), "corrupted")), \
+             patch.object(twitter_monitor, "save_seen", return_value=None), \
+             patch.object(twitter_monitor, "send_tweet", side_effect=fake_send_tweet), \
+             patch.object(twitter_monitor.time, "sleep", return_value=None):
+            new, pushed, filt, ov = twitter_monitor.process_user(
+                pool=None, ai=FakeAI(False), username="u",
+                bot_token="b", chat_id="c", args=args)
+        self.assertEqual(new, 1)
+        self.assertEqual(pushed, 1)
+        self.assertEqual(filt, 0)
+        self.assertEqual(pushed_ids, ["old1"])
+
+
+class ArticleStalledProcessingTest(unittest.TestCase):
+    """P0-2: Article processing 僵尸回退为 pending；process_article_queue 会处理它。"""
+
+    def test_revert_stalled_processing_resets_old_processing(self):
+        from datetime import timedelta as _td
+        old_ts = (datetime.now(timezone.utc) - _td(minutes=60)).isoformat()
+        queue = [{"article_id": "1", "status": "processing", "updated_at": old_ts}]
+        changed = twitter_monitor._revert_stalled_processing(queue, "u")
+        self.assertTrue(changed)
+        self.assertEqual(queue[0]["status"], "pending")
+        self.assertEqual(queue[0]["last_error"], "stalled_processing_reverted")
+        self.assertIsNotNone(queue[0].get("updated_at"))
+
+    def test_process_article_queue_handles_reverted_processing_entry(self):
+        import json as _json
+        import os as _os
+        import tempfile
+        from datetime import timedelta as _td
+        username = "u"
+        with tempfile.TemporaryDirectory() as d:
+            cache_dir = _os.path.join(d, "cache")
+            qpath = _os.path.join(d, f"{username}_queue.json")
+            old_ts = (datetime.now(timezone.utc) - _td(minutes=60)).isoformat()
+            entry = {
+                "article_id": "777", "tweet_id": "1", "author": username,
+                "article_title": "T", "status": "processing", "attempts": 0,
+                "content": None, "updated_at": old_ts, "detected_at": old_ts,
+            }
+            with open(qpath, "w") as f:
+                _json.dump([entry], f)
+            with patch.object(twitter_monitor, "ARTICLE_QUEUE_DIR", d), \
+                 patch.object(twitter_monitor, "ARTICLE_CACHE_DIR", cache_dir), \
+                 patch.object(twitter_monitor, "fetch_article_markdown",
+                              return_value=("# 全文\n" + "x" * 300, None)), \
+                 patch.object(twitter_monitor, "summarize_article",
+                              return_value=("> 结论\n\n### 节\n正文", "mimo")), \
+                 patch.object(twitter_monitor, "send_telegram_rich", return_value={"ok": True}), \
+                 patch.object(twitter_monitor, "_tg_post_quiet", return_value={"ok": True}), \
+                 patch.object(twitter_monitor.time, "sleep", return_value=None):
+                processed = twitter_monitor.process_article_queue(FakeAI(True), "bot", "chat")
+            self.assertEqual(processed, 1)
+            with open(qpath) as f:
+                saved = _json.load(f)[0]
+            self.assertEqual(saved["status"], "sent")
+
+
+class GraphqlEmptyListTest(unittest.TestCase):
+    """P1-7: GraphQL 返回空列表不应触发 6551.io fallback。"""
+
+    def test_graphql_empty_list_returns_empty_without_6551_fallback(self):
+        with patch.object(twitter_monitor.twitter_graphql, "fetch_tweets", return_value=[]):
+            result = twitter_monitor.fetch_tweets(pool=None, username="u", limit=20)
+        self.assertEqual(result, [])
+
+
 class GraphqlCurlTest(unittest.TestCase):
     def test_curl_file_not_found_returns_empty(self):
         import twitter_graphql as tg
@@ -1643,6 +1842,24 @@ class GraphqlCurlTest(unittest.TestCase):
              })), \
              patch.object(tg, "_save_user_id_cache", return_value=None):
             self.assertEqual(tg.get_user_id("someone"), "123")
+
+    def test_curl_raises_on_non_2xx_http_status(self):
+        import types
+        import twitter_graphql as tg
+        stdout = "some body\n403\n0"
+        with patch.object(tg.subprocess, "run", return_value=types.SimpleNamespace(
+                returncode=0, stdout=stdout, stderr="")):
+            with self.assertRaises(tg.CurlError):
+                tg._curl("https://example.com")
+
+    def test_curl_raises_on_nonzero_exit_code(self):
+        import types
+        import twitter_graphql as tg
+        stdout = "some body\n200\n7"
+        with patch.object(tg.subprocess, "run", return_value=types.SimpleNamespace(
+                returncode=0, stdout=stdout, stderr="")):
+            with self.assertRaises(tg.CurlError):
+                tg._curl("https://example.com")
 
 
 if __name__ == "__main__":

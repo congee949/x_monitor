@@ -33,15 +33,31 @@ GUEST_TOKEN_TTL = 10000
 # Auth mode: "cookie" (auth_token+ct0) or "guest" (fallback)
 AUTH_MODE = "cookie"
 
+# Consecutive cookie-auth failures before the stale cookie file is renamed.
+_COOKIE_FAILURE_THRESHOLD = 3
+_cookie_fail_count = 0
+
+
+class CurlError(Exception):
+    """curl subprocess failed or returned a non-2xx HTTP status."""
+
 
 def _curl(url, headers=None, method="GET", timeout=15):
-    """Use curl to avoid Python httpx TLS fingerprint issues."""
-    cmd = ["curl", "-s", "--max-time", str(timeout)]
+    """Use curl to avoid Python httpx TLS fingerprint issues.
+
+    Raises:
+        CurlError: on curl non-zero exit or HTTP status >= 300.
+    """
+    headers = headers or {}
+    write_format = "\n%{http_code}\n%{exitcode}"
+    cmd = [
+        "curl", "-s", "--connect-timeout", "5",
+        "--max-time", str(timeout), "-w", write_format,
+    ]
     if method == "POST":
         cmd += ["-X", "POST"]
-    if headers:
-        for k, v in headers.items():
-            cmd += ["-H", f"{k}: {v}"]
+    for k, v in headers.items():
+        cmd += ["-H", f"{k}: {v}"]
     cmd.append(url)
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 5)
@@ -51,7 +67,39 @@ def _curl(url, headers=None, method="GET", timeout=15):
     except subprocess.TimeoutExpired:
         print(f"  [GraphQL] curl 超时 ({timeout}s): {url[:80]}")
         return ""
-    return result.stdout
+
+    stdout = result.stdout
+    if stdout.endswith("\n"):
+        stdout = stdout[:-1]
+    parts = stdout.rsplit("\n", 2)
+    if len(parts) >= 3:
+        body = "\n".join(parts[:-2])
+        http_code_str = parts[-2]
+        exitcode_str = parts[-1]
+    else:
+        body = stdout
+        http_code_str = "0"
+        exitcode_str = "0"
+
+    try:
+        curl_exit = int(exitcode_str)
+    except ValueError:
+        curl_exit = -1
+
+    try:
+        http_code = int(http_code_str)
+    except ValueError:
+        http_code = 0
+
+    if curl_exit != 0:
+        stderr = result.stderr.strip() if result.stderr else ""
+        raise CurlError(f"curl failed with exit code {curl_exit}: {stderr}")
+
+    if http_code < 200 or http_code >= 300:
+        stderr = result.stderr.strip() if result.stderr else ""
+        raise CurlError(f"HTTP {http_code}: {stderr}")
+
+    return body
 
 
 def _gql_query_id_stale(errors):
@@ -62,6 +110,21 @@ def _gql_query_id_stale(errors):
         "bad request", "graphql validation", "not found for query",
         "could not authenticate", "authorization",
     ))
+
+
+def _account_gone(errors):
+    """Return True if GraphQL errors indicate the cached rest_id is stale.
+
+    Matches both human-readable messages and structured error codes.
+    """
+    msgs = " ".join(e.get("message", "") for e in (errors or [])).lower()
+    if any(kw in msgs for kw in ("suspended", "not found", "deactivated", "unavailable")):
+        return True
+    for e in errors or []:
+        code = e.get("code")
+        if code in (50, "50", "NonExistent", "NotFound"):
+            return True
+    return False
 
 
 def _get_guest_token():
@@ -84,8 +147,12 @@ def _get_guest_token():
         data = json.loads(resp)
         token = data.get("guest_token")
         if token:
-            with open(GUEST_TOKEN_CACHE, "w") as f:
+            tmp = GUEST_TOKEN_CACHE + ".tmp"
+            with open(tmp, "w") as f:
                 json.dump({"token": token, "ts": time.time()}, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, GUEST_TOKEN_CACHE)
             return token
     except Exception:
         pass
@@ -105,10 +172,34 @@ def _load_auth_cookies():
     return None
 
 
+def _clear_auth_cookies():
+    """Rename stale auth cookies out of the way so we stop wasting authed calls."""
+    try:
+        if os.path.exists(AUTH_COOKIE_CACHE):
+            backup = AUTH_COOKIE_CACHE + ".stale"
+            if os.path.exists(backup):
+                os.remove(backup)
+            os.replace(AUTH_COOKIE_CACHE, backup)
+            print(f"  [GraphQL] cookie 连续失败 {_COOKIE_FAILURE_THRESHOLD} 次，已重命名 {AUTH_COOKIE_CACHE}")
+    except Exception:
+        pass
+
+
 def _save_auth_cookies(auth_token, ct0):
-    """Save auth cookies to cache."""
-    with open(AUTH_COOKIE_CACHE, "w") as f:
-        json.dump({"auth_token": auth_token, "ct0": ct0}, f)
+    """Save auth cookies to cache atomically.
+
+    Currently a manual-maintenance hook (no auto-refresh caller).  Atomic
+    tmp+replace write prevents half-written JSON on crash.
+    """
+    try:
+        tmp = AUTH_COOKIE_CACHE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"auth_token": auth_token, "ct0": ct0}, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, AUTH_COOKIE_CACHE)
+    except Exception:
+        pass
 
 
 def _load_user_id_cache():
@@ -129,7 +220,7 @@ def _load_user_id_cache():
 
 
 def _save_user_id_cache(cache):
-    """Save the user id cache atomically (tmp file + os.replace).
+    """Save the user id cache atomically (tmp file + os.replace + fsync).
 
     A crash mid-write can never leave half-written JSON behind; write
     failures are non-fatal (next run simply re-resolves).
@@ -138,6 +229,8 @@ def _save_user_id_cache(cache):
         tmp = USER_ID_CACHE + ".tmp"
         with open(tmp, "w") as f:
             json.dump(cache, f)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, USER_ID_CACHE)
     except Exception:
         pass
@@ -318,79 +411,76 @@ def fetch_tweets(username, limit=20):
     )
 
     headers = ah if use_auth else _gql_headers(gt)
-    resp = _curl(url, headers, timeout=20)
-    try:
-        data = json.loads(resp)
-    except json.JSONDecodeError:
-        raise RuntimeError("GraphQL response not JSON: " + resp[:200])
 
+    def _do_request(req_headers):
+        resp = _curl(url, req_headers, timeout=20)
+        try:
+            return json.loads(resp)
+        except json.JSONDecodeError:
+            raise RuntimeError("GraphQL response not JSON: " + resp[:200])
+
+    def _retry_with_fresh_query(req_headers, label, current_errors):
+        nonlocal url
+        if _gql_query_id_stale(current_errors) and refresh_query_ids():
+            print(f"  [GraphQL] query ID 可能过期，已从 x.com JS 刷新并重试 ({label})")
+            url = "https://x.com/i/api/graphql/{}/UserTweets?variables={}&features={}".format(
+                QUERY_USER_TWEETS, quote(variables), quote(features))
+            data2 = _do_request(req_headers)
+            if data2.get("errors"):
+                raise RuntimeError(f"GraphQL errors ({label} after query refresh): " + str(data2["errors"]))
+            return data2
+        return None
+
+    data = _do_request(headers)
     errors = data.get("errors")
+    used_auth_for_success = use_auth
+
     if errors:
+        global _cookie_fail_count
         error_msgs = [e.get("message", "") for e in errors]
-        # Errors saying the account is gone mean the cached rest_id is stale:
-        # invalidate it so the next run re-resolves the screen name (self-heals
-        # within one 30-min cycle; a false positive only costs one extra lookup).
-        joined_msgs = " ".join(error_msgs).lower()
-        if any(kw in joined_msgs for kw in ("suspended", "not found", "deactivated", "unavailable")):
+        if _account_gone(errors):
             invalidate_user_id(username)
-        # Cookie auth failed -> fall back to the free guest token before giving up,
-        # so we don't burn paid 6551.io credits and the cookie expiry stays visible.
+
         if use_auth:
+            used_auth_for_success = False
             print(f"  [GraphQL] cookie 认证失效，降级 guest 模式: {error_msgs}")
+            _cookie_fail_count += 1
+            if _cookie_fail_count >= _COOKIE_FAILURE_THRESHOLD:
+                _clear_auth_cookies()
+                _cookie_fail_count = 0
             if os.path.exists(GUEST_TOKEN_CACHE):
                 os.remove(GUEST_TOKEN_CACHE)
             gt2 = _get_guest_token()
             if not gt2:
                 raise RuntimeError("GraphQL auth failed and cannot get guest token: " + str(errors))
-            resp = _curl(url, _gql_headers(gt2), timeout=20)
-            try:
-                data = json.loads(resp)
-            except json.JSONDecodeError:
-                raise RuntimeError("GraphQL response not JSON (guest fallback): " + resp[:200])
+            data = _do_request(_gql_headers(gt2))
             errors = data.get("errors")
-            if errors and _gql_query_id_stale(errors) and refresh_query_ids():
-                print("  [GraphQL] query ID 可能过期，已从 x.com JS 刷新并重试")
-                url = "https://x.com/i/api/graphql/{}/UserTweets?variables={}&features={}".format(
-                    QUERY_USER_TWEETS, quote(variables), quote(features))
-                resp = _curl(url, _gql_headers(gt2), timeout=20)
-                try:
-                    data = json.loads(resp)
-                    errors = data.get("errors")
-                except json.JSONDecodeError:
-                    raise RuntimeError("GraphQL response not JSON (after query refresh): " + resp[:200])
             if errors:
-                raise RuntimeError("GraphQL errors (auth+guest fallback): " + str(errors))
-        # Guest mode hit a transient internal error -> retry once with a fresh token.
-        elif any("Internal server error" in m for m in error_msgs):
-            if os.path.exists(GUEST_TOKEN_CACHE):
-                os.remove(GUEST_TOKEN_CACHE)
-            gt2 = _get_guest_token()
-            if gt2:
-                resp = _curl(url, _gql_headers(gt2), timeout=20)
-                try:
-                    data = json.loads(resp)
-                    errors = data.get("errors")
-                    if errors:
-                        raise RuntimeError("GraphQL errors (after retry): " + str(errors))
-                except json.JSONDecodeError:
-                    raise RuntimeError("GraphQL response not JSON (after retry): " + resp[:200])
+                refreshed = _retry_with_fresh_query(_gql_headers(gt2), "auth+guest fallback", errors)
+                if refreshed is not None:
+                    data = refreshed
+                else:
+                    raise RuntimeError("GraphQL errors (auth+guest fallback): " + str(errors))
+        else:
+            refreshed = _retry_with_fresh_query(headers, "guest", errors)
+            if refreshed is not None:
+                data = refreshed
+            elif any("internal server error" in m.lower() for m in error_msgs):
+                if os.path.exists(GUEST_TOKEN_CACHE):
+                    os.remove(GUEST_TOKEN_CACHE)
+                gt2 = _get_guest_token()
+                if gt2:
+                    data = _do_request(_gql_headers(gt2))
+                    if data.get("errors"):
+                        raise RuntimeError("GraphQL errors (after retry): " + str(data["errors"]))
+                else:
+                    raise RuntimeError("GraphQL errors: " + str(errors))
             else:
                 raise RuntimeError("GraphQL errors: " + str(errors))
-        elif _gql_query_id_stale(errors) and refresh_query_ids():
-            print("  [GraphQL] query ID 可能过期，已从 x.com JS 刷新并重试")
-            url = "https://x.com/i/api/graphql/{}/UserTweets?variables={}&features={}".format(
-                QUERY_USER_TWEETS, quote(variables), quote(features))
-            headers = ah if use_auth else _gql_headers(gt)
-            resp = _curl(url, headers, timeout=20)
-            try:
-                data = json.loads(resp)
-            except json.JSONDecodeError:
-                raise RuntimeError("GraphQL response not JSON (after query refresh): " + resp[:200])
-            errors = data.get("errors")
-            if errors:
-                raise RuntimeError("GraphQL errors (after query refresh): " + str(errors))
-        else:
-            raise RuntimeError("GraphQL errors: " + str(errors))
+
+    # Reset cookie failure counter only when the authed request itself succeeds.
+    if used_auth_for_success:
+        _cookie_fail_count = 0
 
     # No errors but an empty user node: typical signature of a deleted account
     # when fetching by a (possibly cached) rest_id. Invalidate the cache so the
@@ -588,7 +678,10 @@ def fetch_article_tweet(tweet_id: str):
         QUERY_TWEET_BY_REST_ID, quote(variables), quote(features)
     )
 
-    resp = _curl(url, _gql_headers(gt), timeout=15)
+    try:
+        resp = _curl(url, _gql_headers(gt), timeout=15)
+    except CurlError:
+        return None
     try:
         data = json.loads(resp)
     except json.JSONDecodeError:
@@ -612,13 +705,19 @@ def refresh_query_ids():
     if not gt:
         return False
 
-    resp = _curl("https://x.com", {"User-Agent": USER_AGENT}, timeout=10)
+    try:
+        resp = _curl("https://x.com", {"User-Agent": USER_AGENT}, timeout=10)
+    except CurlError:
+        return False
     js_match = re.search(r'(https://abs\.twimg\.com/responsive-web/client-web[^"]+\.js)', resp)
     if not js_match:
         return False
 
     js_url = js_match.group(1)
-    js_content = _curl(js_url, {"User-Agent": USER_AGENT}, timeout=20)
+    try:
+        js_content = _curl(js_url, {"User-Agent": USER_AGENT}, timeout=20)
+    except CurlError:
+        return False
 
     patterns = {
         "UserByScreenName": r'"UserByScreenName",\s*queryId:"([^"]+)"',
