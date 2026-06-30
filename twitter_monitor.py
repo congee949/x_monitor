@@ -1533,36 +1533,23 @@ def format_message(
     link = f"https://x.com/{username}/status/{tid}" if tid else ""
     hidden = f'<a href="{link}">​</a>' if link else ""
     note = t.get("note_tweet") or {}
-    note_text = _break_rt_prefix(note.get("text", "").strip())  # RT 归属换行（全文/长推用）
-    folded_full = ""
-    folded_full_rich = ""
-    rich_full = ""
+    note_text = _break_rt_prefix(note.get("text", "").strip())  # RT 归属换行（长推用）
+    rich_body = ""
     if note_text:
-        # TL;DR 优先级：原文自带 > AI 总结 > 短预览
-        preview = extract_author_tldr(note_text)
-        if not preview and ai:
-            preview = summarize_note_tweet(ai, username, note_text)
-        if preview:
-            # Do NOT escape here: format_message escapes `body` once below. Escaping
-            # twice turned "&"/"<" in the TL;DR into literal &amp;/&lt; in Telegram.
-            body = f"TL;DR：{preview}"
-        else:
-            # short_preview 会折叠 RT 换行，所以折叠后再补一次（无 TL;DR 的长转推也分行）
-            body = _break_rt_prefix(short_preview(note_text))
-        # 长推全文折叠在 expandable blockquote 里：列表只占几行，点开看全文
-        folded_full = note_text if len(note_text) <= 2800 else note_text[:2800] + "…"
-        # Telegram 按 UTF-16 计长（astral 表情每个 2 单位）：表情密集长推按字符
-        # 截断仍可能超 4096 → HTML 与 plain 降级双双 400 → 推文静默丢失。按单位收缩。
-        while len(folded_full.encode("utf-16-le")) // 2 > 3000 and len(folded_full) > 100:
-            folded_full = folded_full[: int(len(folded_full) * 0.9)] + "…"
-        # Rich 路径折叠用远大的上限（约 28000 字符）：sendRichMessage 单条 32768。
-        # 但 _rich_preserve 的 <br>/&nbsp; 会让长度膨胀，故按「渲染后」UTF-16 长度
-        # 收缩到 27000 单位以内，留 header/body/标签余量保持在 RICH_MESSAGE_MAX_CHARS 下。
-        folded_full_rich = note_text if len(note_text) <= 28000 else note_text[:28000] + "…"
-        rich_full = _rich_preserve(folded_full_rich)
-        while len(rich_full.encode("utf-16-le")) // 2 > 27000 and len(folded_full_rich) > 100:
-            folded_full_rich = folded_full_rich[: int(len(folded_full_rich) * 0.9)] + "…"
-            rich_full = _rich_preserve(folded_full_rich)
+        # 长推文：不再生成 TL;DR / 全文折叠，直接平铺全文（用户指定 2026-07-01）。
+        # HTML 回退受 sendMessage 4096 限制：Telegram 按 UTF-16 计长（astral 表情每个
+        # 2 单位），按单位收缩到 3000 以内，否则截断仍可能超 4096 致整条静默丢失。
+        body = note_text if len(note_text) <= 2800 else note_text[:2800] + "…"
+        while len(body.encode("utf-16-le")) // 2 > 3000 and len(body) > 100:
+            body = body[: int(len(body) * 0.9)] + "…"
+        # Rich 正文上限远大（sendRichMessage 单条 32768）：约 28000 字符起步，但
+        # _rich_preserve 的 <br>/&nbsp; 会让长度膨胀，故按「渲染后」UTF-16 长度收缩到
+        # 27000 单位以内，留 header/标签余量保持在 RICH_MESSAGE_MAX_CHARS 下。
+        rich_src = note_text if len(note_text) <= 28000 else note_text[:28000] + "…"
+        rich_body = _rich_preserve(rich_src)
+        while len(rich_body.encode("utf-16-le")) // 2 > 27000 and len(rich_src) > 100:
+            rich_src = rich_src[: int(len(rich_src) * 0.9)] + "…"
+            rich_body = _rich_preserve(rich_src)
     elif t.get("article"):
         body = article_preview_text(t)
     else:
@@ -1571,18 +1558,18 @@ def format_message(
         text = f'📢 @{username}{hidden}\n\n{html.escape(body)}'
     else:
         text = f'📢 @{username}{hidden}'
-    if folded_full:
-        text += f"\n\n<blockquote expandable>{html.escape(folded_full)}</blockquote>"
     # Rich HTML variant: tweet body/note is raw user content → _rich_preserve it
     # (escape + <br> + &nbsp;) and send via the rich `html` field (NOT markdown),
     # so < > * _ # | $ [ ] etc. can't be parsed as rich syntax / inject nested
-    # blocks，同时保留原推的换行与空格。「打开原文」按钮来自 wrapper。
-    if body:
-        rich_html = f'📢 @{username}\n\n{_rich_preserve(body)}'
+    # blocks，同时保留原推的换行与空格。长推 rich_body 已是平铺全文。
+    if not rich_body:
+        rich_body = _rich_preserve(body) if body else ""
+    if rich_body:
+        # 头部独占一行：rich html 把裸 \n\n 折叠成同一行，必须用 <br><br>
+        # （HTML 回退路径用原生 \n\n，那条路径换行不折叠）。
+        rich_html = f'📢 @{username}<br><br>{rich_body}'
     else:
         rich_html = f'📢 @{username}'
-    if rich_full:
-        rich_html += f"\n\n<details><summary>全文</summary>\n\n{rich_full}\n\n</details>"
     return text, rich_html, link
 
 
@@ -1622,7 +1609,7 @@ def _html_to_plain(text: str) -> str:
 
 
 def send_telegram_rich(token: str, chat_id: str, markdown: str = "", link: str = "",
-                       *, html: str = "") -> dict:
+                       *, html: str = "", thread_id: "str | int | None" = None) -> dict:
     """sendRichMessage（Bot API Rich Message，上限 32768 字符）。
 
     传 markdown 走 Rich Markdown 字段；传 html=… 走 Rich HTML 字段（恰传其一）。
@@ -1641,6 +1628,8 @@ def send_telegram_rich(token: str, chat_id: str, markdown: str = "", link: str =
     else:
         rich["markdown"] = markdown
     payload: dict = {"chat_id": chat_id, "rich_message": rich}
+    if thread_id is not None:
+        payload["message_thread_id"] = thread_id
     if link:
         payload["reply_markup"] = {
             "inline_keyboard": [[{"text": "\U0001f517 打开原文", "url": link}]]
@@ -1686,12 +1675,15 @@ def send_telegram_rich(token: str, chat_id: str, markdown: str = "", link: str =
     raise RuntimeError("send_telegram_rich: exhausted retries")
 
 
-def send_telegram(token: str, chat_id: str, text: str, link: str = "") -> dict:
+def send_telegram(token: str, chat_id: str, text: str, link: str = "",
+                  *, thread_id: "str | int | None" = None) -> dict:
     payload: dict = {
         "chat_id": chat_id,
         "text": text,
         "parse_mode": "HTML",
     }
+    if thread_id is not None:
+        payload["message_thread_id"] = thread_id
     if link:
         payload["link_preview_options"] = {
             "url": link,
@@ -1744,7 +1736,8 @@ def send_telegram(token: str, chat_id: str, text: str, link: str = "") -> dict:
 
 
 def send_tweet(
-    token: str, chat_id: str, username: str, t: dict, ai: "AIClassifier | None" = None
+    token: str, chat_id: str, username: str, t: dict, ai: "AIClassifier | None" = None,
+    *, thread_id: "str | int | None" = None,
 ) -> dict:
     """统一推文推送入口：rich-first → HTML fallback。
 
@@ -1756,12 +1749,12 @@ def send_tweet(
     """
     html_text, rich_html, link = format_message(username, t, ai)
     if len(rich_html) <= RICH_MESSAGE_MAX_CHARS:
-        r = send_telegram_rich(token, chat_id, link=link, html=rich_html)
+        r = send_telegram_rich(token, chat_id, link=link, html=rich_html, thread_id=thread_id)
         if r.get("ok"):
             return r
         if not r.get("rich_fallback"):
             return r
-    return send_telegram(token, chat_id, html_text, link)
+    return send_telegram(token, chat_id, html_text, link, thread_id=thread_id)
 
 
 # ── 单用户处理 ──────────────────────────────────────
@@ -1773,8 +1766,16 @@ def process_user(
     bot_token: str,
     chat_id: str,
     args: argparse.Namespace,
+    *,
+    content_chat_id: "str | None" = None,
+    content_thread_id: "int | None" = None,
 ) -> tuple[int, int, int, int]:
-    """返回 (new_count, push_count, filter_count, ai_overridden)。"""
+    """返回 (new_count, push_count, filter_count, ai_overridden)。
+
+    content_chat_id/content_thread_id 未传时回落 chat_id（行为不变）：账号级
+    失败告警（_alert_seen_save_failure/_alert_ai_all_failed）仍固定用 chat_id，
+    只有推文推送（send_tweet）走 content 目标——告警/看板与内容分流。
+    """
     print(f"\n{'='*40}")
     print(f"  @{username}")
     print(f"{'='*40}")
@@ -1912,7 +1913,8 @@ def process_user(
             print()
         else:
             try:
-                r = send_tweet(bot_token, chat_id, username, t, ai)
+                r = send_tweet(bot_token, content_chat_id or chat_id, username, t, ai,
+                               thread_id=content_thread_id if content_chat_id else None)
                 ok = r.get("ok", False)
                 print(f"    推送 {'OK' if ok else 'FAIL'}: {t.get('id')}")
                 if not ok:
@@ -2021,8 +2023,13 @@ def _article_queue_time_remaining() -> float:
     return ARTICLE_QUEUE_TIME_BUDGET_SECONDS - elapsed
 
 
-def process_article_queue(ai: AIClassifier, bot_token: str, chat_id: str, dry_run: bool = False) -> int:
-    """处理 Article 队列：抓 Markdown、AI 摘要、推送，成功后删除缓存。"""
+def process_article_queue(ai: AIClassifier, bot_token: str, chat_id: str, dry_run: bool = False,
+                          *, thread_id: "int | None" = None) -> int:
+    """处理 Article 队列：抓 Markdown、AI 摘要、推送，成功后删除缓存。
+
+    chat_id 在 main() 已解析为 content 目标（配置了群组则为群组，否则回落 DM）；
+    本函数发的都是文章相关内容（含失败通知），不区分 alert，全部带 thread_id。
+    """
     if not os.path.exists(ARTICLE_QUEUE_DIR):
         print("No article queue directory")
         return 0
@@ -2082,7 +2089,7 @@ def process_article_queue(ai: AIClassifier, bot_token: str, chat_id: str, dry_ru
                     print(f"    DRY RUN failure notice: {err}")
                 else:
                     try:
-                        r = send_telegram(bot_token, chat_id, msg, link)
+                        r = send_telegram(bot_token, chat_id, msg, link, thread_id=thread_id)
                         print(f"    Failure notice push {'OK' if r.get('ok') else 'FAIL'}")
                         _mid = (r.get("result") or {}).get("message_id")
                         if _mid:
@@ -2110,7 +2117,7 @@ def process_article_queue(ai: AIClassifier, bot_token: str, chat_id: str, dry_ru
                     print(f"    DRY RUN summary failure notice: {err}")
                 else:
                     try:
-                        r = send_telegram(bot_token, chat_id, msg, link)
+                        r = send_telegram(bot_token, chat_id, msg, link, thread_id=thread_id)
                         print(f"    Failure notice push {'OK' if r.get('ok') else 'FAIL'}")
                         _mid = (r.get("result") or {}).get("message_id")
                         if _mid:
@@ -2139,7 +2146,7 @@ def process_article_queue(ai: AIClassifier, bot_token: str, chat_id: str, dry_ru
                     # 优先 sendRichMessage（单条 32k、原生渲染 Markdown）；
                     # 被拒/未开放/超长时回退旧的 HTML 分块多条路径。
                     if len(rich_md) <= RICH_MESSAGE_MAX_CHARS:
-                        r = send_telegram_rich(bot_token, chat_id, rich_md, article_link)
+                        r = send_telegram_rich(bot_token, chat_id, rich_md, article_link, thread_id=thread_id)
                         last_resp = r
                         ok = r.get("ok", False)
                         if not ok and img_urls and r.get("rich_fallback"):
@@ -2148,7 +2155,7 @@ def process_article_queue(ai: AIClassifier, bot_token: str, chat_id: str, dry_ru
                             r = send_telegram_rich(
                                 bot_token, chat_id,
                                 format_article_summary_rich(username, entry, summary),
-                                article_link)
+                                article_link, thread_id=thread_id)
                             last_resp = r
                             ok = r.get("ok", False)
                         if ok:
@@ -2163,7 +2170,7 @@ def process_article_queue(ai: AIClassifier, bot_token: str, chat_id: str, dry_ru
                         if not messages:
                             last_resp = {"ok": False, "description": "empty_rendered_summary"}
                         for idx, part in enumerate(messages, 1):
-                            r = send_telegram(bot_token, chat_id, part, article_link)
+                            r = send_telegram(bot_token, chat_id, part, article_link, thread_id=thread_id)
                             last_resp = r
                             part_ok = r.get("ok", False)
                             print(f"    Article summary part {idx}/{len(messages)} push {'OK' if part_ok else 'FAIL'}")
@@ -2261,6 +2268,12 @@ def main() -> int:
             cfg = json.load(f)
         bot_token = args.bot_token or cfg["telegram_bot_token"]
         chat_id = args.chat_id or cfg["telegram_chat_id"]
+        # X 内容（推文+article 摘要）路由到通知群「X」话题；--chat-id 手动覆盖时
+        # 视为整体调试目标，群组路由让位（content_thread_id 同时清空）。账号级
+        # 失败告警/状态看板不受影响，仍用上面的 chat_id（DM）。
+        group_chat_id = None if args.chat_id else cfg.get("telegram_group_chat_id")
+        content_chat_id = group_chat_id or chat_id
+        content_thread_id = cfg.get("telegram_twitter_thread_id") if group_chat_id else None
 
         # Load token pool for 6551.io fallback (optional if GraphQL works)
         try:
@@ -2304,6 +2317,7 @@ def main() -> int:
                 new, pushed, filtered, ai_ov = process_user(
                     pool=pool, ai=ai, username=username,
                     bot_token=bot_token, chat_id=chat_id, args=args,
+                    content_chat_id=content_chat_id, content_thread_id=content_thread_id,
                 )
             except TokenExhausted as e:
                 print(f"  @{username}: {e}", file=sys.stderr)
@@ -2324,7 +2338,8 @@ def main() -> int:
         # Process article queue (auto, uses GraphQL note_tweet — free)
         article_count = 0
         try:
-            article_count = process_article_queue(ai, bot_token, chat_id, args.dry_run)
+            article_count = process_article_queue(ai, bot_token, content_chat_id, args.dry_run,
+                                                  thread_id=content_thread_id)
             if article_count:
                 print(f"  Articles processed: {article_count}")
         except Exception as e:

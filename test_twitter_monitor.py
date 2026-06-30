@@ -56,7 +56,7 @@ class BacklogGuardTest(unittest.TestCase):
             saved["seen"] = seen
             saved["last_post_ts"] = last_post_ts
 
-        def fake_send_telegram(token, chat_id, text, link=""):
+        def fake_send_telegram(token, chat_id, text, link="", thread_id=None):
             sent.append(link)
             return {"ok": True}
 
@@ -90,7 +90,8 @@ class AccountIsolationTest(unittest.TestCase):
         config_path.write_text('{"telegram_bot_token": "bot", "telegram_chat_id": "chat"}')
         failures_path = Path("test_failures.json")
 
-        def fake_process_user(pool, ai, username, bot_token, chat_id, args):
+        def fake_process_user(pool, ai, username, bot_token, chat_id, args,
+                              content_chat_id=None, content_thread_id=None):
             processed.append(username)
             if username == "broken":
                 raise RuntimeError("api payment required")
@@ -153,23 +154,33 @@ class MessageFormattingTest(unittest.TestCase):
         self.assertIn("📢 @vista8", msg)
         self.assertIn("这是一条普通推文", msg)
 
-    def test_format_message_uses_tldr_for_note_tweet(self):
+    def test_rich_header_on_its_own_line(self):
+        # rich html 把裸 \n\n 折叠 → 头部必须 <br><br> 才独占一行；HTML 回退用原生 \n\n。
+        msg, rich, _ = twitter_monitor.format_message(
+            "vista8", {"id": "1", "note_tweet": {"text": "第一段\n\n第二段正文内容"}}, None)
+        self.assertIn("📢 @vista8<br><br>", rich)
+        self.assertNotIn("📢 @vista8\n\n", rich)
+        self.assertIn("📢 @vista8", msg)  # HTML 回退头部用原生换行
+
+    def test_format_message_note_tweet_inlines_full_text(self):
+        # 长推文：不生成 TL;DR、不折叠，正文直接平铺（用户指定 2026-07-01）。
         long_text = "Stack Overflow 因为大家都用 AI 导致发帖量下降，但公司靠企业知识库和数据授权收入增长。" * 20
-        msg, _rich, link = twitter_monitor.format_message(
+        msg, rich, link = twitter_monitor.format_message(
             "dotey",
             {"id": "2", "text": long_text[:200], "note_tweet": {"text": long_text}},
-            FakeAI(True, "Stack Overflow 社区提问减少，但公司靠企业知识库和数据授权从 AI 浪潮中赚钱。"),
+            FakeAI(True, "不应再生成的 AI 摘要内容"),
         )
         self.assertEqual(link, "https://x.com/dotey/status/2")
-        self.assertIn("TL;DR：Stack Overflow 社区提问减少", msg)
-        # 新行为：可见部分仍短，全文折叠在 expandable blockquote 里
-        visible = msg.split("<blockquote expandable>")[0]
-        self.assertLess(len(visible), 300)
-        self.assertIn("<blockquote expandable>", msg)
-        self.assertTrue(msg.rstrip().endswith("</blockquote>"))
-        self.assertLess(len(msg), 4000)  # Telegram 单条上限内
+        self.assertNotIn("TL;DR", msg)
+        self.assertNotIn("不应再生成的 AI 摘要内容", rich)   # 不再调用 AI 总结
+        self.assertNotIn("<blockquote", msg)                  # 不再折叠
+        self.assertNotIn("<details>", rich)
+        self.assertIn("Stack Overflow 因为大家都用 AI", msg)  # 正文直接平铺
+        self.assertIn("Stack Overflow", rich)
+        self.assertLess(len(msg), 4096)  # HTML 回退仍在单条上限内
 
-    def test_format_message_falls_back_to_short_preview_when_tldr_unavailable(self):
+    def test_format_message_note_tweet_inlines_without_ai(self):
+        # AI 不可用也照样平铺全文，不再走任何 TL;DR/预览回退。
         long_text = "Agent 应用和传统 App + AI 的最大差别，在于执行的主体不同。" * 20
         msg, _rich, _ = twitter_monitor.format_message(
             "dotey",
@@ -177,23 +188,21 @@ class MessageFormattingTest(unittest.TestCase):
             FakeAI(False),
         )
         self.assertNotIn("TL;DR", msg)
+        self.assertNotIn("<blockquote", msg)
         self.assertIn("Agent 应用和传统 App", msg)
-        visible = msg.split("<blockquote expandable>")[0]
-        self.assertLess(len(visible), 260)
-        self.assertIn("<blockquote expandable>", msg)
 
-    def test_format_message_falls_back_when_tldr_quality_is_bad(self):
+    def test_format_message_note_tweet_never_consults_ai(self):
+        # 即便传入可用 AI，长推也不会调用它做摘要（其内容不得泄漏到输出）。
         long_text = "Stack Overflow 因为大家都用 AI 导致发帖量下降，但公司靠企业知识库和数据授权收入增长。" * 20
-        msg, _rich, _ = twitter_monitor.format_message(
+        msg, rich, _ = twitter_monitor.format_message(
             "dotey",
             {"id": "5", "text": long_text[:200], "note_tweet": {"text": long_text}},
             FakeAI(True, "* However, Stack Overflow&#x27;"),
         )
         self.assertNotIn("TL;DR", msg)
+        self.assertNotIn("However, Stack Overflow", msg)
+        self.assertNotIn("However, Stack Overflow", rich)
         self.assertIn("Stack Overflow 因为大家都用 AI", msg)
-        visible = msg.split("<blockquote expandable>")[0]
-        self.assertLess(len(visible), 260)
-        self.assertIn("<blockquote expandable>", msg)
 
     def test_format_message_article_keeps_short_article_hint(self):
         msg, _rich, link = twitter_monitor.format_message(
@@ -215,11 +224,10 @@ class MessageFormattingTest(unittest.TestCase):
 class LatentFixRegressionTest(unittest.TestCase):
     """Regression guards for the 2026-06-03 latent-bug fixes."""
 
-    def test_esc1_tldr_not_double_escaped(self):
-        # ESC-1: a TL;DR containing '&' must render as a single &amp;, not &amp;amp;.
-        ai = FakeAI(available=True,
-                    summary="这是一个包含 A & B 与符号的中文摘要内容长度足够通过质量检查测试")
-        msg, _rich, _ = twitter_monitor.format_message("dotey", {"id": "1", "note_tweet": {"text": "x" * 80}}, ai)
+    def test_esc1_note_text_not_double_escaped(self):
+        # ESC-1: '&' in the inline full text must render as a single &amp;, not &amp;amp;.
+        msg, _rich, _ = twitter_monitor.format_message(
+            "dotey", {"id": "1", "note_tweet": {"text": "包含 A & B 与符号的中文长推正文" + "内容" * 40}}, None)
         self.assertNotIn("&amp;amp;", msg)
         self.assertIn("&amp;", msg)
 
@@ -288,7 +296,7 @@ class FailureAlertTest(unittest.TestCase):
     def test_alert_fires_once_at_threshold_and_resets_on_success(self):
         sent = []
 
-        def fake_send_telegram(token, chat_id, text, link=""):
+        def fake_send_telegram(token, chat_id, text, link="", thread_id=None):
             sent.append(text)
             return {"ok": True}
 
@@ -764,12 +772,12 @@ class RichPushTest(unittest.TestCase):
         calls = {"rich": 0, "legacy": 0, "rich_mds": [], "quiet": []}
         responses = rich_response if isinstance(rich_response, list) else [rich_response]
 
-        def fake_rich(token, chat_id, markdown_, link=""):
+        def fake_rich(token, chat_id, markdown_, link="", thread_id=None):
             calls["rich"] += 1
             calls["rich_mds"].append(markdown_)
             return responses[min(calls["rich"] - 1, len(responses) - 1)]
 
-        def fake_legacy(token, chat_id, text, link=""):
+        def fake_legacy(token, chat_id, text, link="", thread_id=None):
             calls["legacy"] += 1
             return {"ok": True, "result": {"message_id": 999}}
 
@@ -906,7 +914,7 @@ class PushCountTest(unittest.TestCase):
         args = argparse.Namespace(test=False, seed=False, dry_run=False,
                                   limit=20, max_push_age_minutes=45)
 
-        def flaky_send(token, chat_id, text, link=""):
+        def flaky_send(token, chat_id, text, link="", thread_id=None):
             return {"ok": "t2" not in text and "t2" not in link}
 
         with patch.object(twitter_monitor, "datetime", FixedDatetime), \
@@ -923,17 +931,19 @@ class PushCountTest(unittest.TestCase):
 
 
 class AuthorTldrTest(unittest.TestCase):
-    """长推 TL;DR：原文自带优先于 AI 总结；全文折叠进 expandable blockquote。"""
+    """长推平铺全文：原文自带的 TL;DR 行作为正文一部分照常显示，AI 不再介入。"""
 
-    def test_author_tldr_preferred_over_ai(self):
+    def test_note_tweet_inlines_text_including_author_tldr_line(self):
         long_text = ("这是很长的正文内容。" * 40 +
                      "\nTL;DR: 作者自己写的一句话总结内容足够长超过十个字符")
-        msg, _rich, _ = twitter_monitor.format_message(
+        msg, rich, _ = twitter_monitor.format_message(
             "dotey", {"id": "8", "note_tweet": {"text": long_text}},
             FakeAI(True, "AI生成的摘要不应该出现在消息里因为原文自带"))
-        self.assertIn("TL;DR：作者自己写的一句话总结", msg)
-        self.assertNotIn("AI生成的摘要", msg)
-        self.assertIn("<blockquote expandable>", msg)
+        self.assertNotIn("AI生成的摘要", msg)            # 不再调用 AI
+        self.assertNotIn("AI生成的摘要", rich)
+        self.assertNotIn("<blockquote", msg)             # 不折叠
+        self.assertNotIn("<details>", rich)
+        self.assertIn("作者自己写的一句话总结", rich)     # 原文 TL;DR 行作为正文照常平铺
 
     def test_extract_author_tldr_variants(self):
         self.assertIsNotNone(twitter_monitor.extract_author_tldr(
@@ -945,7 +955,7 @@ class AuthorTldrTest(unittest.TestCase):
         # astral 表情每个占 2 个 UTF-16 单位：2500 字符 = 5000 单位，必须被收缩
         msg, _rich, _ = twitter_monitor.format_message(
             "dotey", {"id": "10", "note_tweet": {"text": "\U0001f40d" * 2500}}, None)
-        self.assertIn("<blockquote expandable>", msg)
+        self.assertNotIn("<blockquote", msg)
         self.assertLess(len(msg.encode("utf-16-le")) // 2, 4096)
 
 
@@ -1177,7 +1187,7 @@ class AlertClosureTest(unittest.TestCase):
     def test_alert_pins_then_recovery_edits_and_unpins(self):
         quiet = []
 
-        def fake_send(token, chat_id, text, link=""):
+        def fake_send(token, chat_id, text, link="", thread_id=None):
             return {"ok": True, "result": {"message_id": 555}}
 
         def fake_quiet(token, payload, method):
@@ -1299,12 +1309,12 @@ class SendTweetTest(unittest.TestCase):
     def test_rich_success_skips_html_fallback(self):
         calls = {"rich": 0, "legacy": 0, "html": ""}
 
-        def fake_rich(token, chat_id, markdown="", link="", *, html=""):
+        def fake_rich(token, chat_id, markdown="", link="", *, html="", thread_id=None):
             calls["rich"] += 1
             calls["html"] = html
             return {"ok": True, "result": {"message_id": 1}}
 
-        def fake_legacy(token, chat_id, text, link=""):
+        def fake_legacy(token, chat_id, text, link="", thread_id=None):
             calls["legacy"] += 1
             return {"ok": True}
 
@@ -1319,10 +1329,10 @@ class SendTweetTest(unittest.TestCase):
     def test_rich_rejected_falls_back_to_html(self):
         calls = {"legacy": 0}
 
-        def fake_rich(token, chat_id, markdown="", link="", *, html=""):
+        def fake_rich(token, chat_id, markdown="", link="", *, html="", thread_id=None):
             return {"ok": False, "rich_fallback": True}
 
-        def fake_legacy(token, chat_id, text, link=""):
+        def fake_legacy(token, chat_id, text, link="", thread_id=None):
             calls["legacy"] += 1
             return {"ok": True, "result": {"message_id": 2}}
 
@@ -1336,10 +1346,10 @@ class SendTweetTest(unittest.TestCase):
         # ok=False 但非 rich_fallback（如 429 重试穷尽）→ 直接返回，不二次发送
         calls = {"legacy": 0}
 
-        def fake_rich(token, chat_id, markdown="", link="", *, html=""):
+        def fake_rich(token, chat_id, markdown="", link="", *, html="", thread_id=None):
             return {"ok": False}
 
-        def fake_legacy(token, chat_id, text, link=""):
+        def fake_legacy(token, chat_id, text, link="", thread_id=None):
             calls["legacy"] += 1
             return {"ok": True}
 
@@ -1354,12 +1364,12 @@ class SendTweetTest(unittest.TestCase):
         # 所以 send_tweet 仍走 rich，不会产出超限内容
         calls = {"rich": 0, "legacy": 0, "html_len": 0}
 
-        def fake_rich(token, chat_id, markdown="", link="", *, html=""):
+        def fake_rich(token, chat_id, markdown="", link="", *, html="", thread_id=None):
             calls["rich"] += 1
             calls["html_len"] = len(html)
             return {"ok": True}
 
-        def fake_legacy(token, chat_id, text, link=""):
+        def fake_legacy(token, chat_id, text, link="", thread_id=None):
             calls["legacy"] += 1
             return {"ok": True}
 
@@ -1454,13 +1464,13 @@ class RtBreakTest(unittest.TestCase):
         self.assertIn("RT @paulwalker:\n\n", msg)         # HTML 回退：原生换行
         self.assertIn("RT @paulwalker:<br><br>", rich)    # rich：<br>
 
-    def test_format_message_long_rt_breaks_teaser_when_no_tldr(self):
-        # 长转推无 TL;DR 时，teaser 也要折行（note 分支折叠后补 _break_rt_prefix）
+    def test_format_message_long_rt_breaks_in_note_path(self):
+        # 长转推平铺全文时，RT 归属在两条路径都折行
         note = "RT @bigaccount: " + "这是一条很长的转推正文内容。" * 30
-        msg, _rich, _ = twitter_monitor.format_message(
+        msg, rich, _ = twitter_monitor.format_message(
             "dotey", {"id": "9", "note_tweet": {"text": note}}, None)
-        teaser = msg.split("<blockquote expandable>")[0]
-        self.assertIn("RT @bigaccount:\n\n", teaser)
+        self.assertIn("RT @bigaccount:\n\n", msg)
+        self.assertIn("RT @bigaccount:<br><br>", rich)
 
 
 class RichPreserveTest(unittest.TestCase):
@@ -1472,8 +1482,9 @@ class RichPreserveTest(unittest.TestCase):
             "dotey", {"id": "2", "note_tweet": {"text": note}}, None)
         self.assertIn("第一行<br>第二行<br>", rich)
         self.assertIn("&nbsp;&nbsp;缩进两格的行", rich)
-        self.assertIn("<details><summary>全文</summary>", rich)
-        self.assertIn("<blockquote expandable>", msg)      # 回退路径不变
+        self.assertNotIn("<details>", rich)                # 不再折叠，平铺全文
+        self.assertNotIn("<blockquote", msg)               # 回退也平铺，不折叠
+        self.assertIn("第一行\n第二行", msg)                # HTML 回退用原生换行
         self.assertNotIn("<br>", msg)                      # 回退用原生换行
 
     def test_rich_full_within_budget_with_newline_expansion(self):
@@ -1576,7 +1587,7 @@ class PushRetryTest(unittest.TestCase):
         args = argparse.Namespace(test=False, seed=False, dry_run=False,
                                   limit=20, max_push_age_minutes=45)
 
-        def fake_send(token, chat_id, username, t, ai=None):
+        def fake_send(token, chat_id, username, t, ai=None, thread_id=None):
             sent.append(t["id"])
             return {"ok": True}
 
@@ -1701,7 +1712,7 @@ class AIFailClosedTest(unittest.TestCase):
         ai = twitter_monitor.AIClassifier([self.FailingBackend()])
         pushed_ids = []
 
-        def fake_send_tweet(token, chat_id, username, t, ai=None):
+        def fake_send_tweet(token, chat_id, username, t, ai=None, thread_id=None):
             pushed_ids.append(t["id"])
             return {"ok": True}
 
@@ -1752,7 +1763,7 @@ class LoadSeenCorruptedTest(unittest.TestCase):
         }
         pushed_ids = []
 
-        def fake_send_tweet(token, chat_id, username, t, ai=None):
+        def fake_send_tweet(token, chat_id, username, t, ai=None, thread_id=None):
             pushed_ids.append(t["id"])
             return {"ok": True}
 
@@ -1860,6 +1871,219 @@ class GraphqlCurlTest(unittest.TestCase):
                 returncode=0, stdout=stdout, stderr="")):
             with self.assertRaises(tg.CurlError):
                 tg._curl("https://example.com")
+
+
+class ContentRoutingTest(unittest.TestCase):
+    """X 内容（推文+article 摘要）路由到 content_chat_id/content_thread_id（通知群「X」话题）；
+    账号级失败告警仍走 chat_id（DM），未传 content 目标时回落 chat_id（行为不变）。"""
+
+    def test_send_telegram_includes_thread_id_when_set(self):
+        captured = {}
+
+        def fake_post(token, payload, method="sendMessage"):
+            captured["payload"] = payload
+            return {"ok": True}
+
+        with patch.object(twitter_monitor, "_tg_post", side_effect=fake_post):
+            twitter_monitor.send_telegram("tok", "chat", "hello", thread_id=19)
+        self.assertEqual(captured["payload"].get("message_thread_id"), 19)
+
+    def test_send_telegram_omits_thread_id_when_not_set(self):
+        captured = {}
+
+        def fake_post(token, payload, method="sendMessage"):
+            captured["payload"] = payload
+            return {"ok": True}
+
+        with patch.object(twitter_monitor, "_tg_post", side_effect=fake_post):
+            twitter_monitor.send_telegram("tok", "chat", "hello")
+        self.assertNotIn("message_thread_id", captured["payload"])
+
+    def test_send_telegram_rich_includes_thread_id_when_set(self):
+        captured = {}
+
+        def fake_post(token, payload, method="sendMessage"):
+            captured["payload"] = payload
+            return {"ok": True}
+
+        with patch.object(twitter_monitor, "_tg_post", side_effect=fake_post):
+            twitter_monitor.send_telegram_rich("tok", "chat", html="hi", thread_id=19)
+        self.assertEqual(captured["payload"].get("message_thread_id"), 19)
+
+    def test_send_tweet_propagates_thread_id_to_rich_and_fallback(self):
+        rich_calls = []
+        legacy_calls = []
+
+        def fake_rich(token, chat_id, markdown="", link="", *, html="", thread_id=None):
+            rich_calls.append(thread_id)
+            return {"ok": False, "rich_fallback": True}
+
+        def fake_legacy(token, chat_id, text, link="", thread_id=None):
+            legacy_calls.append(thread_id)
+            return {"ok": True}
+
+        tweet = {"id": "1", "text": "短推", "createdAt": "Tue May 12 00:20:00 +0000 2026"}
+        with patch.object(twitter_monitor, "send_telegram_rich", side_effect=fake_rich), \
+             patch.object(twitter_monitor, "send_telegram", side_effect=fake_legacy):
+            twitter_monitor.send_tweet("tok", "chat", "u", tweet, FakeAI(False), thread_id=19)
+        self.assertEqual(rich_calls, [19])
+        self.assertEqual(legacy_calls, [19])
+
+    def test_process_user_routes_push_to_content_target_alerts_stay_on_chat_id(self):
+        pushed_to = []
+        alert_to = []
+
+        def fake_send_tweet(token, chat_id, username, t, ai=None, thread_id=None):
+            pushed_to.append((chat_id, thread_id))
+            return {"ok": True}
+
+        def fake_alert(bot_token, chat_id, username, error):
+            alert_to.append(chat_id)
+
+        tweets = [{"id": "t1", "text": "这是一条长度足够通过分类过滤器的正常推文内容编号一",
+                   "createdAt": "Tue May 12 00:20:00 +0000 2026"}]
+        args = argparse.Namespace(test=False, seed=False, dry_run=False,
+                                  limit=20, max_push_age_minutes=45)
+
+        with patch.object(twitter_monitor, "datetime", FixedDatetime), \
+             patch.object(twitter_monitor, "fetch_tweets", return_value=tweets), \
+             patch.object(twitter_monitor, "load_seen", return_value=({"old"}, None)), \
+             patch.object(twitter_monitor, "save_seen", side_effect=OSError("disk full")), \
+             patch.object(twitter_monitor, "_alert_seen_save_failure", side_effect=fake_alert), \
+             patch.object(twitter_monitor, "send_tweet", side_effect=fake_send_tweet), \
+             patch.object(twitter_monitor.time, "sleep", return_value=None):
+            with self.assertRaises(OSError):
+                twitter_monitor.process_user(
+                    pool=None, ai=FakeAI(False), username="u",
+                    bot_token="b", chat_id="dm-chat", args=args,
+                    content_chat_id="group-chat", content_thread_id=19)
+
+        self.assertEqual(pushed_to, [("group-chat", 19)])  # 推文走 content 目标
+        self.assertEqual(alert_to, ["dm-chat"])             # seen 写盘失败告警仍走 DM
+
+    def test_process_user_falls_back_to_chat_id_when_content_target_unset(self):
+        pushed_to = []
+
+        def fake_send_tweet(token, chat_id, username, t, ai=None, thread_id=None):
+            pushed_to.append((chat_id, thread_id))
+            return {"ok": True}
+
+        tweets = [{"id": "t1", "text": "这是一条长度足够通过分类过滤器的正常推文内容编号一",
+                   "createdAt": "Tue May 12 00:20:00 +0000 2026"}]
+        args = argparse.Namespace(test=False, seed=False, dry_run=False,
+                                  limit=20, max_push_age_minutes=45)
+
+        with patch.object(twitter_monitor, "datetime", FixedDatetime), \
+             patch.object(twitter_monitor, "fetch_tweets", return_value=tweets), \
+             patch.object(twitter_monitor, "load_seen", return_value=({"old"}, None)), \
+             patch.object(twitter_monitor, "save_seen", return_value=None), \
+             patch.object(twitter_monitor, "send_tweet", side_effect=fake_send_tweet), \
+             patch.object(twitter_monitor.time, "sleep", return_value=None):
+            twitter_monitor.process_user(
+                pool=None, ai=FakeAI(False), username="u",
+                bot_token="b", chat_id="dm-chat", args=args)
+
+        self.assertEqual(pushed_to, [("dm-chat", None)])  # 未传 content_* 回落 chat_id，无 thread_id
+
+    def test_process_article_queue_forwards_thread_id(self):
+        import json as _json
+        import os as _os
+        import tempfile
+        captured = {"rich": []}
+
+        def fake_rich(token, chat_id, markdown_, link="", thread_id=None):
+            captured["rich"].append(thread_id)
+            return {"ok": True}
+
+        def fake_legacy(token, chat_id, text, link="", thread_id=None):
+            return {"ok": True}
+
+        entry = {"article_id": "777", "tweet_id": "1", "author": "u",
+                 "article_title": "T", "status": "pending", "attempts": 0,
+                 "content": None}
+        with tempfile.TemporaryDirectory() as d:
+            cache_dir = _os.path.join(d, "cache")
+            qpath = _os.path.join(d, "u_queue.json")
+            with open(qpath, "w") as f:
+                _json.dump([entry], f)
+            with patch.object(twitter_monitor, "ARTICLE_QUEUE_DIR", d), \
+                 patch.object(twitter_monitor, "ARTICLE_CACHE_DIR", cache_dir), \
+                 patch.object(twitter_monitor, "fetch_article_markdown",
+                              return_value=("# 全文\n" + "x" * 300, None)), \
+                 patch.object(twitter_monitor, "summarize_article",
+                              return_value=("> 结论\n\n### 节\n正文", "mimo")), \
+                 patch.object(twitter_monitor, "send_telegram_rich", side_effect=fake_rich), \
+                 patch.object(twitter_monitor, "send_telegram", side_effect=fake_legacy), \
+                 patch.object(twitter_monitor.time, "sleep", return_value=None):
+                twitter_monitor.process_article_queue(FakeAI(True), "bot", "chat", thread_id=19)
+        self.assertEqual(captured["rich"], [19])
+
+
+class MainContentRoutingTest(unittest.TestCase):
+    """main()：telegram_group_chat_id/telegram_twitter_thread_id 解析为 content 路由目标；
+    --chat-id 手动覆盖时整体让位（content_thread_id 同时清空）。"""
+
+    def _run_main(self, config_extra="", argv_extra=None):
+        captured = {}
+        config_path = Path("test_config_routing.json")
+        config_path.write_text(
+            '{"telegram_bot_token": "bot", "telegram_chat_id": "dm-chat"' + config_extra + '}')
+        failures_path = Path("test_failures_routing.json")
+
+        def fake_process_user(pool, ai, username, bot_token, chat_id, args,
+                              content_chat_id=None, content_thread_id=None):
+            captured["chat_id"] = chat_id
+            captured["content_chat_id"] = content_chat_id
+            captured["content_thread_id"] = content_thread_id
+            return 1, 1, 0, 0
+
+        def fake_process_article_queue(ai, bot_token, chat_id, dry_run=False, *, thread_id=None):
+            captured["article_chat_id"] = chat_id
+            captured["article_thread_id"] = thread_id
+            return 0
+
+        argv = ["twitter_monitor.py"] + (argv_extra or [])
+        try:
+            with patch.object(twitter_monitor, "CONFIG_PATH", str(config_path)), \
+                 patch.object(twitter_monitor, "FAILURES_PATH", str(failures_path)), \
+                 patch.object(twitter_monitor, "update_status_dashboard", return_value=None), \
+                 patch.object(twitter_monitor.TokenPool, "load", return_value=None), \
+                 patch.object(twitter_monitor.AIClassifier, "load", return_value=FakeAI(False)), \
+                 patch.object(twitter_monitor, "load_accounts", return_value=[{"username": "u"}]), \
+                 patch.object(twitter_monitor, "process_user", side_effect=fake_process_user), \
+                 patch.object(twitter_monitor, "process_article_queue",
+                              side_effect=fake_process_article_queue), \
+                 patch.object(sys, "argv", argv):
+                result = twitter_monitor.main()
+        finally:
+            config_path.unlink(missing_ok=True)
+            failures_path.unlink(missing_ok=True)
+        self.assertEqual(result, 0)
+        return captured
+
+    def test_group_and_thread_routed_when_configured(self):
+        captured = self._run_main(
+            config_extra=', "telegram_group_chat_id": "-100123", "telegram_twitter_thread_id": 19')
+        self.assertEqual(captured["chat_id"], "dm-chat")
+        self.assertEqual(captured["content_chat_id"], "-100123")
+        self.assertEqual(captured["content_thread_id"], 19)
+        self.assertEqual(captured["article_chat_id"], "-100123")
+        self.assertEqual(captured["article_thread_id"], 19)
+
+    def test_falls_back_to_dm_when_group_not_configured(self):
+        captured = self._run_main()
+        self.assertEqual(captured["content_chat_id"], "dm-chat")
+        self.assertIsNone(captured["content_thread_id"])
+        self.assertEqual(captured["article_chat_id"], "dm-chat")
+        self.assertIsNone(captured["article_thread_id"])
+
+    def test_chat_id_cli_override_suppresses_group_routing(self):
+        captured = self._run_main(
+            config_extra=', "telegram_group_chat_id": "-100123", "telegram_twitter_thread_id": 19',
+            argv_extra=["--chat-id", "debug-chat"])
+        self.assertEqual(captured["chat_id"], "debug-chat")
+        self.assertEqual(captured["content_chat_id"], "debug-chat")
+        self.assertIsNone(captured["content_thread_id"])
 
 
 if __name__ == "__main__":
