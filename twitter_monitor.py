@@ -304,13 +304,15 @@ ARTICLE_SUMMARY_PROMPT = """请把下面这篇文章总结成适合 Telegram 推
 """
 
 
-def extract_article_image_urls(markdown: str, limit: int = 4) -> list[str]:
+def extract_article_cover(markdown: str) -> "str | None":
+    """封面图：baoyu markdown front matter 的 coverImage 字段（正文里通常没有 ![]()）。"""
+    m = re.search(r'(?im)^coverImage\s*:\s*["\']?(https?://[^"\'\s]+)', markdown)
+    return html.unescape(m.group(1)).strip() if m else None
+
+
+def extract_article_body_images(markdown: str, limit: int = 4) -> list[str]:
+    """正文内嵌图：markdown body 的 ![]() 与 <img src>（不含 front matter 封面）。"""
     urls: list[str] = []
-    # 封面图在 front matter（coverImage: "url"）：正文常无 ![]() → 之前整条被漏掉，
-    # 连封面都不展示。先收封面，再收正文内嵌图，去重后按 limit 截断。
-    cover = re.search(r'(?im)^coverImage\s*:\s*["\']?(https?://[^"\'\s]+)', markdown)
-    if cover:
-        urls.append(html.unescape(cover.group(1)).strip())
     for pattern in (r"!\[[^\]]*\]\((https?://[^\s)]+)\)", r'<img[^>]+src=["\'](https?://[^"\']+)["\']'):
         for url in re.findall(pattern, markdown, re.IGNORECASE):
             clean = html.unescape(url).strip()
@@ -318,6 +320,18 @@ def extract_article_image_urls(markdown: str, limit: int = 4) -> list[str]:
                 urls.append(clean)
             if len(urls) >= limit:
                 return urls
+    return urls
+
+
+def extract_article_image_urls(markdown: str, limit: int = 4) -> list[str]:
+    """封面 + 正文内嵌图合并去重（供 AI 视觉理解用；展示层封面/正文图分开放置）。"""
+    cover = extract_article_cover(markdown)
+    urls: list[str] = [cover] if cover else []
+    for u in extract_article_body_images(markdown, limit):
+        if u not in urls:
+            urls.append(u)
+        if len(urls) >= limit:
+            break
     return urls
 
 
@@ -520,8 +534,26 @@ def _fold_summary_details(summary: str) -> str:
             f"{rest}\n\n</details>")
 
 
+def _inject_detail_images(body: str, image_urls: list) -> str:
+    """把文章正文内嵌图插进「展开论证与细节」折叠区（</details> 之前）；
+
+    无折叠区（摘要没分节）时附在正文末尾。单图裸 ![]()，多图 <tg-collage>。
+    """
+    urls = [u for u in (image_urls or []) if u][:4]
+    if not urls:
+        return body
+    if len(urls) == 1:
+        block = f"![]({urls[0]})"
+    else:
+        block = "<tg-collage>\n\n" + "\n".join(f"![]({u})" for u in urls) + "\n\n</tg-collage>"
+    if "</details>" in body:
+        return body.replace("</details>", f"\n\n{block}\n\n</details>", 1)
+    return f"{body}\n\n{block}"
+
+
 def format_article_summary_rich(username: str, entry: dict, summary: str,
-                                image_urls: list[str] | None = None) -> str:
+                                image_urls: list[str] | None = None,
+                                detail_image_urls: list[str] | None = None) -> str:
     """组装 Rich Markdown 摘要（sendRichMessage 用）：克制的头部 + AI 摘要原文。
 
     AI 输出本来就是 Markdown，rich 模式原生渲染标题/列表/引用块，
@@ -552,6 +584,8 @@ def format_article_summary_rich(username: str, entry: dict, summary: str,
     title_line = (f"## \U0001f4c4 {title}\n"
                   f"**@{author}** · [原文]({link})")
     body = _fold_summary_details(summary.strip())
+    # 正文内嵌图插进「展开论证与细节」折叠区（封面仍走顶部 image_urls）。
+    body = _inject_detail_images(body, detail_image_urls)
     collage = ""
     if image_urls:
         urls = image_urls[:4]
@@ -2196,8 +2230,13 @@ def process_article_queue(ai: AIClassifier, bot_token: str, chat_id: str, dry_ru
             entry["summary_backend"] = backend
             entry["summary_at"] = datetime.now(timezone.utc).isoformat()
             messages = format_article_summary_messages(username, entry, summary)
-            img_urls = extract_article_image_urls(markdown)
-            rich_md = format_article_summary_rich(username, entry, summary, image_urls=img_urls)
+            cover = extract_article_cover(markdown)
+            cover_urls = [cover] if cover else []
+            body_imgs = extract_article_body_images(markdown)
+            img_urls = cover_urls + body_imgs  # 去图重试的判定用
+            rich_md = format_article_summary_rich(
+                username, entry, summary,
+                image_urls=cover_urls, detail_image_urls=body_imgs)
             if dry_run:
                 print(f"    DRY RUN rich markdown {len(rich_md)} chars; fallback parts: {len(messages)}")
                 for idx, part in enumerate(messages, 1):

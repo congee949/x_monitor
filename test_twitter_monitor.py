@@ -817,6 +817,15 @@ class ArticleCoverImageTest(unittest.TestCase):
         self.assertEqual(urls[0], "https://pbs.twimg.com/media/COVER.jpg")
         self.assertEqual(len(urls), 3)  # cover + B1 + B2（COVER 重复去掉）
 
+    def test_cover_and_body_images_separated(self):
+        md = ('---\ncoverImage: "https://pbs.twimg.com/media/COVER.jpg"\n---\n'
+              '正文\n![](https://pbs.twimg.com/media/B1.jpg)\n<img src="https://pbs.twimg.com/media/B2.jpg">')
+        self.assertEqual(twitter_monitor.extract_article_cover(md),
+                         "https://pbs.twimg.com/media/COVER.jpg")
+        self.assertEqual(twitter_monitor.extract_article_body_images(md),
+                         ["https://pbs.twimg.com/media/B1.jpg", "https://pbs.twimg.com/media/B2.jpg"])
+        self.assertIsNone(twitter_monitor.extract_article_cover("正文无 front matter"))
+
 
 class RichPushTest(unittest.TestCase):
     """sendRichMessage 路径：payload 形状 / 400 回退信号 / 队列 rich-first 与回退。"""
@@ -924,6 +933,30 @@ class RichPushTest(unittest.TestCase):
         i_body = md.index("摘要正文")
         self.assertTrue(i_title < i_img < i_body)
         self.assertFalse(md.rstrip().endswith(".jpg)"))  # 封面不在末尾
+
+    def test_body_images_injected_into_details(self):
+        # 正文内嵌图插进「展开论证与细节」折叠区，封面仍在顶部（用户 2026-07-01）
+        summary = "> 结论\n\n### 第一节\n内容一\n\n### 第二节\n内容二\n\n### 第三节\n内容三"
+        entry = {"article_id": "1", "article_title": "T", "author": "vista8"}
+        md = twitter_monitor.format_article_summary_rich(
+            "vista8", entry, summary,
+            image_urls=["https://pbs.twimg.com/media/COVER.jpg"],
+            detail_image_urls=["https://pbs.twimg.com/media/B1.jpg"])
+        self.assertIn("<details><summary>展开论证与细节</summary>", md)
+        i_open = md.index("<details>")
+        i_body_img = md.index("![](https://pbs.twimg.com/media/B1.jpg)")
+        i_close = md.index("</details>")
+        self.assertTrue(i_open < i_body_img < i_close)       # 正文图在折叠区内
+        self.assertLess(md.index("![](https://pbs.twimg.com/media/COVER.jpg)"), i_open)  # 封面在顶部
+
+    def test_body_images_appended_when_no_details(self):
+        # 摘要没分节（无 details）→ 正文图附在末尾
+        entry = {"article_id": "1", "article_title": "T", "author": "v"}
+        md = twitter_monitor.format_article_summary_rich(
+            "v", entry, "只有结论没有分节",
+            detail_image_urls=["https://pbs.twimg.com/media/B1.jpg"])
+        self.assertNotIn("<details>", md)
+        self.assertTrue(md.rstrip().endswith("![](https://pbs.twimg.com/media/B1.jpg)"))
 
     def test_format_article_summary_rich_no_lead_in_without_comment(self):
         # 转推/自文无 quote_comment → 无引子，行为不变
