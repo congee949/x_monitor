@@ -617,6 +617,11 @@ def fetch_tweets(username, limit=20):
                     rt_ext = rt_legacy.get("extended_entities") or {}
                     rt_ent = rt_legacy.get("entities") or {}
                     media = _build_media(rt_ext.get("media") or rt_ent.get("media") or [])
+                    # media 换成原推的之后，entities/extended_entities（t.co 短链匹配用）也要
+                    # 同步换成原推的——否则 normalized["text"] 已是原推全文，但 entities 仍是
+                    # 壳的，_strip_media_tco 会找不到对应短链、漏剥离。
+                    extended_entities = rt_ext
+                    entities = rt_ent
 
             normalized = {
                 "id": tid,

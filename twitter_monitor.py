@@ -1610,6 +1610,21 @@ def _rich_media_block(t: dict) -> str:
     return block + f"<br><br>{media_html}"
 
 
+def _strip_media_tco(text: str, t: dict) -> str:
+    """去掉 full_text 里「媒体对应」的 t.co 短链（图片已作为媒体块内嵌，裸链冗余）。
+
+    用 entities/extended_entities 的 media[].url（媒体专属 t.co）精确匹配并移除，
+    不碰用户正文里主动分享的其它链接——避免「末尾正则」误删真实分享链接。原推（截图）
+    里本就不显示这个媒体短链。
+    """
+    media = ((t.get("extended_entities") or {}).get("media") or []) + \
+            ((t.get("entities") or {}).get("media") or [])
+    urls = {m.get("url") for m in media if isinstance(m, dict) and m.get("url")}
+    for u in urls:
+        text = text.replace(u, "")
+    return text.strip()
+
+
 def format_message(
     username: str, t: dict, ai: "AIClassifier | None" = None
 ) -> tuple[str, str, str]:
@@ -1631,6 +1646,9 @@ def format_message(
     full_text = note_text
     if not full_text and not t.get("article"):
         full_text = _break_rt_prefix(t.get("text", "").strip())
+    if full_text and any((m or {}).get("type") == "photo" for m in (t.get("media") or [])):
+        # 图片已作为 rich 媒体块内嵌，正文里对应的 t.co 短链冗余，剥掉（不碰其它真实分享链接）。
+        full_text = _strip_media_tco(full_text, t)
     rich_body = ""
     if full_text:
         # HTML 回退受 sendMessage 4096 限制：Telegram 按 UTF-16 计长（astral 表情每个

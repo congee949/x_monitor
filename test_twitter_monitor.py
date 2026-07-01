@@ -284,6 +284,87 @@ class RichMediaBlockTest(unittest.TestCase):
         self.assertNotIn("<img", rich)
 
 
+class StripMediaTcoTest(unittest.TestCase):
+    """带图推文正文尾部的「媒体专属」t.co 短链应被剥掉（图已作为 rich 媒体块内嵌），
+    但用户主动分享的真实链接必须保留（精确匹配 entities.media[].url，不用末尾正则）。"""
+
+    def test_media_tco_stripped_when_photo_present(self):
+        # 有 photo 媒体 → 正文里对应的媒体 t.co 短链在 body 与 rich 两路径都被剥掉
+        t = {"id": "1",
+             "text": "看这张图 https://t.co/MEDIALINK",
+             "media": [{"type": "photo", "url": "https://pbs.twimg.com/media/p1.jpg"}],
+             "extended_entities": {"media": [
+                 {"type": "photo", "url": "https://t.co/MEDIALINK",
+                  "media_url_https": "https://pbs.twimg.com/media/p1.jpg"}]}}
+        msg, rich, _ = twitter_monitor.format_message("vista8", t, None)
+        self.assertNotIn("https://t.co/MEDIALINK", msg)   # HTML 回退不含媒体裸链
+        self.assertNotIn("https://t.co/MEDIALINK", rich)  # rich 也不含
+        self.assertIn("看这张图", rich)                    # 正文其余部分保留
+        self.assertIn('<img src="https://pbs.twimg.com/media/p1.jpg"/>', rich)  # 图作为媒体块内嵌
+
+    def test_real_shared_link_at_end_is_kept(self):
+        # 只删 entities 精确匹配的媒体短链；用户主动分享的真实链接即使在末尾也保留
+        t = {"id": "2",
+             "text": "配图见下 https://t.co/MEDIALINK 另外强烈推荐这篇 https://t.co/REALLINK",
+             "media": [{"type": "photo", "url": "https://pbs.twimg.com/media/p1.jpg"}],
+             "extended_entities": {"media": [
+                 {"type": "photo", "url": "https://t.co/MEDIALINK",
+                  "media_url_https": "https://pbs.twimg.com/media/p1.jpg"}]}}
+        msg, rich, _ = twitter_monitor.format_message("vista8", t, None)
+        self.assertNotIn("https://t.co/MEDIALINK", rich)  # 媒体裸链剥掉
+        self.assertIn("https://t.co/REALLINK", rich)      # 真实分享链接（末尾）保留
+        self.assertIn("https://t.co/REALLINK", msg)
+        self.assertNotIn("https://t.co/MEDIALINK", msg)
+
+    def test_no_strip_without_photo_media(self):
+        # 没有 photo 媒体（纯文字 / 仅视频）→ 不触发剥离，正文里的 t.co 原样保留
+        t = {"id": "3",
+             "text": "分享一个链接 https://t.co/PLAINLINK",
+             "extended_entities": {"media": [
+                 {"type": "photo", "url": "https://t.co/PLAINLINK",
+                  "media_url_https": "https://pbs.twimg.com/media/p.jpg"}]}}
+        # 注意：t['media'] 缺失（GraphQL 未提取到 photo）→ 门控不成立，不剥
+        _msg, rich, _ = twitter_monitor.format_message("vista8", t, None)
+        self.assertIn("https://t.co/PLAINLINK", rich)
+
+    def test_rt_reconstructed_text_strips_media_tco(self):
+        # 转推重建全文时媒体 t.co 也要剥离：normalizer 把 entities/extended_entities
+        # 一并换成原推的（twitter_graphql RT rebuild），format_message 才能精确匹配到短链。
+        # 本测试同时守护 twitter_graphql 的 entities 传播修复——没有它 t['extended_entities']
+        # 仍是壳的空 dict，下面的 assertEqual 会 KeyError。
+        import json as _json
+        import twitter_graphql as tg
+        rt_original = {
+            "__typename": "Tweet",
+            "legacy": {"id_str": "888",
+                       "full_text": "原推正文含配图 https://t.co/MEDIALINK",
+                       "extended_entities": {"media": [
+                           {"type": "photo", "url": "https://t.co/MEDIALINK",
+                            "media_url_https": "https://pbs.twimg.com/media/X.jpg"}]}},
+            "core": {"user_results": {"result": {"legacy": {"screen_name": "orig"}}}},
+        }
+        synthetic = {"data": {"user": {"result": {"timeline_v2": {"timeline": {"instructions": [
+            {"entries": [
+                {"content": {"itemContent": {"tweet_results": {"result": {
+                    "__typename": "Tweet",
+                    "legacy": {"id_str": "999", "full_text": "RT @orig: 壳被砍断的短文本…",
+                               "created_at": "Fri Jun 05 17:30:00 +0000 2026",
+                               "retweeted_status_result": {"result": rt_original}}}}}}},
+            ]}]}}}}}}
+        with patch.object(tg, "_auth_headers", lambda: None), \
+             patch.object(tg, "_get_guest_token", lambda: "gt"), \
+             patch.object(tg, "get_user_id", lambda u: "1"), \
+             patch.object(tg, "_curl", lambda *a, **k: _json.dumps(synthetic)):
+            t = tg.fetch_tweets("dotey", limit=20)[0]
+        # 归一化后：entities/extended_entities 已换成原推的（守护 graphql 修复）
+        self.assertEqual(t["extended_entities"]["media"][0]["url"], "https://t.co/MEDIALINK")
+        msg, rich, _ = twitter_monitor.format_message("dotey", t, None)
+        self.assertNotIn("https://t.co/MEDIALINK", rich)   # 转推重建全文里的媒体裸链也剥掉
+        self.assertNotIn("https://t.co/MEDIALINK", msg)
+        self.assertIn("原推正文含配图", rich)               # 正文保留
+        self.assertIn('<img src="https://pbs.twimg.com/media/X.jpg"/>', rich)  # 原推图内嵌
+
+
 class LatentFixRegressionTest(unittest.TestCase):
     """Regression guards for the 2026-06-03 latent-bug fixes."""
 
