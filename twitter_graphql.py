@@ -339,6 +339,46 @@ def get_user_id(screen_name):
     return uid
 
 
+def _build_media(raw_media: list) -> list:
+    """把 GraphQL 的 media 原始节点转成便携 list：photo 用缩略图 url，video/gif 附最佳 mp4。
+
+    同时用于推文本体与转推原推（转推媒体在 rt_result.legacy.extended_entities，壳里没有）。
+    """
+    media = []
+    for m in raw_media or []:
+        if not isinstance(m, dict):
+            continue
+        item = {
+            "type": m.get("type"),  # photo / video / animated_gif
+            "url": m.get("media_url_https") or m.get("media_url"),
+            "width": None,
+            "height": None,
+            "duration_ms": None,
+            "bitrate": None,
+            "video_url": None,
+        }
+        orig = m.get("original_info") or {}
+        if orig.get("width"):
+            item["width"] = orig.get("width")
+            item["height"] = orig.get("height")
+        else:
+            large = (m.get("sizes") or {}).get("large") or {}
+            item["width"] = large.get("w")
+            item["height"] = large.get("h")
+        if item["type"] in ("video", "animated_gif"):
+            vi = m.get("video_info") or {}
+            item["duration_ms"] = vi.get("duration_millis")
+            variants = vi.get("variants") or []
+            mp4s = [v for v in variants
+                    if v.get("content_type") == "video/mp4" and v.get("url")]
+            if mp4s:
+                best = max(mp4s, key=lambda v: v.get("bitrate") or 0)
+                item["video_url"] = best.get("url")
+                item["bitrate"] = best.get("bitrate")
+        media.append(item)
+    return media
+
+
 def fetch_tweets(username, limit=20):
     """Fetch user tweets, return normalized format list.
 
@@ -522,6 +562,10 @@ def fetch_tweets(username, limit=20):
             rt_result = (legacy.get("retweeted_status_result") or {}).get("result") or {}
             if rt_result.get("__typename") == "TweetWithVisibilityResults":
                 rt_result = rt_result.get("tweet") or {}
+            rt_legacy = rt_result.get("legacy") or {}
+            rt_user = ((rt_result.get("core") or {}).get("user_results") or {}).get("result") or {}
+            rt_screen = ((rt_user.get("legacy") or {}).get("screen_name")
+                         or (rt_user.get("core") or {}).get("screen_name") or "")
 
             # Quote: quoted_status_result 在 tweet_result 顶层（非 legacy 下），形状同推文
             quoted_result = (tweet_result.get("quoted_status_result") or {}).get("result") or {}
@@ -554,47 +598,25 @@ def fetch_tweets(username, limit=20):
             extended_entities = legacy.get("extended_entities", {}) or {}
 
             # ========== Media extraction (photos, videos, animated_gif) ==========
-            # Raw GraphQL provides media in entities.media and (richer) extended_entities.media
-            # We build a convenient 'media' list with direct usable URLs.
-            # Photos: use 'url'
-            # Videos/GIFs: use 'video_url' (best mp4 variant)
-            media = []
-            raw_media = (extended_entities.get("media") or entities.get("media") or [])
-            for m in raw_media:
-                if not isinstance(m, dict):
-                    continue
-                item = {
-                    "type": m.get("type"),  # photo / video / animated_gif
-                    "url": m.get("media_url_https") or m.get("media_url"),
-                    "width": None,
-                    "height": None,
-                    "duration_ms": None,
-                    "bitrate": None,
-                    "video_url": None,
-                }
+            # 推文本体媒体在 entities.media / (更全) extended_entities.media。
+            media = _build_media(extended_entities.get("media") or entities.get("media") or [])
 
-                # original size if available
-                orig = m.get("original_info") or {}
-                if orig.get("width"):
-                    item["width"] = orig.get("width")
-                    item["height"] = orig.get("height")
-                else:
-                    large = (m.get("sizes") or {}).get("large") or {}
-                    item["width"] = large.get("w")
-                    item["height"] = large.get("h")
-
-                if item["type"] in ("video", "animated_gif"):
-                    vi = m.get("video_info") or {}
-                    item["duration_ms"] = vi.get("duration_millis")
-                    variants = vi.get("variants") or []
-                    mp4s = [v for v in variants
-                            if v.get("content_type") == "video/mp4" and v.get("url")]
-                    if mp4s:
-                        best = max(mp4s, key=lambda v: v.get("bitrate") or 0)
-                        item["video_url"] = best.get("url")
-                        item["bitrate"] = best.get("bitrate")
-
-                media.append(item)
+            # 转推重建：Twitter 把转推壳的 full_text 砍到 140、壳无 note_tweet/media；
+            # 原推正文与媒体都在 rt_result 里。非 article 转推时用原推重建全文
+            # + note_tweet（长推 → format_message 走平铺全文）+ 媒体（配图），
+            # 使转推与本博主自己发长推/带图推同款展示；article 转推仍走摘要队列不重建。
+            if rt_result and rt_screen and not article_rest_id:
+                rt_note = ((rt_result.get("note_tweet") or {})
+                           .get("note_tweet_results") or {}).get("result", {}).get("text", "")
+                rt_full = rt_legacy.get("full_text", "")
+                if rt_note or rt_full:
+                    text = f"RT @{rt_screen}: {rt_note or rt_full}"
+                    if rt_note:
+                        note_text = f"RT @{rt_screen}: {rt_note}"
+                if not media:
+                    rt_ext = rt_legacy.get("extended_entities") or {}
+                    rt_ent = rt_legacy.get("entities") or {}
+                    media = _build_media(rt_ext.get("media") or rt_ent.get("media") or [])
 
             normalized = {
                 "id": tid,
@@ -626,14 +648,9 @@ def fetch_tweets(username, limit=20):
                     "rest_id": article_rest_id,
                 }
 
-            if rt_result:
-                rt_legacy = rt_result.get("legacy") or {}
-                rt_user = ((rt_result.get("core") or {}).get("user_results") or {}).get("result") or {}
-                rt_screen = ((rt_user.get("legacy") or {}).get("screen_name")
-                             or (rt_user.get("core") or {}).get("screen_name") or "")
-                if rt_legacy.get("id_str"):
-                    normalized["retweeted_status"] = {"id": rt_legacy["id_str"],
-                                                      "screen_name": rt_screen}
+            if rt_result and rt_legacy.get("id_str"):
+                normalized["retweeted_status"] = {"id": rt_legacy["id_str"],
+                                                  "screen_name": rt_screen}
 
             # 引用：作者可解析时才设 quoted_status（quoted_result 已在上方按可用性归零，
             # 非空即代表 id 与 screen_name 均有效；被引推文删除/作者不可解析时为空 → 不设）。

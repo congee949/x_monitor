@@ -120,11 +120,16 @@ def detect_article(tweet: dict) -> str | None:
 
 
 def _quote_comment_text(tweet: dict) -> str:
-    """引用推文中博主自己的评论：note_tweet 优先否则壳 text，去尾部 t.co 短链 + 收缩。"""
+    """引用推文中博主自己的评论：note_tweet 优先否则壳 text，去尾部 t.co 短链。
+
+    保留原文换行（引子按原文分行显示，不再折成一行 / 砍到 200 字）：只把每行内的
+    连续空白压成单空格、3+ 连续空行收敛为一个，末尾大上限 2000 兜住 rich 预算。
+    """
     text = (tweet.get("note_tweet") or {}).get("text") or tweet.get("text") or ""
     text = re.sub(r"\s*https?://t\.co/\w+\s*$", "", text)  # 去尾部 t.co 短链
-    text = re.sub(r"\s+", " ", text).strip()
-    return text[:200]
+    text = re.sub(r"[ \t]+", " ", text)          # 行内连续空白 → 单空格（不动换行）
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return text[:2000]
 
 
 def save_article(username: str, article_id: str, tweet: dict) -> None:
@@ -301,6 +306,11 @@ ARTICLE_SUMMARY_PROMPT = """请把下面这篇文章总结成适合 Telegram 推
 
 def extract_article_image_urls(markdown: str, limit: int = 4) -> list[str]:
     urls: list[str] = []
+    # 封面图在 front matter（coverImage: "url"）：正文常无 ![]() → 之前整条被漏掉，
+    # 连封面都不展示。先收封面，再收正文内嵌图，去重后按 limit 截断。
+    cover = re.search(r'(?im)^coverImage\s*:\s*["\']?(https?://[^"\'\s]+)', markdown)
+    if cover:
+        urls.append(html.unescape(cover.group(1)).strip())
     for pattern in (r"!\[[^\]]*\]\((https?://[^\s)]+)\)", r'<img[^>]+src=["\'](https?://[^"\']+)["\']'):
         for url in re.findall(pattern, markdown, re.IGNORECASE):
             clean = html.unescape(url).strip()
@@ -489,9 +499,10 @@ def format_article_summary_messages(username: str, entry: dict, summary: str) ->
     # 不假 sent」的防线（否则空摘要会被引子撑成非空、误判已送达）。
     comment = (entry.get("quote_comment") or "").strip()
     if comment and chunks:
-        comment = re.sub(r"\s+", " ", comment)
-        lead_in = f"> @{html.escape(username)} 引用：{html.escape(comment)}\n\n"
-        chunks = [lead_in + chunks[0]] + chunks[1:]
+        # 保留原文分行，@user 独占首行，用 Telegram HTML 原生 <blockquote>；作独立首块，
+        # 避免更长的引子拼进 chunks[0] 顶破 4096（HTML 回退单条上限）。
+        lead_in = f"<blockquote>@{html.escape(username)} 引用：\n{html.escape(comment)}</blockquote>"
+        chunks = [lead_in] + chunks
     return chunks
 
 
@@ -529,21 +540,33 @@ def format_article_summary_rich(username: str, entry: dict, summary: str,
     lead_in = ""
     comment = (entry.get("quote_comment") or "").strip()
     if comment:
-        comment = re.sub(r"\s+", " ", comment)  # 折成一行
-        comment = re.sub(r"([\[\]()*_#`<>|~])", r"\\\1", comment)  # 同标题转义
-        lead_in = f"> @{username} 引用：{comment}\n\n"
-    header = (f"## \U0001f4c4 {title}\n"
-              f"**@{author}** · [原文]({link})\n\n---\n\n")
+        # 保留原文分行：@user 独占首行，每行加 blockquote 前缀，逐行转义 markdown 特殊
+        # 字符（含行首「1.」→字面，避免被当有序列表重排）；空行用 `>` 维持引用块连续。
+        esc_lines = []
+        for ln in comment.split("\n"):
+            ln = re.sub(r"([\[\]()*_#`<>|~])", r"\\\1", ln)
+            ln = re.sub(r"^(\s*\d+)\.", r"\1\\.", ln)
+            esc_lines.append(f"> {ln}" if ln.strip() else ">")
+        quoted_body = "\n".join(esc_lines)
+        lead_in = f"> @{username} 引用：\n{quoted_body}\n\n"
+    title_line = (f"## \U0001f4c4 {title}\n"
+                  f"**@{author}** · [原文]({link})")
     body = _fold_summary_details(summary.strip())
     collage = ""
     if image_urls:
         urls = image_urls[:4]
         if len(urls) == 1:
-            collage = f"\n\n![]({urls[0]})"
+            collage = f"![]({urls[0]})"
         else:
             blocks = "\n".join(f"![]({u})" for u in urls)
-            collage = f"\n\n<tg-collage>\n\n{blocks}\n\n</tg-collage>"
-    return lead_in + header + body + collage
+            collage = f"<tg-collage>\n\n{blocks}\n\n</tg-collage>"
+    # 封面从消息末尾移到正文之前（用户 2026-07-01）：有引用引子 → 引子紧下方
+    # （引子 → 封面 → 标题 → 正文）；无引子 → 标题下、正文上（标题 → 封面 → 正文）。
+    if lead_in:
+        mid = (collage + "\n\n") if collage else ""
+        return f"{lead_in}{mid}{title_line}\n\n---\n\n{body}"
+    mid = (collage + "\n\n") if collage else ""
+    return f"{title_line}\n\n{mid}---\n\n{body}"
 
 
 def format_article_summary_message(username: str, entry: dict, summary: str) -> tuple[str, str]:
@@ -1518,6 +1541,41 @@ def _rich_preserve(text: str) -> str:
     return esc
 
 
+def _fmt_duration(ms: "int | None") -> str:
+    s = int((ms or 0) / 1000)
+    return f"{s // 60}:{s % 60:02d}"
+
+
+def _rich_media_block(t: dict) -> str:
+    """普通推文媒体块（rich html 字段）：照片 / 视频封面嵌为 <img>，多图拼 <tg-collage>。
+
+    视频、GIF 取封面缩略图（t['media'][].url = pbs.twimg.com，Telegram 服务端可拉、
+    URL 照片 ≤5MB），并在上方标 ▶️+时长；真正的 mp4 不嵌——rich 不支持视频块，
+    且长视频按 URL 拉取超限会让整条 rich 被 400 拒、回退纯文本（净倒退）。
+    语法是官方 Rich HTML（不是文章摘要用的 Markdown ![]()），媒体只能作独立块。
+    URL 来自 GraphQL 已提取的 t['media']；RT 媒体在 retweeted_status 不进 t['media']，本期不处理。
+    """
+    imgs = []
+    hint = ""
+    for m in t.get("media") or []:
+        url = m.get("url")  # photo: media_url_https；video/gif: 封面缩略图
+        if not url or not url.startswith("https://") or '"' in url or "<" in url:
+            continue
+        imgs.append(url)
+        if m.get("type") in ("video", "animated_gif") and not hint:
+            hint = (f"▶️ 视频 · {_fmt_duration(m.get('duration_ms'))}"
+                    if m.get("type") == "video" else "▶️ GIF")
+    if not imgs:
+        return ""
+    imgs = imgs[:4]
+    if len(imgs) == 1:
+        media_html = f'<img src="{imgs[0]}"/>'
+    else:
+        media_html = "<tg-collage>" + "".join(f'<img src="{u}"/>' for u in imgs) + "</tg-collage>"
+    block = f"<br><br>{hint}" if hint else ""
+    return block + f"<br><br>{media_html}"
+
+
 def format_message(
     username: str, t: dict, ai: "AIClassifier | None" = None
 ) -> tuple[str, str, str]:
@@ -1533,19 +1591,23 @@ def format_message(
     link = f"https://x.com/{username}/status/{tid}" if tid else ""
     hidden = f'<a href="{link}">​</a>' if link else ""
     note = t.get("note_tweet") or {}
-    note_text = _break_rt_prefix(note.get("text", "").strip())  # RT 归属换行（长推用）
+    # 长推(note_tweet)与普通推文都平铺全文（用户指定 2026-07-01：不再 TL;DR/折叠/140 截断）；
+    # 带 article 节点且无长文的推走文章预览（标题），不裸推 t.co 链接。
+    note_text = _break_rt_prefix(note.get("text", "").strip())  # RT 归属换行
+    full_text = note_text
+    if not full_text and not t.get("article"):
+        full_text = _break_rt_prefix(t.get("text", "").strip())
     rich_body = ""
-    if note_text:
-        # 长推文：不再生成 TL;DR / 全文折叠，直接平铺全文（用户指定 2026-07-01）。
+    if full_text:
         # HTML 回退受 sendMessage 4096 限制：Telegram 按 UTF-16 计长（astral 表情每个
         # 2 单位），按单位收缩到 3000 以内，否则截断仍可能超 4096 致整条静默丢失。
-        body = note_text if len(note_text) <= 2800 else note_text[:2800] + "…"
+        body = full_text if len(full_text) <= 2800 else full_text[:2800] + "…"
         while len(body.encode("utf-16-le")) // 2 > 3000 and len(body) > 100:
             body = body[: int(len(body) * 0.9)] + "…"
         # Rich 正文上限远大（sendRichMessage 单条 32768）：约 28000 字符起步，但
         # _rich_preserve 的 <br>/&nbsp; 会让长度膨胀，故按「渲染后」UTF-16 长度收缩到
         # 27000 单位以内，留 header/标签余量保持在 RICH_MESSAGE_MAX_CHARS 下。
-        rich_src = note_text if len(note_text) <= 28000 else note_text[:28000] + "…"
+        rich_src = full_text if len(full_text) <= 28000 else full_text[:28000] + "…"
         rich_body = _rich_preserve(rich_src)
         while len(rich_body.encode("utf-16-le")) // 2 > 27000 and len(rich_src) > 100:
             rich_src = rich_src[: int(len(rich_src) * 0.9)] + "…"
@@ -1553,7 +1615,7 @@ def format_message(
     elif t.get("article"):
         body = article_preview_text(t)
     else:
-        body = _break_rt_prefix(short_preview(t.get("text", "")))  # 普通转推：RT 归属换行
+        body = ""
     if body:
         text = f'📢 @{username}{hidden}\n\n{html.escape(body)}'
     else:
@@ -1570,6 +1632,9 @@ def format_message(
         rich_html = f'📢 @{username}<br><br>{rich_body}'
     else:
         rich_html = f'📢 @{username}'
+    # 照片 / 视频封面缩略图嵌进 rich 末尾（文章自带配图走另一路径，不在此处理）。
+    if not t.get("article"):
+        rich_html += _rich_media_block(t)
     return text, rich_html, link
 
 

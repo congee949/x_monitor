@@ -162,6 +162,14 @@ class MessageFormattingTest(unittest.TestCase):
         self.assertNotIn("📢 @vista8\n\n", rich)
         self.assertIn("📢 @vista8", msg)  # HTML 回退头部用原生换行
 
+    def test_format_message_regular_tweet_full_text_no_140_cap(self):
+        # 普通推文（非长推）也平铺全文，不再砍到 140（用户 2026-07-01）
+        long_regular = "普通推文内容片段" * 30  # 240 字，非 note_tweet / 非 article
+        msg, rich, _ = twitter_monitor.format_message("vista8", {"id": "1", "text": long_regular})
+        self.assertNotIn("…", msg)                       # 不再 140 截断
+        self.assertIn("普通推文内容片段" * 25, msg)        # 全文平铺
+        self.assertIn("普通推文内容片段" * 25, rich)
+
     def test_format_message_note_tweet_inlines_full_text(self):
         # 长推文：不生成 TL;DR、不折叠，正文直接平铺（用户指定 2026-07-01）。
         long_text = "Stack Overflow 因为大家都用 AI 导致发帖量下降，但公司靠企业知识库和数据授权收入增长。" * 20
@@ -219,6 +227,61 @@ class MessageFormattingTest(unittest.TestCase):
         self.assertEqual(link, "https://x.com/dotey/status/4")
         self.assertIn("X Article：DeepSeek 的 10 万亿美元大战略【译】", msg)
         self.assertIn("作者讨论 DeepSeek", msg)
+
+
+class RichMediaBlockTest(unittest.TestCase):
+    """普通推文媒体：照片/视频封面嵌为 rich <img>，HTML 回退不嵌图。"""
+
+    def test_video_embeds_poster_with_play_hint(self):
+        t = {"id": "1", "text": "看视频",
+             "media": [{"type": "video",
+                        "url": "https://pbs.twimg.com/amplify_video_thumb/123/img/abc",
+                        "video_url": "https://video.twimg.com/x.mp4",
+                        "duration_ms": 214916}]}
+        msg, rich, _ = twitter_monitor.format_message("OpenAIDevs", t, None)
+        self.assertIn('<img src="https://pbs.twimg.com/amplify_video_thumb/123/img/abc"/>', rich)
+        self.assertIn("▶️ 视频 · 3:34", rich)
+        self.assertNotIn("<img", msg)          # HTML 回退不嵌图（靠 link preview）
+        self.assertNotIn("video.twimg.com", rich)  # 不嵌 mp4 本身
+
+    def test_single_photo_embeds_img(self):
+        t = {"id": "2", "text": "图",
+             "media": [{"type": "photo", "url": "https://pbs.twimg.com/media/p1.jpg"}]}
+        _msg, rich, _ = twitter_monitor.format_message("vista8", t, None)
+        self.assertIn('<img src="https://pbs.twimg.com/media/p1.jpg"/>', rich)
+        self.assertNotIn("<tg-collage>", rich)
+        self.assertNotIn("▶️", rich)
+
+    def test_multi_photo_uses_collage_capped_at_four(self):
+        t = {"id": "3", "text": "多图",
+             "media": [{"type": "photo", "url": f"https://pbs.twimg.com/media/p{i}.jpg"}
+                       for i in range(6)]}
+        _msg, rich, _ = twitter_monitor.format_message("vista8", t, None)
+        self.assertIn("<tg-collage>", rich)
+        self.assertEqual(rich.count("<img "), 4)   # 上限 4
+
+    def test_no_media_no_img(self):
+        t = {"id": "4", "text": "纯文字推文没有任何媒体"}
+        _msg, rich, _ = twitter_monitor.format_message("vista8", t, None)
+        self.assertNotIn("<img", rich)
+        self.assertNotIn("<tg-collage>", rich)
+
+    def test_note_tweet_with_video_embeds_poster(self):
+        # 长推也能带媒体：正文平铺 + 末尾封面图
+        t = {"id": "5", "note_tweet": {"text": "长推正文" * 30},
+             "media": [{"type": "video", "url": "https://pbs.twimg.com/x/img/v",
+                        "duration_ms": 65000}]}
+        _msg, rich, _ = twitter_monitor.format_message("vista8", t, None)
+        self.assertIn('<img src="https://pbs.twimg.com/x/img/v"/>', rich)
+        self.assertIn("▶️ 视频 · 1:05", rich)
+
+    def test_article_path_skips_tweet_media_block(self):
+        # 文章自带配图走另一路径，format_message 不在此重复嵌 t['media']
+        t = {"id": "6", "text": "https://t.co/x",
+             "article": {"title": "标题", "preview_text": "预览"},
+             "media": [{"type": "photo", "url": "https://pbs.twimg.com/media/a.jpg"}]}
+        _msg, rich, _ = twitter_monitor.format_message("dotey", t, None)
+        self.assertNotIn("<img", rich)
 
 
 class LatentFixRegressionTest(unittest.TestCase):
@@ -442,6 +505,53 @@ class RetweetArticleTest(unittest.TestCase):
         self.assertEqual(captured["cmd"][-1], "https://x.com/liuren/status/2062808278812520765")
 
 
+class RetweetReconstructTest(unittest.TestCase):
+    """转推非 article：壳被 Twitter 砍到 140，用原推重建全文 + note_tweet(长推) + 媒体。"""
+
+    def _run(self, rt_original):
+        import json as _json
+        import twitter_graphql as tg
+        synthetic = {"data": {"user": {"result": {"timeline_v2": {"timeline": {"instructions": [
+            {"entries": [
+                {"content": {"itemContent": {"tweet_results": {"result": {
+                    "__typename": "Tweet",
+                    "legacy": {"id_str": "999", "full_text": "RT @orig: 壳被砍断的短文本…",
+                               "created_at": "Fri Jun 05 17:30:00 +0000 2026",
+                               "retweeted_status_result": {"result": rt_original}}}}}}},
+            ]}]}}}}}}
+        with patch.object(tg, "_auth_headers", lambda: None), \
+             patch.object(tg, "_get_guest_token", lambda: "gt"), \
+             patch.object(tg, "get_user_id", lambda u: "1"), \
+             patch.object(tg, "_curl", lambda *a, **k: _json.dumps(synthetic)):
+            return tg.fetch_tweets("dotey", limit=20)[0]
+
+    def test_long_rt_reconstructs_note_and_media(self):
+        rt_original = {
+            "__typename": "Tweet",
+            "legacy": {"id_str": "888", "full_text": "短壳",
+                       "extended_entities": {"media": [
+                           {"type": "photo", "media_url_https": "https://pbs.twimg.com/media/X.jpg"}]}},
+            "core": {"user_results": {"result": {"legacy": {"screen_name": "orig"}}}},
+            "note_tweet": {"note_tweet_results": {"result": {"text": "完整长正文" * 30}}},
+        }
+        t = self._run(rt_original)
+        self.assertTrue(t["text"].startswith("RT @orig: 完整长正文"))
+        self.assertTrue(t["note_tweet"]["text"].startswith("RT @orig: 完整长正文"))
+        self.assertGreater(len(t["note_tweet"]["text"]), 140)   # 全文，非 140 壳
+        self.assertEqual([m["url"] for m in t["media"]], ["https://pbs.twimg.com/media/X.jpg"])
+
+    def test_short_rt_reconstructs_full_text_no_note(self):
+        rt_original = {
+            "__typename": "Tweet",
+            "legacy": {"id_str": "888", "full_text": "原推完整正文一句话示意"},
+            "core": {"user_results": {"result": {"legacy": {"screen_name": "orig"}}}},
+        }
+        t = self._run(rt_original)
+        self.assertEqual(t["text"], "RT @orig: 原推完整正文一句话示意")
+        self.assertNotIn("note_tweet", t)
+        self.assertEqual(t.get("media", []), [])
+
+
 class QuoteArticleTest(unittest.TestCase):
     """引用他人 X Article：单条摘要、署名原作者、博主评论作引子；壳推无 URL 也要入队。
 
@@ -663,7 +773,7 @@ class QuoteArticleTest(unittest.TestCase):
                  "quote_comment": "this is a great writeup on tokenization"}
         msgs = twitter_monitor.format_article_summary_messages("karpathy", entry, "**结论**\n正文")
         self.assertTrue(msgs)
-        self.assertIn("@karpathy 引用：this is a great writeup", msgs[0])
+        self.assertIn("<blockquote>@karpathy 引用：\nthis is a great writeup", msgs[0])
         # 无评论条目不加引子（行为不变）
         plain = {"article_id": "1", "author": "dotey", "article_title": "T"}
         msgs2 = twitter_monitor.format_article_summary_messages("dotey", plain, "**结论**\n正文")
@@ -672,6 +782,40 @@ class QuoteArticleTest(unittest.TestCase):
         self.assertEqual(
             twitter_monitor.format_article_summary_messages(
                 "karpathy", entry, "https://example.com/only-a-link"), [])
+
+
+class QuoteCommentTextTest(unittest.TestCase):
+    """引用评论抽取：保留换行、不砍 200、去尾部 t.co。"""
+
+    def test_preserves_newlines_and_no_200_truncation(self):
+        long = "第一行评论\n\n" + "\n".join(f"{i}. 要点内容{i}" for i in range(1, 40))
+        out = twitter_monitor._quote_comment_text({"text": long})
+        self.assertIn("\n", out)             # 换行保留（不再折成一行）
+        self.assertGreater(len(out), 200)    # 不再砍到 200
+        self.assertTrue(out.startswith("第一行评论"))
+
+    def test_prefers_note_tweet_and_strips_trailing_tco(self):
+        t = {"text": "短壳", "note_tweet": {"text": "完整长评论\n第二行 https://t.co/abc123"}}
+        out = twitter_monitor._quote_comment_text(t)
+        self.assertEqual(out, "完整长评论\n第二行")
+
+
+class ArticleCoverImageTest(unittest.TestCase):
+    """front matter coverImage 也要进配图（之前只扫正文 ![]() → 封面被漏）。"""
+
+    def test_extracts_front_matter_cover(self):
+        md = '---\ncoverImage: "https://pbs.twimg.com/media/ABC.jpg"\n---\n\n# 标题\n\n正文无内嵌图'
+        self.assertEqual(twitter_monitor.extract_article_image_urls(md),
+                         ["https://pbs.twimg.com/media/ABC.jpg"])
+
+    def test_cover_plus_body_images_deduped(self):
+        md = ('---\ncoverImage: "https://pbs.twimg.com/media/COVER.jpg"\n---\n'
+              '![](https://pbs.twimg.com/media/B1.jpg)\n'
+              '![](https://pbs.twimg.com/media/COVER.jpg)\n'
+              '<img src="https://pbs.twimg.com/media/B2.jpg">')
+        urls = twitter_monitor.extract_article_image_urls(md)
+        self.assertEqual(urls[0], "https://pbs.twimg.com/media/COVER.jpg")
+        self.assertEqual(len(urls), 3)  # cover + B1 + B2（COVER 重复去掉）
 
 
 class RichPushTest(unittest.TestCase):
@@ -736,19 +880,50 @@ class RichPushTest(unittest.TestCase):
         entry = {"article_id": "2052796100608974848", "article_title": "Tokenization deep dive",
                  "author": "trq212", "quote_comment": "this is a great writeup"}
         md = twitter_monitor.format_article_summary_rich("karpathy", entry, "> 结论\n\n正文")
-        self.assertTrue(md.startswith("> @karpathy 引用：this is a great writeup"))
+        # @user 独占首行，评论逐行加 blockquote 前缀
+        self.assertTrue(md.startswith("> @karpathy 引用：\n> this is a great writeup"))
         self.assertIn("## \U0001f4c4 Tokenization deep dive", md)
         self.assertIn("**@trq212**", md)   # 署名原作者，不是引用者
+
+    def test_format_article_summary_rich_quote_comment_preserves_newlines(self):
+        # 引子保留原文换行 + 不砍字数（用户 2026-07-01 反馈：之前折成一行 + 200 截断）
+        entry = {"article_id": "1", "article_title": "T", "author": "vista8",
+                 "quote_comment": "第一行评论\n\n1. 要点一\n2. 要点二"}
+        md = twitter_monitor.format_article_summary_rich("vista8", entry, "正文")
+        self.assertIn("> @vista8 引用：\n> 第一行评论", md)   # @user 独占首行
+        self.assertIn("> 1\\. 要点一", md)                    # 行首数字点转义为字面
+        self.assertIn("> 2\\. 要点二", md)
+        self.assertIn("\n>\n", md)                            # 空行用 > 维持引用块连续
 
     def test_format_article_summary_rich_escapes_quote_comment(self):
         entry = {"article_id": "1", "article_title": "标题", "author": "trq212",
                  "quote_comment": "see [this]\n*bold* <hr>"}
         md = twitter_monitor.format_article_summary_rich("karpathy", entry, "正文")
-        lead = md.splitlines()[0]
-        self.assertIn(r"\[this\]", lead)    # 同标题转义
-        self.assertIn(r"\*bold\*", lead)
-        self.assertIn(r"\<hr\>", lead)
-        self.assertNotIn("\n", lead)        # 折成一行
+        self.assertIn(r"> see \[this\]", md)      # 同标题转义 + 保留换行
+        self.assertIn(r"> \*bold\* \<hr\>", md)
+
+    def test_cover_placed_after_lead_in_before_title(self):
+        # 有引用引子：顺序 引子 → 封面 → 标题 → 正文（用户 2026-07-01 选择）
+        entry = {"article_id": "1", "article_title": "T", "author": "vista8",
+                 "quote_comment": "评论一句话"}
+        md = twitter_monitor.format_article_summary_rich(
+            "vista8", entry, "摘要正文", image_urls=["https://pbs.twimg.com/media/C.jpg"])
+        i_lead = md.index("> @vista8 引用：")
+        i_img = md.index("![](https://pbs.twimg.com/media/C.jpg)")
+        i_title = md.index("## \U0001f4c4 T")
+        i_body = md.index("摘要正文")
+        self.assertTrue(i_lead < i_img < i_title < i_body)
+
+    def test_cover_placed_after_title_when_no_lead_in(self):
+        # 无引子：顺序 标题 → 封面 → 正文（封面不再挂末尾）
+        entry = {"article_id": "1", "article_title": "T", "author": "dotey"}
+        md = twitter_monitor.format_article_summary_rich(
+            "dotey", entry, "摘要正文", image_urls=["https://pbs.twimg.com/media/C.jpg"])
+        i_title = md.index("## \U0001f4c4 T")
+        i_img = md.index("![](https://pbs.twimg.com/media/C.jpg)")
+        i_body = md.index("摘要正文")
+        self.assertTrue(i_title < i_img < i_body)
+        self.assertFalse(md.rstrip().endswith(".jpg)"))  # 封面不在末尾
 
     def test_format_article_summary_rich_no_lead_in_without_comment(self):
         # 转推/自文无 quote_comment → 无引子，行为不变
