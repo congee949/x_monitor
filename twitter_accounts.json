@@ -34,5 +34,25 @@
   {
     "username": "MacroMargin",
     "enabled": true
+  },
+  {
+    "username": "ClaudeDevs",
+    "enabled": true
+  },
+  {
+    "username": "OpenAIDevs",
+    "enabled": true
+  },
+  {
+    "username": "bcherny",
+    "enabled": true
+  },
+  {
+    "username": "charliermarsh",
+    "enabled": true
+  },
+  {
+    "username": "_philschmid",
+    "enabled": true
   }
 ]
