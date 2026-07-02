@@ -220,3 +220,18 @@ Addressed the remaining eval items the user explicitly opted into.
 - 4xx/可解析 2xx 回执：清零熔断计数；5xx/垃圾 2xx：不清零。
 - 告警通道（note_account_failure）宁重勿漏；内容通道宁漏勿重。
 - 测试 173 个（新增 25），本地 3.14 与 bwg 3.9.25 双绿；已部署 bwg（备份 twitter_monitor.py.bak-20260702-idempotency）。
+
+## 2026-07-02 — 第三批：三个案底 P2 落地（504 / macrumors / 推送预算）
+
+### Design Decisions
+- **504 归歧义**：`_tg_post` 对 `e.code == 504` 抛 TgAmbiguousDelivery（网关超时=上游可能已处理，与读超时同构），502/503/500 保留盲重试（未达后端，重试安全）。关闭 5xx 家族里唯一的「已处理但无响应」重复路径。
+- **macrumors 同款语义**：send_card 歧义按已送达返回（防 main 的「回落到文字」对已送达卡片重发）+ 留痕带卡片 link；send_html 歧义首条按已送达 + 留痕带 `digest i/N` 段落标识，连续第 2 条熔断抛出走 main 既有「未标 seen 次日重试」。卡片不熔断（其失败路径是换格式重发）但计入连续计数，让后续 send_html 第一条即可熔断。留痕文件与 x_monitor 进程 8:00 重叠时有读改写竞态，最坏丢一条痕迹，已接受。
+- **推送预算两层门槛**：硬不变量在逐次层——`SEND_ATTEMPT_MIN_REMAINING_SECONDS=65`（60s socket 超时+余量），send_telegram(_rich) 每次尝试发起前检查，发起了的请求必然在 SIGALRM 前收到结果；粗门槛 `PUSH_MIN_REMAINING_SECONDS=240` 在推送循环层避免白撞。直调/测试/macrumors 下 `_ARTICLE_QUEUE_RUN_START=None → remaining=inf`，门槛不触发。
+- **送达即刻 checkpoint**：每条推文送达后立即 save_seen（先）+ save_push_retry 摘除（后）——顺序不可换（中间被杀留孤儿 retry 条目会被 seen 短路无重复；反序被杀则下轮当新推文重发）。载入时清理 `push_retry ∩ seen` 孤儿。**checkpoint 加 `not args.test` 守卫**（审查抓的 P1：--test 推送发调试目标，写生产 seen 会让生产群永久漏推）。
+
+### 第三批对抗审查（3 视角 15 agent，5 条确认 / 1 条否决）
+确认并已修：--test 污染生产 seen（P1）；240s 门槛低估 rich→HTML 复合最坏 318–510s（P1+P2 同根，治本改逐次门槛）；macrumors send_html 无熔断批量假送达（P2）；send_html 留痕无段落标识（P2）。
+否决：重试梯子末次 sleep-then-raise 死等（预先存在，未触碰）。
+
+### 测试
+- 180→184：--test 守卫、逐次预算门槛、macrumors html 熔断、卡片计数联动。本地与 bwg 3.9 双绿。

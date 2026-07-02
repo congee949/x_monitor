@@ -2468,6 +2468,15 @@ class TgPostDeliveryClassificationTest(unittest.TestCase):
             twitter_monitor._tg_post("tok", {"chat_id": "1"})
         self.assertEqual(twitter_monitor._AMBIGUOUS_STREAK, 0)
 
+    def test_504_becomes_ambiguous_not_retry(self):
+        """504=网关超时，上游可能已处理：必须归歧义，走 5xx 盲重试会重复。"""
+        import io
+        import urllib.error
+        err = urllib.error.HTTPError("url", 504, "Gateway Timeout", {}, io.BytesIO(b""))
+        with patch("urllib.request.urlopen", side_effect=err):
+            with self.assertRaises(twitter_monitor.TgAmbiguousDelivery):
+                twitter_monitor._tg_post("tok", {"chat_id": "1"})
+
     def test_5xx_does_not_reset_ambiguous_streak(self):
         """502/504 多为边缘 nginx 在后端挂死时生成：清零会让「一半 502 一半超时」
         的大面积故障绕过熔断、批量静默丢推。"""
@@ -2606,6 +2615,217 @@ class SendAmbiguousDeliveryTest(unittest.TestCase):
             with self.assertRaises(urllib.error.URLError):
                 twitter_monitor.send_telegram_rich("tok", "1", html="<b>hi</b>")
         self.assertEqual(len(calls), 3)
+
+
+class PushBudgetAndCheckpointTest(unittest.TestCase):
+    """推送循环的时间预算与送达即刻 checkpoint（25m kill 窗口防重复）。"""
+
+    def _args(self):
+        return argparse.Namespace(test=False, seed=False, dry_run=False,
+                                  limit=20, max_push_age_minutes=45)
+
+    def _tweet(self, tid, minute):
+        return {"id": tid,
+                "text": f"这是一条长度足够通过分类过滤器的正常推文内容编号{tid}",
+                "createdAt": f"Tue May 12 00:{minute:02d}:00 +0000 2026"}
+
+    def test_budget_exhausted_defers_to_push_retry_without_sending(self):
+        sent, saved, saved_retry = [], {}, {}
+        with patch.object(twitter_monitor, "datetime", FixedDatetime), \
+             patch.object(twitter_monitor, "fetch_tweets",
+                          return_value=[self._tweet("t1", 20), self._tweet("t2", 21)]), \
+             patch.object(twitter_monitor, "load_seen", return_value=({"old"}, None)), \
+             patch.object(twitter_monitor, "load_push_retry", return_value=set()), \
+             patch.object(twitter_monitor, "save_seen",
+                          side_effect=lambda u, s, last_post_ts=None: saved.update({"seen": set(s)})), \
+             patch.object(twitter_monitor, "save_push_retry",
+                          side_effect=lambda u, r: saved_retry.update({"retry": set(r)})), \
+             patch.object(twitter_monitor, "_article_queue_time_remaining", return_value=10.0), \
+             patch.object(twitter_monitor, "send_tweet",
+                          side_effect=lambda *a, **k: sent.append(1) or {"ok": True}), \
+             patch.object(twitter_monitor.time, "sleep", return_value=None):
+            _n, pushed, _f, _a = twitter_monitor.process_user(
+                pool=None, ai=FakeAI(False), username="u",
+                bot_token="b", chat_id="c", args=self._args())
+        self.assertEqual(sent, [])  # 预算不足绝不发起发送
+        self.assertEqual(pushed, 0)
+        self.assertEqual(saved_retry.get("retry"), {"t1", "t2"})
+        self.assertNotIn("t1", saved.get("seen", set()))
+        self.assertNotIn("t2", saved.get("seen", set()))
+
+    def test_delivered_tweet_checkpointed_before_mid_loop_kill(self):
+        """第 1 条送达后进程被 SIGALRM 杀（SystemExit）：seen 必须已落盘。"""
+        seen_snapshots = []
+
+        def fake_send(token, chat_id, username, t, ai=None, thread_id=None):
+            if t["id"] == "t2":
+                raise SystemExit(1)  # 模拟 SIGALRM handler 的 sys.exit
+            return {"ok": True}
+
+        with patch.object(twitter_monitor, "datetime", FixedDatetime), \
+             patch.object(twitter_monitor, "fetch_tweets",
+                          return_value=[self._tweet("t1", 20), self._tweet("t2", 21)]), \
+             patch.object(twitter_monitor, "load_seen", return_value=({"old"}, None)), \
+             patch.object(twitter_monitor, "load_push_retry", return_value=set()), \
+             patch.object(twitter_monitor, "save_seen",
+                          side_effect=lambda u, s, last_post_ts=None: seen_snapshots.append(set(s))), \
+             patch.object(twitter_monitor, "save_push_retry", return_value=None), \
+             patch.object(twitter_monitor, "send_tweet", side_effect=fake_send), \
+             patch.object(twitter_monitor.time, "sleep", return_value=None):
+            with self.assertRaises(SystemExit):
+                twitter_monitor.process_user(
+                    pool=None, ai=FakeAI(False), username="u",
+                    bot_token="b", chat_id="c", args=self._args())
+        # kill 前的 checkpoint 已把 t1 落盘（末尾统一落盘没机会执行）
+        self.assertTrue(seen_snapshots, "送达后必须有 checkpoint 落盘")
+        self.assertIn("t1", seen_snapshots[-1])
+        self.assertNotIn("t2", seen_snapshots[-1])
+
+    def test_retry_tweet_checkpoint_clears_retry_file(self):
+        """push_retry 里的推文送达后，checkpoint 立即从 retry 文件移除。"""
+        retry_snapshots = []
+        tweet = {"id": "retry-me",
+                 "text": "这是一条长度足够通过分类过滤器的正常推文内容等待重试",
+                 "createdAt": "Mon May 11 15:55:43 +0000 2026"}
+
+        def fake_send(token, chat_id, username, t, ai=None, thread_id=None):
+            return {"ok": True}
+
+        with patch.object(twitter_monitor, "datetime", FixedDatetime), \
+             patch.object(twitter_monitor, "fetch_tweets", return_value=[tweet]), \
+             patch.object(twitter_monitor, "load_seen", return_value=({"old"}, None)), \
+             patch.object(twitter_monitor, "load_push_retry", return_value={"retry-me"}), \
+             patch.object(twitter_monitor, "save_seen", return_value=None), \
+             patch.object(twitter_monitor, "save_push_retry",
+                          side_effect=lambda u, r: retry_snapshots.append(set(r))), \
+             patch.object(twitter_monitor, "send_tweet", side_effect=fake_send), \
+             patch.object(twitter_monitor.time, "sleep", return_value=None):
+            twitter_monitor.process_user(
+                pool=None, ai=FakeAI(False), username="u",
+                bot_token="b", chat_id="c", args=self._args())
+        # 第一次 save_push_retry 就是送达 checkpoint，retry-me 已移除
+        self.assertTrue(retry_snapshots)
+        self.assertNotIn("retry-me", retry_snapshots[0])
+
+    def test_test_mode_does_not_checkpoint_into_production_seen(self):
+        """--test 推送发往调试目标：绝不能写生产 seen / 摘 push_retry（否则生产群永久漏推）。"""
+        saved, saved_retry = {}, {}
+        args = argparse.Namespace(test=True, test_count=5, seed=False, dry_run=False,
+                                  limit=20, max_push_age_minutes=45)
+        with patch.object(twitter_monitor, "datetime", FixedDatetime), \
+             patch.object(twitter_monitor, "fetch_tweets",
+                          return_value=[self._tweet("t1", 20)]), \
+             patch.object(twitter_monitor, "load_seen", return_value=({"old"}, None)), \
+             patch.object(twitter_monitor, "load_push_retry", return_value=set()), \
+             patch.object(twitter_monitor, "save_seen",
+                          side_effect=lambda u, s, last_post_ts=None: saved.update({"seen": set(s)})), \
+             patch.object(twitter_monitor, "save_push_retry",
+                          side_effect=lambda u, r: saved_retry.update({"retry": set(r)})), \
+             patch.object(twitter_monitor, "send_tweet", return_value={"ok": True}), \
+             patch.object(twitter_monitor.time, "sleep", return_value=None):
+            twitter_monitor.process_user(
+                pool=None, ai=FakeAI(False), username="u",
+                bot_token="b", chat_id="c", args=args)
+        self.assertNotIn("t1", saved.get("seen", set()))
+
+    def test_send_attempt_budget_gate_refuses_to_start_request(self):
+        """逐次预算门槛：剩余不足 65s 时绝不发起请求（未发出=无重复风险）。"""
+        with patch.object(twitter_monitor, "_article_queue_time_remaining",
+                          return_value=10.0), \
+             patch.object(twitter_monitor, "_tg_post") as m:
+            with self.assertRaises(RuntimeError):
+                twitter_monitor.send_telegram("tok", "1", "hi")
+            with self.assertRaises(RuntimeError):
+                twitter_monitor.send_telegram_rich("tok", "1", html="<b>hi</b>")
+        m.assert_not_called()
+
+    def test_orphan_retry_entry_already_seen_is_pruned_not_repushed(self):
+        """checkpoint 顺序被杀留下的孤儿（seen ∧ push_retry）：清理且不重推。"""
+        sent, saved_retry = [], {}
+        tweet = {"id": "orphan",
+                 "text": "这是一条长度足够通过分类过滤器的正常推文内容孤儿条目",
+                 "createdAt": "Tue May 12 00:20:00 +0000 2026"}
+        with patch.object(twitter_monitor, "datetime", FixedDatetime), \
+             patch.object(twitter_monitor, "fetch_tweets", return_value=[tweet]), \
+             patch.object(twitter_monitor, "load_seen", return_value=({"orphan"}, None)), \
+             patch.object(twitter_monitor, "load_push_retry", return_value={"orphan"}), \
+             patch.object(twitter_monitor, "save_seen", return_value=None), \
+             patch.object(twitter_monitor, "save_push_retry",
+                          side_effect=lambda u, r: saved_retry.update({"retry": set(r)})), \
+             patch.object(twitter_monitor, "send_tweet",
+                          side_effect=lambda *a, **k: sent.append(1) or {"ok": True}), \
+             patch.object(twitter_monitor.time, "sleep", return_value=None):
+            twitter_monitor.process_user(
+                pool=None, ai=FakeAI(False), username="u",
+                bot_token="b", chat_id="c", args=self._args())
+        self.assertEqual(sent, [])  # 已 seen，绝不重推
+        self.assertEqual(saved_retry.get("retry"), set())  # 孤儿已清理
+
+
+class MacrumorsAmbiguousDeliveryTest(unittest.TestCase):
+    """macrumors_daily 对 TgAmbiguousDelivery 的同款语义：按已送达、不重试、不回落。"""
+
+    def setUp(self):
+        import macrumors_daily
+        self.md = macrumors_daily
+        twitter_monitor._AMBIGUOUS_STREAK = 0
+        self.recorded = []
+        self._rec_patch = patch.object(
+            twitter_monitor, "_record_assumed_delivery",
+            side_effect=lambda method, link: self.recorded.append((method, link)))
+        self._rec_patch.start()
+        self.addCleanup(self._rec_patch.stop)
+
+    def test_send_card_ambiguous_returns_normally_no_text_fallback(self):
+        """卡片歧义不得抛出——抛出会走 main 的回落文字 = 已送达卡片再发一遍。"""
+        def fake_post(token, payload, method="sendMessage"):
+            raise twitter_monitor.TgAmbiguousDelivery("socket.timeout: timed out")
+
+        item = {"zh_title": "标题", "zh_summary": "摘要", "image": "https://i/1.jpg",
+                "link": "https://www.macrumors.com/x", "sub_items": None}
+        with patch.object(twitter_monitor, "_tg_post", side_effect=fake_post):
+            self.md.send_card("tok", "1", item)  # 不应抛出
+        self.assertEqual(self.recorded,
+                         [("sendPhoto(macrumors)", "https://www.macrumors.com/x")])
+
+    def test_send_html_ambiguous_returns_without_retry(self):
+        calls = []
+
+        def fake_post(token, payload, method="sendMessage"):
+            calls.append(method)
+            raise twitter_monitor.TgAmbiguousDelivery("socket.timeout: timed out")
+
+        with patch.object(twitter_monitor, "_tg_post", side_effect=fake_post), \
+                patch("time.sleep"):
+            self.md.send_html("tok", "1", "hello", trace_id="digest 1/2")  # 不应抛出
+        self.assertEqual(len(calls), 1)  # 不盲目重发
+        self.assertEqual(self.recorded, [("sendMessage(macrumors)", "digest 1/2")])
+
+    def test_send_html_consecutive_ambiguous_breaks_to_failure(self):
+        """连续歧义熔断：第 2 条 digest 消息按失败抛出 → main 不标 seen 次日重试。"""
+
+        def fake_post(token, payload, method="sendMessage"):
+            raise twitter_monitor.TgAmbiguousDelivery("socket.timeout: timed out")
+
+        with patch.object(twitter_monitor, "_tg_post", side_effect=fake_post), \
+                patch("time.sleep"):
+            self.md.send_html("tok", "1", "part1", trace_id="digest 1/2")  # 首条按已送达
+            with self.assertRaises(twitter_monitor.TgAmbiguousDelivery):
+                self.md.send_html("tok", "1", "part2", trace_id="digest 2/2")
+
+    def test_card_ambiguous_counts_toward_streak_so_html_breaks_first(self):
+        """卡片歧义计入连续计数：大面积故障时 send_html 第一条即可熔断。"""
+
+        def fake_post(token, payload, method="sendMessage"):
+            raise twitter_monitor.TgAmbiguousDelivery("socket.timeout: timed out")
+
+        item = {"zh_title": "标题", "zh_summary": "", "image": "https://i/1.jpg",
+                "link": "https://www.macrumors.com/x", "sub_items": None}
+        with patch.object(twitter_monitor, "_tg_post", side_effect=fake_post), \
+                patch("time.sleep"):
+            self.md.send_card("tok", "1", item)  # 卡片按已送达，但计数=1
+            with self.assertRaises(twitter_monitor.TgAmbiguousDelivery):
+                self.md.send_html("tok", "1", "part1")  # 连续第 2 条 → 熔断
 
 
 class FlushAssumedDeliveryNoticeTest(unittest.TestCase):

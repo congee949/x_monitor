@@ -96,6 +96,15 @@ ARTICLE_MARKDOWN_TIMEOUT = 30  # seconds; reduced from 90 to avoid cron overruns
 MAX_ARTICLES_PER_RUN = 5
 ARTICLE_QUEUE_TIME_BUDGET_SECONDS = 25 * 60  # align with SIGALRM global timeout
 ARTICLE_QUEUE_MIN_REMAINING_SECONDS = 5 * 60
+# 防「kill 砸在发送在途窗口」的两层预算门槛（kill 落在已送达未落盘 = 重复推送入口）：
+# 1) 硬不变量在逐次层：send_telegram(_rich) 每次尝试发起前须剩 ≥65s（60s socket
+#    超时 + 余量）——发起了的请求必然在 SIGALRM 前收到结果并 checkpoint，
+#    复合最坏（rich 慢退化 429/超时 → HTML 回退再烧一梯子，可达 300s+）不再依赖
+#    循环外的粗粒度估算。
+# 2) 粗门槛在推送循环层：剩余 <240s 不再开始新推文，避免明知发不完还逐条撞逐次
+#    门槛（每条白等一次失败路径）。
+SEND_ATTEMPT_MIN_REMAINING_SECONDS = 65
+PUSH_MIN_REMAINING_SECONDS = 4 * 60
 ARTICLE_PROCESSING_STALL_MINUTES = 30
 _ARTICLE_QUEUE_RUN_START: float | None = None
 
@@ -1814,8 +1823,13 @@ def _tg_post(token: str, payload: dict, method: str = "sendMessage") -> dict:
     try:
         resp = urllib.request.urlopen(req, timeout=60)
     except urllib.error.HTTPError as e:
+        if e.code == 504:
+            # 网关超时：上游已收到请求但未及时响应——与读超时同构的歧义
+            # （请求可能已被处理），归入 TgAmbiguousDelivery，绝不能走
+            # 5xx 盲重试路径重发。502/503 表示未到达后端，保留重试。
+            raise TgAmbiguousDelivery(f"HTTP 504: {e.reason}") from e
         # 4xx（含 429）由 Bot API 后端产生，证明链路在处理请求 → 清零熔断计数；
-        # 5xx 多为边缘 nginx 在后端不可达时直接生成，不证明任何事，不清零——
+        # 其余 5xx 多为边缘 nginx 在后端不可达时直接生成，不证明任何事，不清零——
         # 否则「一半 502 一半挂死」的大面积故障会让熔断永不触发、批量丢推。
         if e.code < 500:
             _note_definite_response()
@@ -1896,6 +1910,13 @@ def send_telegram_rich(token: str, chat_id: str, markdown: str = "", link: str =
 
     last_err = None
     for attempt in range(3):
+        # 逐次预算门槛：单次尝试最坏挂 60s（socket 超时），剩余预算不足时绝不
+        # 发起请求——被放弃的尝试从未发出，抛给调用方走 push_failed/push_retry
+        # 无重复风险；发起了的请求必然在 SIGALRM 前收到结果（checkpoint 可落盘）。
+        # 直调/测试/macrumors 下 _ARTICLE_QUEUE_RUN_START 为 None → inf，不触发。
+        if _article_queue_time_remaining() < SEND_ATTEMPT_MIN_REMAINING_SECONDS:
+            raise last_err or RuntimeError(
+                "send_telegram_rich: 剩余预算不足以发起尝试，本轮放弃（进 push_retry）")
         try:
             return _tg_post(token, payload, method="sendRichMessage")
         except TgAmbiguousDelivery as e:
@@ -1973,6 +1994,10 @@ def send_telegram(token: str, chat_id: str, text: str, link: str = "",
     # message is still delivered instead of raising and being dropped/marked-seen.
     last_err = None
     for attempt in range(3):
+        # 逐次预算门槛：同 send_telegram_rich（未发出=未送达，放弃无重复风险）
+        if _article_queue_time_remaining() < SEND_ATTEMPT_MIN_REMAINING_SECONDS:
+            raise last_err or RuntimeError(
+                "send_telegram: 剩余预算不足以发起尝试，本轮放弃（进 push_retry）")
         try:
             return _tg_post(token, payload)
         except TgAmbiguousDelivery as e:
@@ -2071,6 +2096,12 @@ def process_user(
 
     seen, last_post_iso = load_seen(username)
     push_retry = load_push_retry(username)
+    stale_retry = push_retry & seen
+    if stale_retry:
+        # 送达 checkpoint（先 seen 后 retry）中间被杀的孤儿：已送达已 seen，
+        # 只清记录不重推（seen 检查会短路，留着只是脏状态）
+        push_retry -= stale_retry
+        print(f"  清理 {len(stale_retry)} 条已 seen 的孤儿 push_retry 记录")
 
     # P0-5：seen 文件损坏且无备份时进入安全推送模式
     seen_corrupted = (last_post_iso == "corrupted")
@@ -2181,6 +2212,7 @@ def process_user(
         to_push = []
 
     push_failed: set[str] = set()
+    push_deferred = False
     for t, _reason in to_push:
         tid = str(t.get("id") or "")
         if args.dry_run:
@@ -2193,6 +2225,16 @@ def process_user(
             print(f"link: {link}")
             print()
         else:
+            # 剩余时间预算（与 article 队列同一时钟）：临近 25m SIGALRM 时不再
+            # 发起新发送，未发推文进 push_retry（绝不标 seen）下轮绕过 push-age
+            # 继续——kill 落在发送在途窗口时无法得知送达与否，防重复优先。
+            if push_deferred or _article_queue_time_remaining() < PUSH_MIN_REMAINING_SECONDS:
+                if not push_deferred:
+                    push_deferred = True
+                    print(f"    剩余时间不足 {PUSH_MIN_REMAINING_SECONDS}s，"
+                          f"本轮停止推送，余量进 push_retry 下轮继续")
+                push_failed.add(tid)
+                continue
             try:
                 r = send_tweet(bot_token, content_chat_id or chat_id, username, t, ai,
                                thread_id=content_thread_id if content_chat_id else None)
@@ -2201,6 +2243,21 @@ def process_user(
                 if not ok:
                     print(f"        resp: {r}")
                     push_failed.add(tid)
+                elif not args.test:
+                    # 送达即刻 checkpoint（先 seen 后 push_retry，顺序不可换：
+                    # 中间被杀留下的孤儿 retry 条目会被 seen 短路，不产生重复；
+                    # 反序被杀则推文既不 seen 也不 retry → 下轮当新推文重发）。
+                    # 失败只打日志：末尾统一落盘 + _alert 兜底。
+                    # --test 不 checkpoint：测试推送发往调试目标，写生产 seen /
+                    # 摘 push_retry 会让生产群永久漏掉这些推文（基线语义如此）。
+                    seen.add(tid)
+                    try:
+                        save_seen(username, seen, last_post_iso)
+                        if tid in push_retry:
+                            push_retry.discard(tid)
+                            save_push_retry(username, push_retry)
+                    except OSError as e:
+                        print(f"    checkpoint 落盘失败（忽略，末尾统一落盘）: {e}")
                 time.sleep(1.2)
             except Exception as e:
                 print(f"    推送异常: {e}")
