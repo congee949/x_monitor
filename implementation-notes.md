@@ -178,3 +178,45 @@ Addressed the remaining eval items the user explicitly opted into.
 - created_at 取 sendMessage 返回的 result.date（Telegram UTC epoch），与 time.time()(UTC epoch) 同基准。
 - 审查修复(major)：created_at 非数值（脏状态文件）时 float() 容错视作 0，与计数字段同款自愈，防每轮崩在 _atomic_write 前导致永久瘫痪+丢计数。
 - 实测：首轮升级把旧看板(无 created_at)重建为 3415 并置顶，state 含 ttl/created_at，getChat 确认 pinned==3415。
+
+## 2026-07-02 — TG 发送幂等语义修复（重复推送根因）
+
+### 根因
+- 7-01 16:30 UTC 轮 philschmid 推文（id 2072357009022943258）在 X 话题落了两条（16:30:12 / 16:30:29，间隔 17s = 15s 读超时 + 2s 退避）：sendRichMessage 带图时 Telegram 服务端先拉图再回响应，`_tg_post` 15s 读超时把「已送达但响应慢」误判为失败，重试循环盲目重发。经典 at-most-once / at-least-once 混淆；Bot API 无幂等 token，重发必重复。
+
+### Design Decisions
+- **异常分相分类**（依据 bwg /usr/bin/python3 3.9.25 的 `AbstractHTTPHandler.do_open` 实测源码）：连接/TLS/发送请求体阶段的 OSError 被 urllib 包成 `URLError` → 未送达，重试安全；`getresponse()`/读响应体阶段异常裸抛 → 请求已完整送出，归类为新异常 `TgAmbiguousDelivery`，禁止重发。
+- **歧义即视为已送达**：send_telegram / send_telegram_rich 捕获 TgAmbiguousDelivery 后打 ⚠ 日志并返回 `{"ok": True, "assumed_delivered": True}`——调用方正常标 seen/标 sent，不进 push_retry，rich 也不再走 HTML 回退（回退同样会产生第二条）。取舍：宁可极小概率漏一条推送，也不重复刷屏；漏推概率 ≈ P(响应丢失 × 实际未处理)，远小于重复概率。
+- **超时 15s → 60s**：缩小歧义窗口本身。rich 带图响应可超 15s；60s 后仍歧义的才走 assumed_delivered。
+- **TgAmbiguousDelivery 子类 OSError**：macrumors_daily 直接调 `tm._tg_post`，其 `except (URLError, TimeoutError, OSError)` 捕获面不变（行为等同旧裸 socket.timeout），不在本次范围内改其语义（P2 记录）。
+
+### Tradeoffs
+- 429/5xx 保留原重试：状态码表明请求被拒/内部错误，未产生消息；504 理论上有歧义但 Telegram sendMessage 实际罕见，不为它加分支。
+- assumed_delivered 响应无 result.message_id：文章失败通知的 failure_msg_id 闭环、看板 new_mid 在该罕见路径下跳过（下轮自愈/重建），接受。
+
+### Open Questions / P2
+- macrumors_daily send_html/send_card 的读超时仍会重试（重复卡片风险同款机制），待单独修复。
+
+### 两轮对抗式审查结论（v1 → v2 → v3）
+**第一轮（5 视角 41 agent，10 条确认 / 8 条否决）**，确认项已修：
+- P1 `except Exception` 过宽：token 脏字符（InvalidURL/UnicodeEncodeError，发生在联网前）被误归歧义 → 全量静默丢推。修复：catch-all 收窄为 `(OSError, HTTPException)` + InvalidURL 显式放行。
+- P1 大面积故障批量 assumed → 加连续歧义熔断 `_AMBIGUOUS_STREAK`（第 2 条起按失败进 push_retry）。
+- P1 只有 ⚠ print 不可观测 → `.assumed_delivered.json` 留痕 + 轮首汇总 DM（`_flush_assumed_delivery_notice`）。
+- P1 告警路径 alerted=True 被 assumed 锁定 → `ok and not assumed_delivered` 才落定（宁重勿漏）。
+- P1/P2 测试空洞：timeout=60 锚定、HTTPError 放行锚定、ambiguous 测试补 patch time.sleep。
+- P2 article sent 落盘顺序 → send 成功即刻落盘。
+否决项（预先存在/不可触发，记录不修）：504 走 5xx 盲重试（同构风险但预先存在）、推送循环无时间预算 + 25m kill 窗口、macrumors body 读失败重试重复、_tg_post_quiet 60s 拖慢看板路径。
+
+**第二轮（对 v2 增量 3 视角 23 agent，10 条确认 / 0 否决）**，全部已修：
+- P1 flush 自身歧义会自记账本（自指噪音挤掉真实痕迹）+ 占用熔断额度 → flush 改直发 `_tg_post`，不留痕不占额度。
+- P1 任意 HTTPError 清零熔断（502/504 是边缘 nginx 后端挂死的产物）→ 只有 `e.code < 500` 清零；同理 2xx+垃圾体不清零（`_note_definite_response` 移到 json.loads 成功后）。
+- P1 mid-save 抛 OSError 会把已送达 sent 翻成 failed（磁盘满 → 每轮重发）→ mid-save 包 try/except OSError 忽略。
+- P2 `_record` 缺 makedirs（全新部署丢痕迹）、`_flush` 缺非 list 守卫（损坏账本永不清理）、flush 未跟随「完整轮」门槛（--test/--chat-id 调试会把核对 DM 发进调试目标并删账本）→ 全部修复。
+- P2 三处测试空洞 → 补 FlushAssumedDeliveryNoticeTest（5 用例）、5xx/4xx/垃圾 2xx streak 锚定（3 用例）、ArticleSentPersistBeforeQuietEditTest。
+
+### 最终交付语义
+- 发出前失败（URLError/InvalidURL/本地错误）：响亮失败，重试安全，走 push_retry。
+- 发出后响应缺失（读超时/连接中断/垃圾响应）：首条按已送达（防重复）+ 留痕 + 下轮汇总 DM；连续第 2 条起熔断按失败（防批量丢失）。
+- 4xx/可解析 2xx 回执：清零熔断计数；5xx/垃圾 2xx：不清零。
+- 告警通道（note_account_failure）宁重勿漏；内容通道宁漏勿重。
+- 测试 173 个（新增 25），本地 3.14 与 bwg 3.9.25 双绿；已部署 bwg（备份 twitter_monitor.py.bak-20260702-idempotency）。

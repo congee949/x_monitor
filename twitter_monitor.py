@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import http.client
 import json
 import os
 import html
@@ -44,6 +45,8 @@ ACCOUNTS_PATH = os.path.join(SCRIPT_DIR, "twitter_accounts.json")
 TOKENS_PATH = os.path.join(SCRIPT_DIR, "twitter_tokens.json")
 AI_CONFIG_PATH = os.path.join(SCRIPT_DIR, "twitter_ai.json")
 SEEN_DIR = os.path.join(SCRIPT_DIR, "twitter_seen")
+# 歧义按已送达处理的发送痕迹（下一轮汇总 DM 核对后清除）
+ASSUMED_DELIVERY_PATH = os.path.join(SEEN_DIR, ".assumed_delivered.json")
 
 # GraphQL data source (free, no API key)
 try:
@@ -1331,7 +1334,9 @@ def note_account_failure(failures: dict, username: str, error: str,
             try:
                 r = send_telegram(bot_token, chat_id, text)
                 print(f"  失败告警推送 {'OK' if r.get('ok') else 'FAIL'}: @{username}")
-                if r.get("ok"):
+                # 告警通道方向与内容推送相反：宁重勿漏。assumed_delivered（疑似
+                # 送达）不落定 alerted，下轮重发；重复一条告警 << 告警静默丢失。
+                if r.get("ok") and not r.get("assumed_delivered"):
                     rec["alerted"] = True
                     mid = (r.get("result") or {}).get("message_id")
                     if mid:
@@ -1690,14 +1695,151 @@ def format_message(
     return text, rich_html, link
 
 
+class TgAmbiguousDelivery(OSError):
+    """请求已完整送出但响应缺失/不可读：Telegram 可能已处理，不可盲目重发。
+
+    2026-07-02 X 话题重复推送根因：sendRichMessage 带图时 Telegram 服务端先拉图
+    再回响应，15s 读超时被当作"发送失败"重发，实际第一次已入群。
+    子类 OSError 是为了不缩小 macrumors_daily 等既有 except (URLError, OSError)
+    调用方的捕获面（行为等同旧的裸 socket.timeout）；twitter_monitor 自己的发送
+    函数则显式识别本异常并按已送达处理。
+    """
+
+
+# 连续歧义熔断：单条慢响应（本次事故形态）按已送达防重复；但连续多条 60s 读超时
+# 的先验解释是「Telegram 没在处理」（边缘 LB 活着、后端挂死的大面积故障形态），
+# 继续按已送达会把整轮推文批量标 seen 静默丢弃。故本进程内第 2 条起改按失败处理
+# （进 push_retry，恢复后重发；最坏重复 1 条 << 批量永久丢失）。只有确由 Bot API
+# 后端产生的响应（可解析的 2xx 回执、4xx 含 429）才清零计数；5xx/垃圾 2xx 可能
+# 是边缘 nginx 在后端挂死时生成的，不清零。
+_AMBIGUOUS_STREAK = 0
+
+
+def _note_definite_response() -> None:
+    global _AMBIGUOUS_STREAK
+    _AMBIGUOUS_STREAK = 0
+
+
+def _register_ambiguous_send() -> bool:
+    """记一次歧义发送；返回 True=按已送达处理，False=连续歧义应按失败处理。"""
+    global _AMBIGUOUS_STREAK
+    _AMBIGUOUS_STREAK += 1
+    return _AMBIGUOUS_STREAK < 2
+
+
+def _record_assumed_delivery(method: str, link: str) -> None:
+    """按已送达处理的持久痕迹：下一轮开头汇总 DM 提醒人工核对（真丢推可发现可补救）。
+
+    任何失败只打日志：留痕是发送路径的旁路，绝不能让它打断 assumed_delivered 返回。
+    """
+    entries = []
+    try:
+        with open(ASSUMED_DELIVERY_PATH, encoding="utf-8") as f:
+            entries = json.load(f)
+        if not isinstance(entries, list):
+            entries = []
+    except FileNotFoundError:
+        pass
+    except Exception:
+        entries = []
+    entries.append({"ts": datetime.now(timezone.utc).isoformat(),
+                    "method": method, "link": link or ""})
+    try:
+        # 全新部署/目录被清时 SEEN_DIR 可能尚未创建（load_seen 是唯一其他来源）
+        os.makedirs(os.path.dirname(ASSUMED_DELIVERY_PATH) or ".", exist_ok=True)
+        _atomic_write(ASSUMED_DELIVERY_PATH,
+                      json.dumps(entries[-50:], ensure_ascii=False, indent=2))
+    except OSError as e:
+        print(f"  assumed-delivery 痕迹写盘失败（忽略）: {e}")
+
+
+def _flush_assumed_delivery_notice(bot_token: str, chat_id: str) -> None:
+    """上轮有歧义按已送达的发送时，发汇总 DM 供人工核对，送达确认后清痕迹。
+
+    直发 _tg_post 而不走 send_telegram：通知自身再遇歧义时绝不能写回它正在
+    汇报的账本（自指条目会挤掉真实痕迹），也不占用本进程"首条歧义按已送达"
+    的熔断额度（否则内容通道阈值实际从 2 降到 1）。失败/歧义都只保留文件，
+    下轮重试——告警自身绝不静默丢失。
+    """
+    entries = None
+    try:
+        with open(ASSUMED_DELIVERY_PATH, encoding="utf-8") as f:
+            entries = json.load(f)
+    except FileNotFoundError:
+        return
+    except Exception:
+        pass
+    if not isinstance(entries, list) or not entries:
+        # 空/损坏痕迹无法报告：清掉避免每轮空转噪音（内容已不可恢复）
+        try:
+            os.remove(ASSUMED_DELIVERY_PATH)
+        except OSError:
+            pass
+        return
+    lines = [f"⚠️ <b>歧义送达核对</b>：此前 {len(entries)} 条消息因响应缺失按已送达处理，"
+             f"请核对是否真的入群："]
+    for e in entries[-10:]:
+        ts = str(e.get("ts", ""))[:16].replace("T", " ")
+        lines.append(html.escape(f"· {ts} {e.get('method', '')} {e.get('link') or '(无链接)'}"))
+    if len(entries) > 10:
+        lines.append(f"…另有 {len(entries) - 10} 条更早的略")
+    payload = {"chat_id": chat_id, "text": "\n".join(lines), "parse_mode": "HTML",
+               "link_preview_options": {"is_disabled": True}}
+    try:
+        r = _tg_post(bot_token, payload)
+    except Exception as e:
+        print(f"  歧义送达汇总告警发送失败，保留痕迹下轮再试: {e}")
+        return
+    if r.get("ok"):
+        try:
+            os.remove(ASSUMED_DELIVERY_PATH)
+        except OSError:
+            pass
+
+
 def _tg_post(token: str, payload: dict, method: str = "sendMessage") -> dict:
     req = urllib.request.Request(
         f"https://api.telegram.org/bot{token}/{method}",
         data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=15) as r:
-        return json.loads(r.read().decode("utf-8"))
+    # urllib 的异常分相（以 bwg /usr/bin/python3 3.9 的 do_open 实现为准）：
+    # 连接/TLS/发送请求体阶段的 OSError 会被包成 URLError —— 请求未送达，重试安全；
+    # getresponse()/读响应体阶段的异常（socket.timeout/ConnectionReset/
+    # RemoteDisconnected/BadStatusLine/IncompleteRead…）裸抛 —— 请求已完整送出，
+    # Telegram 可能已处理，归类为 TgAmbiguousDelivery 禁止盲目重发。
+    # 收窄到 (OSError, HTTPException)：InvalidURL（token 脏字符，发生在联网前）及
+    # ValueError/UnicodeEncodeError 等本地确定性错误必须裸抛响亮失败——误归歧义
+    # 会把持久性配置错误变成「全部标 seen 的静默丢推」。
+    try:
+        resp = urllib.request.urlopen(req, timeout=60)
+    except urllib.error.HTTPError as e:
+        # 4xx（含 429）由 Bot API 后端产生，证明链路在处理请求 → 清零熔断计数；
+        # 5xx 多为边缘 nginx 在后端不可达时直接生成，不证明任何事，不清零——
+        # 否则「一半 502 一半挂死」的大面积故障会让熔断永不触发、批量丢推。
+        if e.code < 500:
+            _note_definite_response()
+        raise
+    except urllib.error.URLError:
+        raise  # 发出前失败（连接/TLS/发送阶段），可安全重试
+    except http.client.InvalidURL:
+        raise  # URL 本地校验失败，未联网，绝非歧义
+    except (OSError, http.client.HTTPException) as e:
+        raise TgAmbiguousDelivery(f"{type(e).__name__}: {e}") from e
+    try:
+        with resp:
+            body = resp.read()
+    except (OSError, http.client.HTTPException) as e:
+        # 状态行已收到但响应体读取失败：消息几乎必定已发出
+        raise TgAmbiguousDelivery(f"{type(e).__name__}: {e}") from e
+    try:
+        result = json.loads(body.decode("utf-8"))
+    except ValueError as e:
+        # 2xx 已确认但响应体不是合法 JSON（网关/代理异常页）：已送达按歧义处理，
+        # 且不清零熔断计数——连续垃圾 2xx 同样是「后端没在处理」的故障形态
+        raise TgAmbiguousDelivery(f"{type(e).__name__}: {e}") from e
+    _note_definite_response()  # 可解析的 Bot API 回执才算确定性响应
+    return result
 
 
 def _tg_post_quiet(token: str, payload: dict, method: str) -> dict:
@@ -1756,6 +1898,17 @@ def send_telegram_rich(token: str, chat_id: str, markdown: str = "", link: str =
     for attempt in range(3):
         try:
             return _tg_post(token, payload, method="sendRichMessage")
+        except TgAmbiguousDelivery as e:
+            # 请求已送出、响应缺失：大概率已入群，重发必产生重复消息（Bot API
+            # 无幂等 token）。按已送达返回成功，调用方正常标 seen / 标 sent，
+            # 宁可极小概率漏推也不重复推。连续歧义则熔断改按失败（防大面积故障
+            # 时批量静默丢推），痕迹落盘供下轮汇总核对。
+            if not _register_ambiguous_send():
+                print(f"  ⚠ sendRichMessage 连续歧义（疑似 Telegram 故障），按失败进重试: {e}")
+                raise
+            _record_assumed_delivery("sendRichMessage", link)
+            print(f"  ⚠ sendRichMessage 响应缺失，按已送达处理（防重复）: {e}")
+            return {"ok": True, "assumed_delivered": True}
         except urllib.error.HTTPError as e:
             last_err = e
             try:
@@ -1784,6 +1937,8 @@ def send_telegram_rich(token: str, chat_id: str, markdown: str = "", link: str =
                         "error_code": e.code, "description": desc}
             raise
         except (urllib.error.URLError, TimeoutError, OSError) as e:
+            # 只有发出前的失败会走到这（_tg_post 已把发出后的失败归为
+            # TgAmbiguousDelivery 并在上方分支返回）：请求未送达，重试安全。
             last_err = e
             time.sleep(2 * (attempt + 1))
             continue
@@ -1820,6 +1975,15 @@ def send_telegram(token: str, chat_id: str, text: str, link: str = "",
     for attempt in range(3):
         try:
             return _tg_post(token, payload)
+        except TgAmbiguousDelivery as e:
+            # 同 send_telegram_rich：请求已送出、响应缺失，重发必重复，按已送达处理；
+            # 连续歧义熔断按失败，痕迹落盘供下轮汇总核对。
+            if not _register_ambiguous_send():
+                print(f"  ⚠ sendMessage 连续歧义（疑似 Telegram 故障），按失败进重试: {e}")
+                raise
+            _record_assumed_delivery("sendMessage", link)
+            print(f"  ⚠ sendMessage 响应缺失，按已送达处理（防重复）: {e}")
+            return {"ok": True, "assumed_delivered": True}
         except urllib.error.HTTPError as e:
             last_err = e
             try:
@@ -2303,6 +2467,15 @@ def process_article_queue(ai: AIClassifier, bot_token: str, chat_id: str, dry_ru
                     if ok:
                         entry["status"] = "sent"
                         entry["sent_at"] = datetime.now(timezone.utc).isoformat()
+                        # 已送达即刻落盘：下面的 quiet 编辑可挂 60s，进程在窗口内
+                        # 被杀会让磁盘停留在 processing → 下轮整篇摘要重发。
+                        # best-effort：落盘失败（磁盘满等）绝不能抛进外层 except
+                        # 把已送达的 sent 翻成 failed（那会重造重复推送），退回
+                        # 函数末尾的统一落盘即可。
+                        try:
+                            _save_article_queue(queue_path, queue, dry_run)
+                        except OSError as e:
+                            print(f"    sent 状态即刻落盘失败（忽略，末尾统一落盘）: {e}")
                         delete_article_cache(entry)
                         _fmid = entry.pop("failure_msg_id", None)
                         if _fmid:
@@ -2420,6 +2593,15 @@ def main() -> int:
             return 1
 
         print(f"Twitter 监控：{len(accounts)} 个账号")
+
+        if not (args.dry_run or args.test or args.seed or args.user):
+            # 上轮存在「歧义按已送达」的发送时，先发汇总 DM 供人工核对（真丢推可发现）。
+            # 完整 cron 轮才执行（与看板同门槛）：--test/--seed/--user 调试运行常带
+            # --chat-id 覆盖，核对 DM 发进调试目标并删账本会让生产告警永久丢失。
+            try:
+                _flush_assumed_delivery_notice(bot_token, chat_id)
+            except Exception as e:
+                print(f"  歧义送达汇总告警异常（忽略）: {e}")
 
         total_new = 0
         total_push = 0

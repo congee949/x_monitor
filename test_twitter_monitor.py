@@ -1,6 +1,7 @@
 import argparse
 import json
 import sys
+import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -2373,6 +2374,347 @@ class MainContentRoutingTest(unittest.TestCase):
         self.assertEqual(captured["chat_id"], "debug-chat")
         self.assertEqual(captured["content_chat_id"], "debug-chat")
         self.assertIsNone(captured["content_thread_id"])
+
+
+class TgPostDeliveryClassificationTest(unittest.TestCase):
+    """_tg_post 的发送分相语义：发出前失败可重试（URLError/InvalidURL 原样抛），
+    发出后失败（读响应超时/连接中断/响应体损坏）→ TgAmbiguousDelivery。"""
+
+    def setUp(self):
+        twitter_monitor._AMBIGUOUS_STREAK = 0
+
+    def _response(self, body: bytes):
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return body
+
+        return _Resp()
+
+    def test_success_returns_parsed_json_with_60s_timeout(self):
+        with patch("urllib.request.urlopen",
+                   return_value=self._response(b'{"ok": true, "result": {"message_id": 7}}')) as m:
+            r = twitter_monitor._tg_post("tok", {"chat_id": "1"})
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["result"]["message_id"], 7)
+        # 15s 读超时是本次重复推送事故的直接诱因，60s 是修复主体之一，锚死
+        m.assert_called_once()
+        self.assertEqual(m.call_args.kwargs["timeout"], 60)
+
+    def test_pre_send_urlerror_propagates_unchanged(self):
+        import urllib.error
+        err = urllib.error.URLError(ConnectionRefusedError("refused"))
+        with patch("urllib.request.urlopen", side_effect=err):
+            with self.assertRaises(urllib.error.URLError) as ctx:
+                twitter_monitor._tg_post("tok", {"chat_id": "1"})
+        self.assertNotIsInstance(ctx.exception, twitter_monitor.TgAmbiguousDelivery)
+
+    def test_http_error_propagates_unchanged(self):
+        # HTTPError（4xx/5xx）= 有响应，必须原样抛给状态码分支；误归歧义会静默丢弃
+        import io
+        import urllib.error
+        err = urllib.error.HTTPError("url", 400, "Bad Request", {}, io.BytesIO(b"{}"))
+        with patch("urllib.request.urlopen", side_effect=err):
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                twitter_monitor._tg_post("tok", {"chat_id": "1"})
+        self.assertNotIsInstance(ctx.exception, twitter_monitor.TgAmbiguousDelivery)
+
+    def test_local_invalid_url_propagates_unchanged(self):
+        # token 脏字符（空格/换行）→ InvalidURL 在联网前抛出：必须响亮失败，
+        # 误归歧义会把配置错误变成「全部标 seen 的永久静默丢推」
+        import http.client
+        with patch("urllib.request.urlopen", side_effect=http.client.InvalidURL("bad token")):
+            with self.assertRaises(http.client.InvalidURL):
+                twitter_monitor._tg_post("tok\n", {"chat_id": "1"})
+
+    def test_local_unicode_error_propagates_unchanged(self):
+        # 非 ASCII token → UnicodeEncodeError（ValueError 子类，联网前抛出）：响亮失败
+        err = UnicodeEncodeError("ascii", "x", 0, 1, "ordinal not in range")
+        with patch("urllib.request.urlopen", side_effect=err):
+            with self.assertRaises(UnicodeEncodeError):
+                twitter_monitor._tg_post("tok​", {"chat_id": "1"})
+
+    def test_post_send_read_timeout_becomes_ambiguous(self):
+        import socket
+        with patch("urllib.request.urlopen", side_effect=socket.timeout("timed out")):
+            with self.assertRaises(twitter_monitor.TgAmbiguousDelivery):
+                twitter_monitor._tg_post("tok", {"chat_id": "1"})
+
+    def test_body_read_failure_becomes_ambiguous(self):
+        import socket
+
+        class _BrokenResp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                raise socket.timeout("read timed out")
+
+        with patch("urllib.request.urlopen", return_value=_BrokenResp()):
+            with self.assertRaises(twitter_monitor.TgAmbiguousDelivery):
+                twitter_monitor._tg_post("tok", {"chat_id": "1"})
+
+    def test_definite_response_resets_ambiguous_streak(self):
+        twitter_monitor._AMBIGUOUS_STREAK = 1
+        with patch("urllib.request.urlopen", return_value=self._response(b'{"ok": true}')):
+            twitter_monitor._tg_post("tok", {"chat_id": "1"})
+        self.assertEqual(twitter_monitor._AMBIGUOUS_STREAK, 0)
+
+    def test_5xx_does_not_reset_ambiguous_streak(self):
+        """502/504 多为边缘 nginx 在后端挂死时生成：清零会让「一半 502 一半超时」
+        的大面积故障绕过熔断、批量静默丢推。"""
+        import io
+        import urllib.error
+        twitter_monitor._AMBIGUOUS_STREAK = 1
+        err = urllib.error.HTTPError("url", 502, "Bad Gateway", {}, io.BytesIO(b""))
+        with patch("urllib.request.urlopen", side_effect=err):
+            with self.assertRaises(urllib.error.HTTPError):
+                twitter_monitor._tg_post("tok", {"chat_id": "1"})
+        self.assertEqual(twitter_monitor._AMBIGUOUS_STREAK, 1)
+
+    def test_4xx_resets_ambiguous_streak(self):
+        """4xx（含 429）确由 Bot API 后端产生，证明链路在处理请求。"""
+        import io
+        import urllib.error
+        twitter_monitor._AMBIGUOUS_STREAK = 1
+        err = urllib.error.HTTPError("url", 429, "Too Many Requests", {}, io.BytesIO(b"{}"))
+        with patch("urllib.request.urlopen", side_effect=err):
+            with self.assertRaises(urllib.error.HTTPError):
+                twitter_monitor._tg_post("tok", {"chat_id": "1"})
+        self.assertEqual(twitter_monitor._AMBIGUOUS_STREAK, 0)
+
+    def test_garbage_2xx_body_does_not_reset_streak(self):
+        """2xx + 非 JSON 响应体（网关异常页）不清零：连续垃圾 2xx 第 2 条起要能熔断。"""
+        twitter_monitor._AMBIGUOUS_STREAK = 1
+        with patch("urllib.request.urlopen", return_value=self._response(b"<html>gateway</html>")):
+            with self.assertRaises(twitter_monitor.TgAmbiguousDelivery):
+                twitter_monitor._tg_post("tok", {"chat_id": "1"})
+        self.assertEqual(twitter_monitor._AMBIGUOUS_STREAK, 1)
+
+
+class SendAmbiguousDeliveryTest(unittest.TestCase):
+    """发送函数对 TgAmbiguousDelivery 按已送达处理：不重发、不回退、返回 ok；
+    连续歧义熔断按失败；痕迹落盘隔离到临时文件。"""
+
+    def setUp(self):
+        twitter_monitor._AMBIGUOUS_STREAK = 0
+        self._tmp = tempfile.TemporaryDirectory()
+        self._path_patch = patch.object(
+            twitter_monitor, "ASSUMED_DELIVERY_PATH",
+            str(Path(self._tmp.name) / ".assumed_delivered.json"))
+        self._path_patch.start()
+        self.addCleanup(self._path_patch.stop)
+        self.addCleanup(self._tmp.cleanup)
+
+    def test_rich_ambiguous_returns_ok_without_resend(self):
+        calls = []
+
+        def fake_post(token, payload, method="sendMessage"):
+            calls.append(method)
+            raise twitter_monitor.TgAmbiguousDelivery("socket.timeout: timed out")
+
+        with patch.object(twitter_monitor, "_tg_post", side_effect=fake_post), \
+                patch("time.sleep"):
+            r = twitter_monitor.send_telegram_rich("tok", "1", html="<b>hi</b>")
+        self.assertTrue(r["ok"])
+        self.assertTrue(r["assumed_delivered"])
+        self.assertEqual(len(calls), 1)  # 不盲目重发
+
+    def test_html_ambiguous_returns_ok_without_resend(self):
+        calls = []
+
+        def fake_post(token, payload, method="sendMessage"):
+            calls.append(method)
+            raise twitter_monitor.TgAmbiguousDelivery("socket.timeout: timed out")
+
+        with patch.object(twitter_monitor, "_tg_post", side_effect=fake_post), \
+                patch("time.sleep"):
+            r = twitter_monitor.send_telegram("tok", "1", "hi")
+        self.assertTrue(r["ok"])
+        self.assertTrue(r["assumed_delivered"])
+        self.assertEqual(len(calls), 1)
+
+    def test_send_tweet_ambiguous_rich_does_not_fall_back_to_html(self):
+        """rich 疑似已送达时绝不能再走 HTML 回退——那会造成第二条消息。"""
+        calls = []
+
+        def fake_post(token, payload, method="sendMessage"):
+            calls.append(method)
+            raise twitter_monitor.TgAmbiguousDelivery("socket.timeout: timed out")
+
+        tweet = {"id": "1", "text": "hello world", "created_at": "Wed Jul 01 16:29:48 +0000 2026"}
+        with patch.object(twitter_monitor, "_tg_post", side_effect=fake_post), \
+                patch("time.sleep"):
+            r = twitter_monitor.send_tweet("tok", "1", "someone", tweet, None)
+        self.assertTrue(r["ok"])
+        self.assertEqual(calls, ["sendRichMessage"])  # 无 sendMessage 回退
+
+    def test_consecutive_ambiguous_breaks_to_failure(self):
+        """熔断：进程内第 2 条连续歧义按失败抛出（进 push_retry），防大面积故障批量丢推。"""
+
+        def fake_post(token, payload, method="sendMessage"):
+            raise twitter_monitor.TgAmbiguousDelivery("socket.timeout: timed out")
+
+        with patch.object(twitter_monitor, "_tg_post", side_effect=fake_post), \
+                patch("time.sleep"):
+            first = twitter_monitor.send_telegram("tok", "1", "msg-1")
+            self.assertTrue(first["assumed_delivered"])
+            with self.assertRaises(twitter_monitor.TgAmbiguousDelivery):
+                twitter_monitor.send_telegram("tok", "1", "msg-2")
+
+    def test_ambiguous_leaves_persistent_trace(self):
+        """按已送达处理必须留痕：下一轮汇总 DM 靠这个文件发现真丢推。"""
+
+        def fake_post(token, payload, method="sendMessage"):
+            raise twitter_monitor.TgAmbiguousDelivery("socket.timeout: timed out")
+
+        with patch.object(twitter_monitor, "_tg_post", side_effect=fake_post), \
+                patch("time.sleep"):
+            twitter_monitor.send_telegram("tok", "1", "hi", "https://x.com/u/status/1")
+        entries = json.loads(Path(twitter_monitor.ASSUMED_DELIVERY_PATH).read_text())
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["link"], "https://x.com/u/status/1")
+
+    def test_alert_path_does_not_latch_on_assumed_delivery(self):
+        """告警通道宁重勿漏：assumed_delivered 不落定 alerted，下轮重发。"""
+        failures = {"u1": {"count": 3, "last_error": "boom", "alerted": False}}
+        with patch.object(twitter_monitor, "send_telegram",
+                          return_value={"ok": True, "assumed_delivered": True}):
+            twitter_monitor.note_account_failure(
+                failures, "u1", "boom", "tok", "1", False)
+        self.assertFalse(failures["u1"].get("alerted"))
+
+    def test_pre_send_failure_still_retries(self):
+        """发出前失败（URLError）保持原重试语义：3 次后抛出。"""
+        import urllib.error
+        calls = []
+
+        def fake_post(token, payload, method="sendMessage"):
+            calls.append(method)
+            raise urllib.error.URLError(ConnectionRefusedError("refused"))
+
+        with patch.object(twitter_monitor, "_tg_post", side_effect=fake_post), \
+                patch("time.sleep"):
+            with self.assertRaises(urllib.error.URLError):
+                twitter_monitor.send_telegram_rich("tok", "1", html="<b>hi</b>")
+        self.assertEqual(len(calls), 3)
+
+
+class FlushAssumedDeliveryNoticeTest(unittest.TestCase):
+    """轮首汇总核对 DM：直发 _tg_post（不留痕、不占熔断额度），送达确认才删账本。"""
+
+    def setUp(self):
+        twitter_monitor._AMBIGUOUS_STREAK = 0
+        self._tmp = tempfile.TemporaryDirectory()
+        self.ledger = Path(self._tmp.name) / ".assumed_delivered.json"
+        self._path_patch = patch.object(
+            twitter_monitor, "ASSUMED_DELIVERY_PATH", str(self.ledger))
+        self._path_patch.start()
+        self.addCleanup(self._path_patch.stop)
+        self.addCleanup(self._tmp.cleanup)
+
+    def _write_ledger(self, entries):
+        self.ledger.write_text(json.dumps(entries), encoding="utf-8")
+
+    def test_confirmed_send_clears_ledger(self):
+        self._write_ledger([{"ts": "2026-07-02T00:30:00", "method": "sendRichMessage",
+                             "link": "https://x.com/u/status/1"}])
+        sent = []
+
+        def fake_post(token, payload, method="sendMessage"):
+            sent.append(payload)
+            return {"ok": True, "result": {"message_id": 9}}
+
+        with patch.object(twitter_monitor, "_tg_post", side_effect=fake_post):
+            twitter_monitor._flush_assumed_delivery_notice("tok", "1")
+        self.assertEqual(len(sent), 1)
+        self.assertIn("https://x.com/u/status/1", sent[0]["text"])
+        self.assertFalse(self.ledger.exists())
+
+    def test_ambiguous_notice_keeps_ledger_without_self_recording(self):
+        """通知自身歧义：账本原样保留（不追加自指条目）、不占熔断额度。"""
+        original = [{"ts": "2026-07-02T00:30:00", "method": "sendRichMessage",
+                     "link": "https://x.com/u/status/1"}]
+        self._write_ledger(original)
+
+        def fake_post(token, payload, method="sendMessage"):
+            raise twitter_monitor.TgAmbiguousDelivery("socket.timeout: timed out")
+
+        with patch.object(twitter_monitor, "_tg_post", side_effect=fake_post):
+            twitter_monitor._flush_assumed_delivery_notice("tok", "1")
+        self.assertEqual(json.loads(self.ledger.read_text()), original)
+        self.assertEqual(twitter_monitor._AMBIGUOUS_STREAK, 0)  # 额度未被通知消耗
+
+    def test_send_failure_keeps_ledger(self):
+        import urllib.error
+        self._write_ledger([{"ts": "t", "method": "sendMessage", "link": ""}])
+        with patch.object(twitter_monitor, "_tg_post",
+                          side_effect=urllib.error.URLError("down")):
+            twitter_monitor._flush_assumed_delivery_notice("tok", "1")
+        self.assertTrue(self.ledger.exists())
+
+    def test_corrupt_ledger_removed_without_send(self):
+        self.ledger.write_text('{"a": 1}', encoding="utf-8")
+        with patch.object(twitter_monitor, "_tg_post") as m:
+            twitter_monitor._flush_assumed_delivery_notice("tok", "1")
+        m.assert_not_called()
+        self.assertFalse(self.ledger.exists())
+
+    def test_missing_ledger_is_noop(self):
+        with patch.object(twitter_monitor, "_tg_post") as m:
+            twitter_monitor._flush_assumed_delivery_notice("tok", "1")
+        m.assert_not_called()
+
+
+class ArticleSentPersistBeforeQuietEditTest(unittest.TestCase):
+    """已送达的 article 必须在 quiet 编辑前落盘，且落盘失败不得把 sent 翻成 failed。"""
+
+    def test_mid_save_oserror_does_not_flip_sent_to_failed(self):
+        saves = []
+        real_save = twitter_monitor._save_article_queue
+
+        def flaky_save(queue_path, queue, dry_run):
+            saves.append([dict(e) for e in queue])
+            # 第一次带 status=sent 的落盘 = send 成功后的即刻落盘，模拟磁盘满
+            sent_saves = [s for s in saves if s and s[0].get("status") == "sent"]
+            if queue and queue[0].get("status") == "sent" and len(sent_saves) == 1:
+                raise OSError("disk full")
+            return real_save(queue_path, queue, dry_run)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            queue_path = str(Path(tmp) / "u_queue.json")
+            entry = {"article_id": "a1", "tweet_id": "t1", "author": "u",
+                     "status": "pending", "attempts": 0, "content": None,
+                     "detected_at": datetime.now(timezone.utc).isoformat(),
+                     "tweet_text": "", "note_tweet_text": "",
+                     "article_title": "T", "article_preview": "P", "quote_comment": ""}
+            Path(queue_path).write_text(json.dumps([entry]), encoding="utf-8")
+            with patch.object(twitter_monitor, "ARTICLE_QUEUE_DIR", tmp), \
+                    patch.object(twitter_monitor, "cleanup_old_article_cache"), \
+                    patch.object(twitter_monitor, "_save_article_queue", side_effect=flaky_save), \
+                    patch.object(twitter_monitor, "fetch_article_markdown",
+                                 return_value=("# T\n\ncontent body", "")), \
+                    patch.object(twitter_monitor, "cache_article_markdown", return_value=""), \
+                    patch.object(twitter_monitor, "summarize_article",
+                                 return_value=("summary text", "fake")), \
+                    patch.object(twitter_monitor, "send_telegram_rich",
+                                 return_value={"ok": True}), \
+                    patch.object(twitter_monitor, "delete_article_cache"), \
+                    patch("time.sleep"):
+                twitter_monitor.process_article_queue(FakeAI(), "tok", "1", False)
+            final = json.loads(Path(queue_path).read_text())
+        # 即刻落盘（sent）确实发生过且失败被吞掉，最终盘面必须是 sent 而非 failed
+        self.assertGreaterEqual(
+            len([s for s in saves if s and s[0].get("status") == "sent"]), 2)
+        self.assertEqual(final[0]["status"], "sent")
 
 
 if __name__ == "__main__":
