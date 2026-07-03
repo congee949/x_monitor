@@ -364,7 +364,8 @@ def select_cards(items: list[dict]) -> list[dict]:
     return cards
 
 
-def send_card(token: str, chat_id: str, it: dict, header: str = "") -> None:
+def send_card(token: str, chat_id: str, it: dict, header: str = "",
+              *, thread_id: "str | int | None" = None) -> None:
     sub = it.get("sub_items")
     if sub:
         cap = f"<b>{esc(it['zh_title'])}（{len(sub)} 篇）</b>"
@@ -379,6 +380,8 @@ def send_card(token: str, chat_id: str, it: dict, header: str = "") -> None:
         "caption": cap[:1024], "parse_mode": "HTML",
         "reply_markup": {"inline_keyboard": [[{"text": "📖 原文", "url": it["link"]}]]},
     }
+    if thread_id is not None:
+        payload["message_thread_id"] = thread_id
     try:
         tm._tg_post(token, payload, "sendPhoto")
     except tm.TgAmbiguousDelivery as e:
@@ -436,9 +439,12 @@ def build_html_messages(items: list[dict], header: str, truncated: int) -> list[
     return messages
 
 
-def send_html(token: str, chat_id: str, text: str, trace_id: str = "") -> None:
+def send_html(token: str, chat_id: str, text: str, trace_id: str = "",
+              *, thread_id: "str | int | None" = None) -> None:
     payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML",
                "link_preview_options": {"is_disabled": True}}
+    if thread_id is not None:
+        payload["message_thread_id"] = thread_id
     for attempt in range(3):
         try:
             tm._tg_post(token, payload, "sendMessage")
@@ -484,7 +490,13 @@ def main() -> int:
     # 复用 twitter_monitor 的配置路径（项目真源），避免文件被改名后再次断裂
     with open(tm.CONFIG_PATH) as f:
         cfg = json.load(f)
-    token, chat_id = cfg["telegram_bot_token"], cfg["telegram_chat_id"]
+    token = cfg["telegram_bot_token"]
+    # digest 路由到通知群的「资讯」话题（与 twitter_monitor 同群同套路）；未配置
+    # telegram_group_chat_id 时回落到 telegram_chat_id（DM），行为不变。thread_id
+    # 仅在走群时生效，DM 回落不带 thread。
+    group_chat_id = cfg.get("telegram_group_chat_id")
+    chat_id = group_chat_id or cfg["telegram_chat_id"]
+    thread_id = cfg.get("telegram_macrumors_thread_id") if group_chat_id else None
 
     items = parse_items(fetch_feed())
     seen, seen_existed = load_seen()
@@ -546,7 +558,7 @@ def main() -> int:
     sent_cards = set()
     for idx, it in enumerate(cards):
         try:
-            send_card(token, chat_id, it, header if idx == 0 else "")
+            send_card(token, chat_id, it, header if idx == 0 else "", thread_id=thread_id)
             sent_cards.add(it["guid"])
             mark_guids_seen(seen, all_guids([it]), dry=dry)
             time.sleep(1)
@@ -560,7 +572,8 @@ def main() -> int:
         try:
             messages = build_html_messages(rest, rest_header, truncated)
             for i, msg in enumerate(messages, 1):
-                send_html(token, chat_id, msg, trace_id=f"digest {i}/{len(messages)}")
+                send_html(token, chat_id, msg, trace_id=f"digest {i}/{len(messages)}",
+                          thread_id=thread_id)
                 time.sleep(1)
             rest_sent = True
             mark_guids_seen(seen, all_guids(rest), dry=dry)
