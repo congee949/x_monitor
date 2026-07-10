@@ -2471,6 +2471,91 @@ class ApplyRouteOverlayTest(unittest.TestCase):
         self.assertEqual(out, cfg)
 
 
+class ThreadNotFoundFallbackTest(unittest.TestCase):
+    """话题失效自愈：400 message thread not found → 换回退话题重试一次；
+    轮末 _alert_thread_fallback 汇总一条 DM。话题被删不能变成静默断流。"""
+
+    def setUp(self):
+        twitter_monitor._THREAD_FALLBACK_EVENTS.clear()
+        twitter_monitor._AMBIGUOUS_STREAK = 0
+        self._fallback_patch = patch.object(twitter_monitor, "_THREAD_FALLBACK_ID", 19)
+        self._fallback_patch.start()
+        self.addCleanup(self._fallback_patch.stop)
+
+    def _thread_not_found_post(self, calls):
+        import io
+        import urllib.error
+
+        def fake_post(token, payload, method="sendMessage"):
+            calls.append(dict(payload))
+            if payload.get("message_thread_id") == 555:
+                raise urllib.error.HTTPError(
+                    "url", 400, "Bad Request", {},
+                    io.BytesIO(b'{"ok":false,"description":"Bad Request: message thread not found"}'))
+            return {"ok": True, "result": {"message_id": 1}}
+
+        return fake_post
+
+    def test_send_telegram_falls_back_to_default_thread(self):
+        calls = []
+        with patch.object(twitter_monitor, "_tg_post",
+                          side_effect=self._thread_not_found_post(calls)):
+            r = twitter_monitor.send_telegram("bot", "chat", "hi", thread_id=555)
+        self.assertTrue(r.get("ok"))
+        self.assertEqual([c.get("message_thread_id") for c in calls], [555, 19])
+        self.assertEqual(twitter_monitor._THREAD_FALLBACK_EVENTS, [555])
+
+    def test_send_telegram_rich_falls_back_to_default_thread(self):
+        calls = []
+        with patch.object(twitter_monitor, "_tg_post",
+                          side_effect=self._thread_not_found_post(calls)):
+            r = twitter_monitor.send_telegram_rich("bot", "chat", html="hi", thread_id=555)
+        self.assertTrue(r.get("ok"))
+        self.assertNotIn("rich_fallback", r)
+        self.assertEqual([c.get("message_thread_id") for c in calls], [555, 19])
+
+    def test_no_fallback_id_drops_to_general(self):
+        calls = []
+        with patch.object(twitter_monitor, "_THREAD_FALLBACK_ID", None), \
+             patch.object(twitter_monitor, "_tg_post",
+                          side_effect=self._thread_not_found_post(calls)):
+            r = twitter_monitor.send_telegram("bot", "chat", "hi", thread_id=555)
+        self.assertTrue(r.get("ok"))
+        self.assertNotIn("message_thread_id", calls[1])
+
+    def test_other_400_still_strips_parse_mode(self):
+        import io
+        import urllib.error
+        calls = []
+
+        def fake_post(token, payload, method="sendMessage"):
+            calls.append(dict(payload))
+            if payload.get("parse_mode"):
+                raise urllib.error.HTTPError(
+                    "url", 400, "Bad Request", {},
+                    io.BytesIO(b'{"ok":false,"description":"can\'t parse entities"}'))
+            return {"ok": True}
+
+        with patch.object(twitter_monitor, "_tg_post", side_effect=fake_post):
+            r = twitter_monitor.send_telegram("bot", "chat", "<b>hi</b>", thread_id=555)
+        self.assertTrue(r.get("ok"))
+        # 剥 parse_mode 重试，thread 保留（不是话题问题）
+        self.assertNotIn("parse_mode", calls[1])
+        self.assertEqual(calls[1].get("message_thread_id"), 555)
+        self.assertEqual(twitter_monitor._THREAD_FALLBACK_EVENTS, [])
+
+    def test_alert_thread_fallback_flushes_once(self):
+        quiet = []
+        twitter_monitor._THREAD_FALLBACK_EVENTS.extend([555, 555, 666])
+        with patch.object(twitter_monitor, "_tg_post_quiet",
+                          side_effect=lambda t, p, m: quiet.append(p) or {"ok": True}):
+            twitter_monitor._alert_thread_fallback("bot", "dm")
+            twitter_monitor._alert_thread_fallback("bot", "dm")  # 第二次应无事件可发
+        self.assertEqual(len(quiet), 1)
+        self.assertIn("555, 666", quiet[0]["text"])
+        self.assertEqual(twitter_monitor._THREAD_FALLBACK_EVENTS, [])
+
+
 class TgPostDeliveryClassificationTest(unittest.TestCase):
     """_tg_post 的发送分相语义：发出前失败可重试（URLError/InvalidURL 原样抛），
     发出后失败（读响应超时/连接中断/响应体损坏）→ TgAmbiguousDelivery。"""

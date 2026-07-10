@@ -1358,6 +1358,48 @@ def _alert_seen_save_failure(bot_token: str, chat_id: str, username: str, error:
                    "sendMessage")
 
 
+# 话题失效自愈：thread not found 时把消息回退到默认话题（main 从配置置位），
+# 事件累积到轮末汇总一条 DM 告警——话题被删/关闭不能变成静默断流。
+_THREAD_FALLBACK_ID: "int | None" = None
+_THREAD_FALLBACK_EVENTS: list = []
+
+
+def _swap_thread_on_not_found(payload: dict, desc: str) -> "dict | None":
+    """400 描述命中 thread not found 时返回换好话题的新 payload，否则 None。
+
+    回退目标是 _THREAD_FALLBACK_ID；已在回退话题（或未配置回退）则直接摘掉
+    message_thread_id 落 General——比静默丢消息好。"""
+    if payload.get("message_thread_id") is None:
+        return None
+    if "message thread not found" not in (desc or "").lower():
+        return None
+    bad = payload.get("message_thread_id")
+    _THREAD_FALLBACK_EVENTS.append(bad)
+    fixed = dict(payload)
+    if _THREAD_FALLBACK_ID and bad != _THREAD_FALLBACK_ID:
+        fixed["message_thread_id"] = _THREAD_FALLBACK_ID
+        print(f"  ⚠️ thread {bad} 不存在（话题被删/关闭？），回退默认话题 {_THREAD_FALLBACK_ID}")
+    else:
+        fixed.pop("message_thread_id", None)
+        print(f"  ⚠️ thread {bad} 不存在且无可用回退话题，落 General")
+    return fixed
+
+
+def _alert_thread_fallback(bot_token: str, chat_id: str) -> None:
+    """轮末把本轮全部 thread-not-found 回退汇总成一条 DM 告警并清空事件。"""
+    if not _THREAD_FALLBACK_EVENTS:
+        return
+    bad = ", ".join(sorted({str(x) for x in _THREAD_FALLBACK_EVENTS}))
+    _THREAD_FALLBACK_EVENTS.clear()
+    if not (bot_token and chat_id):
+        return
+    text = ("⚠️ <b>X Monitor 话题路由回退</b>\n"
+            f"以下 message_thread_id 报 thread not found，消息已回退默认话题：<code>{html.escape(bad)}</code>\n"
+            "请检查话题是否被删除/关闭，并修正路由表或 config。")
+    _tg_post_quiet(bot_token, {"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
+                   "sendMessage")
+
+
 def _alert_ai_all_failed(bot_token: str, chat_id: str, username: str) -> None:
     """AI 推广识别全部后端失败时告警，避免 suspicious 推文被错误放行。"""
     if not (bot_token and chat_id):
@@ -2013,6 +2055,11 @@ def send_telegram_rich(token: str, chat_id: str, markdown: str = "", link: str =
                     desc = json.loads(body).get("description", "")
                 except Exception:
                     desc = body[:200]
+                if e.code == 400:
+                    fixed = _swap_thread_on_not_found(payload, desc)
+                    if fixed is not None:
+                        payload = fixed  # 话题失效：换回退话题占用一次重试，400 即时无预算压力
+                        continue
                 return {"ok": False, "rich_fallback": True,
                         "error_code": e.code, "description": desc}
             raise
@@ -2085,6 +2132,18 @@ def send_telegram(token: str, chat_id: str, text: str, link: str = "",
             if e.code >= 500:
                 time.sleep(2 * (attempt + 1))
                 continue
+            if e.code == 400:
+                # 话题失效先于 parse_mode 剥离：否则先剥格式重进同一个死话题，
+                # 再 400 时 parse_mode 已不在，直接 raise 进 push_retry 永久循环。
+                desc = ""
+                try:
+                    desc = json.loads(body).get("description", "")
+                except Exception:
+                    desc = body[:200]
+                fixed = _swap_thread_on_not_found(payload, desc)
+                if fixed is not None:
+                    payload = fixed
+                    continue
             if e.code == 400 and payload.get("parse_mode"):
                 payload = dict(payload)
                 payload["text"] = _html_to_plain(text)
@@ -2674,7 +2733,7 @@ def main() -> int:
     try:
         # 每轮起止时间戳：日志此前无任何时间标记，无法事后审计运行时长/定位轮次
         run_started = time.monotonic()
-        global _ARTICLE_QUEUE_RUN_START
+        global _ARTICLE_QUEUE_RUN_START, _THREAD_FALLBACK_ID
         _ARTICLE_QUEUE_RUN_START = run_started
         print(f"\n==== monitor run {datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S %z')} ====")
 
@@ -2692,6 +2751,8 @@ def main() -> int:
         # 账号级主题路由映射（accounts.json 的 topic 字段 → 话题 thread）；
         # --chat-id 覆盖时随群组路由一起让位（全部落覆盖目标、无 thread）。
         topic_threads = (cfg.get("telegram_topic_threads") or {}) if group_chat_id else {}
+        # 话题失效自愈的回退目标（默认 X 话题）；无群组路由时无话题可回退
+        _THREAD_FALLBACK_ID = content_thread_id
 
         # Load token pool for 6551.io fallback (optional if GraphQL works)
         try:
@@ -2779,6 +2840,11 @@ def main() -> int:
                 print(f"  Articles processed: {article_count}")
         except Exception as e:
             print(f"  Article queue error: {e}")
+        if not args.dry_run:
+            try:
+                _alert_thread_fallback(bot_token, chat_id)
+            except Exception as e:
+                print(f"  话题回退告警异常（忽略）: {e}")
         if pool is not None:
             print(f"  token 池：{pool.available_count}/{len(pool._tokens)} 可用")
         if not args.dry_run:
