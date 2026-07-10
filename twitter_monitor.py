@@ -1772,32 +1772,82 @@ def _fmt_duration(ms: "int | None") -> str:
     return f"{s // 60}:{s % 60:02d}"
 
 
-def _rich_media_block(t: dict) -> str:
-    """普通推文媒体块（rich html 字段）：照片 / 视频封面嵌为 <img>，多图拼 <tg-collage>。
+# rich 外链媒体拉取上限 20MB（照片 5MB）。HEAD 拿到精确字节数时留 1MB 余量；
+# HEAD 失败回退 bitrate×时长估算时再收紧（bitrate 是峰值声明，实测估算偏大 3-5 倍）。
+RICH_VIDEO_HEAD_MAX_BYTES = 19 * 1024 * 1024
+RICH_VIDEO_EST_MAX_BYTES = 18 * 1024 * 1024
+_RICH_VIDEO_ENABLED = False   # main 从 cfg["rich_video_embed"] 置位；默认关 = 封面行为
 
-    视频、GIF 取封面缩略图（t['media'][].url = pbs.twimg.com，Telegram 服务端可拉、
-    URL 照片 ≤5MB），并在上方标 ▶️+时长；真正的 mp4 不嵌——rich 不支持视频块，
-    且长视频按 URL 拉取超限会让整条 rich 被 400 拒、回退纯文本（净倒退）。
+
+def _head_content_length(url: str) -> "int | None":
+    """HEAD 取 Content-Length（bwg 实测与 Telegram 拉取到的 file_size 一字不差）；
+    任何失败回 None（回退估算，绝不阻塞格式化主线超过超时）。"""
+    try:
+        req = urllib.request.Request(url, method="HEAD")
+        with urllib.request.urlopen(req, timeout=8) as r:
+            cl = r.headers.get("Content-Length")
+            return int(cl) if cl else None
+    except Exception:
+        return None
+
+
+def _pick_embeddable_mp4(m: dict) -> "str | None":
+    """从 variants（bitrate 降序）选「能塞进外链上限的最大清晰度」mp4。
+
+    HEAD 精确判断优先；HEAD 不可用退回 bitrate/8×duration 估算（更保守上限）。
+    gif/无 bitrate 档估算为 0 视为可嵌。全部超限/无档回 None → 维持封面行为。"""
+    variants = m.get("variants") or []
+    if not variants and m.get("video_url"):
+        variants = [{"url": m["video_url"], "bitrate": m.get("bitrate") or 0}]
+    dur_s = (m.get("duration_ms") or 0) / 1000
+    for v in variants:
+        url = v.get("url")
+        if not url or not url.startswith("https://") or '"' in url or "<" in url:
+            continue
+        size = _head_content_length(url)
+        if size is not None:
+            if size <= RICH_VIDEO_HEAD_MAX_BYTES:
+                return url
+            continue  # 精确超限：试下一档
+        est = (v.get("bitrate") or 0) / 8 * dur_s
+        if est <= RICH_VIDEO_EST_MAX_BYTES:
+            return url
+    return None
+
+
+def _rich_media_block(t: dict, embed_video: bool = True) -> str:
+    """普通推文媒体块（rich html 字段）：照片嵌 <img>；视频/GIF 在 rich_video_embed
+    开启且体积能塞进外链上限时嵌可播放 <video>（2026-07-10 探针验证 Telegram
+    服务端可拉 video.twimg.com 并物化原生 Video），否则退回封面 <img> + ▶️/时长；
+    多媒体拼 <tg-collage>（官方支持 img/video 混排），上限 4。
     语法是官方 Rich HTML（不是文章摘要用的 Markdown ![]()），媒体只能作独立块。
-    URL 来自 GraphQL 已提取的 t['media']；RT 媒体在 retweeted_status 不进 t['media']，本期不处理。
+    URL 来自 GraphQL 已提取的 t['media']（转推媒体由转推全文重建回填进来）。
+    embed_video=False 供发送降级梯剥视频重试（视频被 Telegram 拒时换封面重发）。
     """
-    imgs = []
+    parts = []
     hint = ""
     for m in t.get("media") or []:
         url = m.get("url")  # photo: media_url_https；video/gif: 封面缩略图
         if not url or not url.startswith("https://") or '"' in url or "<" in url:
             continue
-        imgs.append(url)
-        if m.get("type") in ("video", "animated_gif") and not hint:
-            hint = (f"▶️ 视频 · {_fmt_duration(m.get('duration_ms'))}"
-                    if m.get("type") == "video" else "▶️ GIF")
-    if not imgs:
+        mp4 = None
+        if (m.get("type") in ("video", "animated_gif")
+                and embed_video and _RICH_VIDEO_ENABLED):
+            mp4 = _pick_embeddable_mp4(m)
+        if mp4:
+            parts.append(f'<video src="{mp4}"/>')
+        else:
+            parts.append(f'<img src="{url}"/>')
+            if m.get("type") in ("video", "animated_gif") and not hint:
+                hint = (f"▶️ 视频 · {_fmt_duration(m.get('duration_ms'))}"
+                        if m.get("type") == "video" else "▶️ GIF")
+    if not parts:
         return ""
-    imgs = imgs[:4]
-    if len(imgs) == 1:
-        media_html = f'<img src="{imgs[0]}"/>'
+    parts = parts[:4]
+    if len(parts) == 1:
+        media_html = parts[0]
     else:
-        media_html = "<tg-collage>" + "".join(f'<img src="{u}"/>' for u in imgs) + "</tg-collage>"
+        media_html = "<tg-collage>" + "".join(parts) + "</tg-collage>"
     block = f"<br><br>{hint}" if hint else ""
     return block + f"<br><br>{media_html}"
 
@@ -1818,7 +1868,8 @@ def _strip_media_tco(text: str, t: dict) -> str:
 
 
 def format_message(
-    username: str, t: dict, ai: "AIClassifier | None" = None
+    username: str, t: dict, ai: "AIClassifier | None" = None,
+    *, embed_video: bool = True,
 ) -> tuple[str, str, str]:
     """Build both the HTML fallback message and the rich-message variant.
 
@@ -1878,7 +1929,7 @@ def format_message(
         rich_html = f'📢 @{username}'
     # 照片 / 视频封面缩略图嵌进 rich 末尾（文章自带配图走另一路径，不在此处理）。
     if not t.get("article"):
-        rich_html += _rich_media_block(t)
+        rich_html += _rich_media_block(t, embed_video)
     return text, rich_html, link
 
 
@@ -2255,6 +2306,20 @@ def send_tweet(
             return r
         if not r.get("rich_fallback"):
             return r
+        if "<video" in rich_html:
+            # 降级梯（仿文章「带图被拒→去图重试」）：rich 含可播视频被确定性 400 拒
+            # （拉取失败/超限误估）→ 剥视频换封面重发 rich，再拒才落 HTML。
+            # 歧义（TgAmbiguousDelivery）在 send 内部已按已送达返回，走不到这里，
+            # 不存在视频+封面双发。
+            _h2, rich_nv, _l2 = format_message(username, t, ai, embed_video=False)
+            if rich_nv != rich_html and len(rich_nv) <= RICH_MESSAGE_MAX_CHARS:
+                print("    rich 含视频被拒，剥 video 换封面重试")
+                r = send_telegram_rich(token, chat_id, link=link, html=rich_nv,
+                                       thread_id=thread_id)
+                if r.get("ok"):
+                    return r
+                if not r.get("rich_fallback"):
+                    return r
     return send_telegram(token, chat_id, html_text, link, thread_id=thread_id)
 
 
@@ -2864,6 +2929,11 @@ def main() -> int:
         _CROSS_DEDUP_ENABLED = bool(cfg.get("cross_account_dedup"))
         if _CROSS_DEDUP_ENABLED:
             print("  跨账号去重已启用（纯转发 + Article）")
+        # rich 可播视频内嵌：config 键开关，默认关 = 封面缩略图行为
+        global _RICH_VIDEO_ENABLED
+        _RICH_VIDEO_ENABLED = bool(cfg.get("rich_video_embed"))
+        if _RICH_VIDEO_ENABLED:
+            print("  rich 视频内嵌已启用（≤20MB 档，超限回退封面）")
 
         # Load token pool for 6551.io fallback (optional if GraphQL works)
         try:

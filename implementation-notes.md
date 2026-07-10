@@ -269,3 +269,14 @@ Addressed the remaining eval items the user explicitly opted into.
 
 ### 测试
 - 195→206（CrossAccountDedupTest ×11：抑制/首推登记/同轮双账号/quote 不穿透/原创不抑制/dry-run 与 --test 不写/默认关/TTL+容量 GC/article 双闸+skipped 终态）。
+
+## 2026-07-10 — F3 rich 可播视频内嵌（config 键 rich_video_embed）
+
+### Design Decisions
+- **选流 HEAD 优先**：探针实测 GraphQL `bitrate` 是峰值声明，bitrate×duration 估算偏大 3-5 倍（10.9MB 估→3.7MB 实、49MB 估→9.4MB 实），纯估算会误杀大量可嵌视频；bwg 对 video.twimg.com 的 HEAD Content-Length 与 Telegram 物化 file_size 一字不差 → `_pick_embeddable_mp4` 逐档 HEAD（≤19MB 取最大档），HEAD 失败回退估算（≤18MB 更保守）。gif/无码率档估算为 0 视为可嵌。
+- **渲染**：可嵌 → `<video src>`（去 ▶️ hint 去封面）；不可嵌/全超限/m3u8-only → 维持封面 `<img>`+▶️+时长（不算失败）；photo+video 混媒体 `<tg-collage>` 混排（官方支持），上限 4 保持。HTML 回退路径不动。
+- **降级梯**（send_tweet，仿文章「带图被拒→去图重试」）：rich 含 `<video>` 被**确定性 400** 拒 → `format_message(embed_video=False)` 剥视频换封面重发 rich → 再拒才落 HTML；歧义（TgAmbiguousDelivery）在 send 内部已按已送达返回，走不到降级梯——无视频+封面双发。
+- 探针（2026-07-10，msg 4192/4193 留 DM 供肉眼核）：Telegram 服务端可拉 video.twimg.com 并物化原生 Video 对象（含 file_id/宽高/缩略图），49MB 峰值档实际 9.4MB 也成功——20MB 上限针对实际字节数。
+
+### 测试
+- 206→216（RichVideoEmbedTest ×10：开关开时嵌 video/HEAD 选档/估算回退/全超限回封面/gif/混排 collage/剥视频重试不落 HTML/两级拒后落 HTML/歧义恰一发/默认关封面行为）。

@@ -285,6 +285,150 @@ class RichMediaBlockTest(unittest.TestCase):
         self.assertNotIn("<img", rich)
 
 
+class RichVideoEmbedTest(unittest.TestCase):
+    """F3：rich_video_embed 开启时短视频嵌可播放 <video>（HEAD 精确选流优先、
+    估算回退、全超限回封面），send_tweet 剥视频降级梯，歧义不双发。"""
+
+    def setUp(self):
+        p = patch.object(twitter_monitor, "_RICH_VIDEO_ENABLED", True)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _video_tweet(self, variants, duration_ms=42000):
+        return {"id": "1", "text": "看视频",
+                "media": [{"type": "video",
+                           "url": "https://pbs.twimg.com/thumb/img/abc",
+                           "video_url": variants[0]["url"] if variants else None,
+                           "bitrate": variants[0]["bitrate"] if variants else None,
+                           "variants": variants,
+                           "duration_ms": duration_ms}]}
+
+    def test_video_embeds_playable_video_when_enabled(self):
+        t = self._video_tweet([{"url": "https://video.twimg.com/hi.mp4", "bitrate": 2176000}])
+        with patch.object(twitter_monitor, "_head_content_length", return_value=3_715_988):
+            _msg, rich, _ = twitter_monitor.format_message("OpenAIDevs", t, None)
+        self.assertIn('<video src="https://video.twimg.com/hi.mp4"/>', rich)
+        self.assertNotIn("▶️", rich)          # 可播视频不再要提示
+        self.assertNotIn("pbs.twimg.com/thumb", rich)  # 不再嵌封面
+        self.assertNotIn("<video", _msg)      # HTML 回退不嵌媒体
+
+    def test_picks_largest_variant_under_cap_via_head(self):
+        t = self._video_tweet([
+            {"url": "https://video.twimg.com/2160p.mp4", "bitrate": 25128000},
+            {"url": "https://video.twimg.com/720p.mp4", "bitrate": 2176000},
+        ])
+        sizes = {"https://video.twimg.com/2160p.mp4": 49_000_000,
+                 "https://video.twimg.com/720p.mp4": 9_400_000}
+        with patch.object(twitter_monitor, "_head_content_length",
+                          side_effect=lambda u: sizes[u]):
+            _msg, rich, _ = twitter_monitor.format_message("u", t, None)
+        self.assertIn('720p.mp4"/>', rich)
+        self.assertNotIn("2160p", rich)
+
+    def test_head_failure_falls_back_to_estimate(self):
+        # 104s：10.368Mbps 估 ~128MB 超限；950kbps 估 ~12MB 可嵌
+        t = self._video_tweet([
+            {"url": "https://video.twimg.com/1080p.mp4", "bitrate": 10368000},
+            {"url": "https://video.twimg.com/360p.mp4", "bitrate": 950000},
+        ], duration_ms=104000)
+        with patch.object(twitter_monitor, "_head_content_length", return_value=None):
+            _msg, rich, _ = twitter_monitor.format_message("u", t, None)
+        self.assertIn('360p.mp4"/>', rich)
+
+    def test_all_variants_oversize_keeps_poster(self):
+        t = self._video_tweet([{"url": "https://video.twimg.com/big.mp4",
+                                "bitrate": 25128000}], duration_ms=734000)
+        with patch.object(twitter_monitor, "_head_content_length",
+                          return_value=2_199_000_000):
+            _msg, rich, _ = twitter_monitor.format_message("u", t, None)
+        self.assertNotIn("<video", rich)
+        self.assertIn('<img src="https://pbs.twimg.com/thumb/img/abc"/>', rich)
+        self.assertIn("▶️ 视频 · 12:14", rich)
+
+    def test_gif_embeds_video_without_bitrate(self):
+        t = {"id": "2", "text": "动图",
+             "media": [{"type": "animated_gif",
+                        "url": "https://pbs.twimg.com/tweet_video_thumb/x.jpg",
+                        "video_url": "https://video.twimg.com/tweet_video/x.mp4",
+                        "bitrate": 0, "variants": [], "duration_ms": None}]}
+        with patch.object(twitter_monitor, "_head_content_length", return_value=None):
+            _msg, rich, _ = twitter_monitor.format_message("u", t, None)
+        self.assertIn('<video src="https://video.twimg.com/tweet_video/x.mp4"/>', rich)
+
+    def test_mixed_photo_video_collage(self):
+        t = {"id": "3", "text": "图+视频",
+             "media": [
+                 {"type": "photo", "url": "https://pbs.twimg.com/media/p1.jpg"},
+                 {"type": "video", "url": "https://pbs.twimg.com/thumb2.jpg",
+                  "video_url": "https://video.twimg.com/v.mp4",
+                  "variants": [{"url": "https://video.twimg.com/v.mp4", "bitrate": 1000}],
+                  "duration_ms": 5000, "bitrate": 1000}]}
+        with patch.object(twitter_monitor, "_head_content_length", return_value=1_000_000):
+            _msg, rich, _ = twitter_monitor.format_message("u", t, None)
+        self.assertIn("<tg-collage>", rich)
+        self.assertIn('<img src="https://pbs.twimg.com/media/p1.jpg"/>', rich)
+        self.assertIn('<video src="https://video.twimg.com/v.mp4"/>', rich)
+
+    def test_send_tweet_strips_video_and_retries_rich_on_400(self):
+        t = self._video_tweet([{"url": "https://video.twimg.com/hi.mp4", "bitrate": 1000}])
+        rich_calls, legacy_calls = [], []
+
+        def fake_rich(token, chat_id, markdown="", link="", *, html="", thread_id=None):
+            rich_calls.append(html)
+            if "<video" in html:
+                return {"ok": False, "rich_fallback": True, "description": "WEBPAGE_MEDIA_EMPTY"}
+            return {"ok": True, "result": {"message_id": 9}}
+
+        with patch.object(twitter_monitor, "_head_content_length", return_value=1000), \
+             patch.object(twitter_monitor, "send_telegram_rich", side_effect=fake_rich), \
+             patch.object(twitter_monitor, "send_telegram",
+                          side_effect=lambda *a, **k: legacy_calls.append(a) or {"ok": True}):
+            r = twitter_monitor.send_tweet("b", "c", "u", t, None)
+        self.assertTrue(r.get("ok"))
+        self.assertEqual(len(rich_calls), 2)
+        self.assertIn("<video", rich_calls[0])
+        self.assertNotIn("<video", rich_calls[1])   # 第二发剥了视频（封面）
+        self.assertIn("<img", rich_calls[1])
+        self.assertEqual(legacy_calls, [])          # 不落 HTML
+
+    def test_send_tweet_video_then_second_reject_falls_to_html(self):
+        t = self._video_tweet([{"url": "https://video.twimg.com/hi.mp4", "bitrate": 1000}])
+        legacy_calls = []
+
+        def fake_rich(token, chat_id, markdown="", link="", *, html="", thread_id=None):
+            return {"ok": False, "rich_fallback": True, "description": "nope"}
+
+        with patch.object(twitter_monitor, "_head_content_length", return_value=1000), \
+             patch.object(twitter_monitor, "send_telegram_rich", side_effect=fake_rich), \
+             patch.object(twitter_monitor, "send_telegram",
+                          side_effect=lambda *a, **k: legacy_calls.append(a) or {"ok": True}):
+            r = twitter_monitor.send_tweet("b", "c", "u", t, None)
+        self.assertTrue(r.get("ok"))
+        self.assertEqual(len(legacy_calls), 1)      # 两级 rich 均拒 → HTML 兜底
+
+    def test_send_tweet_ambiguous_video_never_retries(self):
+        t = self._video_tweet([{"url": "https://video.twimg.com/hi.mp4", "bitrate": 1000}])
+        rich_calls = []
+
+        def fake_rich(token, chat_id, markdown="", link="", *, html="", thread_id=None):
+            rich_calls.append(html)
+            return {"ok": True, "assumed_delivered": True}
+
+        with patch.object(twitter_monitor, "_head_content_length", return_value=1000), \
+             patch.object(twitter_monitor, "send_telegram_rich", side_effect=fake_rich):
+            r = twitter_monitor.send_tweet("b", "c", "u", t, None)
+        self.assertTrue(r.get("ok"))
+        self.assertEqual(len(rich_calls), 1)        # 歧义按已送达，绝不第二发
+
+    def test_disabled_flag_keeps_poster_behavior(self):
+        t = self._video_tweet([{"url": "https://video.twimg.com/hi.mp4", "bitrate": 1000}])
+        with patch.object(twitter_monitor, "_RICH_VIDEO_ENABLED", False), \
+             patch.object(twitter_monitor, "_head_content_length", return_value=1000):
+            _msg, rich, _ = twitter_monitor.format_message("u", t, None)
+        self.assertNotIn("<video", rich)
+        self.assertIn("▶️ 视频", rich)
+
+
 class StripMediaTcoTest(unittest.TestCase):
     """带图推文正文尾部的「媒体专属」t.co 短链应被剥掉（图已作为 rich 媒体块内嵌），
     但用户主动分享的真实链接必须保留（精确匹配 entities.media[].url，不用末尾正则）。"""
