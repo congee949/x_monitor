@@ -101,7 +101,8 @@ class AccountIsolationTest(unittest.TestCase):
         try:
             with patch.object(twitter_monitor, "CONFIG_PATH", str(config_path)):
                 with patch.object(twitter_monitor, "FAILURES_PATH", str(failures_path)), \
-                     patch.object(twitter_monitor, "update_status_dashboard", return_value=None):
+                     patch.object(twitter_monitor, "update_status_dashboard", return_value=None), \
+                     patch.object(twitter_monitor, "check_cookie_health", return_value=None):
                     with patch.object(twitter_monitor.TokenPool, "load", return_value=None):
                         with patch.object(twitter_monitor.AIClassifier, "load", return_value=FakeAI(False)):
                             with patch.object(twitter_monitor, "load_accounts", return_value=[{"username": "ok1"}, {"username": "broken"}, {"username": "ok2"}]):
@@ -2642,6 +2643,7 @@ class MainContentRoutingTest(unittest.TestCase):
                               "test_route_table_absent.json"), \
                  patch.object(twitter_monitor, "FAILURES_PATH", str(failures_path)), \
                  patch.object(twitter_monitor, "update_status_dashboard", return_value=None), \
+                 patch.object(twitter_monitor, "check_cookie_health", return_value=None), \
                  patch.object(twitter_monitor.TokenPool, "load", return_value=None), \
                  patch.object(twitter_monitor.AIClassifier, "load", return_value=FakeAI(False)), \
                  patch.object(twitter_monitor, "load_accounts",
@@ -3415,6 +3417,86 @@ class ArticleSentPersistBeforeQuietEditTest(unittest.TestCase):
         self.assertGreaterEqual(
             len([s for s in saves if s and s[0].get("status") == "sent"]), 2)
         self.assertEqual(final[0]["status"], "sent")
+
+
+class CookieHealthAlertTest(unittest.TestCase):
+    """cookie 认证看门狗：连续"整轮降级 guest"达阈值只告警一次，authed 恢复后清零。"""
+
+    def _health(self, degraded, cookies_loaded=False, degrade_events=0, authed_success=0):
+        import twitter_graphql as tg
+        return patch.object(tg, "auth_health_summary", return_value={
+            "cookies_loaded": cookies_loaded,
+            "authed_success": authed_success,
+            "degrade_events": degrade_events,
+            "degraded": degraded,
+        })
+
+    def test_alert_fires_once_at_threshold_then_resets_on_recovery(self):
+        sent = []
+
+        def fake_send(token, chat_id, text, link="", thread_id=None):
+            sent.append(text)
+            return {"ok": True, "result": {"message_id": 111}}
+
+        with tempfile.TemporaryDirectory() as d:
+            path = str(Path(d) / ".cookie_health.json")
+            with patch.object(twitter_monitor, "COOKIE_HEALTH_PATH", path), \
+                 patch.object(twitter_monitor, "send_telegram", side_effect=fake_send), \
+                 patch.object(twitter_monitor, "_tg_post_quiet", return_value={"ok": True}):
+                # 降级但未到阈值：不告警
+                with self._health(degraded=True, cookies_loaded=True, degrade_events=1):
+                    for _ in range(twitter_monitor.COOKIE_DEGRADE_ALERT_THRESHOLD - 1):
+                        twitter_monitor.check_cookie_health("bot", "chat")
+                    self.assertEqual(sent, [])
+                    # 第 THRESHOLD 轮：告警一次
+                    twitter_monitor.check_cookie_health("bot", "chat")
+                    self.assertEqual(len(sent), 1)
+                    self.assertIn("cookie", sent[0].lower())
+                    st = twitter_monitor.load_cookie_health()
+                    self.assertTrue(st["alerted"])
+                    self.assertEqual(st["consecutive_degraded"],
+                                     twitter_monitor.COOKIE_DEGRADE_ALERT_THRESHOLD)
+                    # 继续降级：不重复告警
+                    twitter_monitor.check_cookie_health("bot", "chat")
+                    self.assertEqual(len(sent), 1)
+                # authed 恢复：清零、alerted 复位
+                with self._health(degraded=False, cookies_loaded=True, authed_success=3):
+                    twitter_monitor.check_cookie_health("bot", "chat")
+                st = twitter_monitor.load_cookie_health()
+                self.assertEqual(st["consecutive_degraded"], 0)
+                self.assertFalse(st["alerted"])
+
+    def test_dry_run_counts_but_never_sends_or_latches(self):
+        sent = []
+        with tempfile.TemporaryDirectory() as d:
+            path = str(Path(d) / ".cookie_health.json")
+            with patch.object(twitter_monitor, "COOKIE_HEALTH_PATH", path), \
+                 patch.object(twitter_monitor, "send_telegram",
+                              side_effect=lambda *a, **k: sent.append(a) or {"ok": True}), \
+                 patch.object(twitter_monitor, "_tg_post_quiet", return_value={"ok": True}), \
+                 self._health(degraded=True, cookies_loaded=False):
+                for _ in range(twitter_monitor.COOKIE_DEGRADE_ALERT_THRESHOLD + 1):
+                    twitter_monitor.check_cookie_health("bot", "chat", dry_run=True)
+                st = json.loads(Path(path).read_text())
+            self.assertEqual(sent, [])
+            self.assertFalse(st.get("alerted", False))
+            self.assertGreaterEqual(st["consecutive_degraded"],
+                                    twitter_monitor.COOKIE_DEGRADE_ALERT_THRESHOLD)
+
+    def test_healthy_run_stays_silent_and_zeroed(self):
+        sent = []
+        with tempfile.TemporaryDirectory() as d:
+            path = str(Path(d) / ".cookie_health.json")
+            with patch.object(twitter_monitor, "COOKIE_HEALTH_PATH", path), \
+                 patch.object(twitter_monitor, "send_telegram",
+                              side_effect=lambda *a, **k: sent.append(a) or {"ok": True}), \
+                 patch.object(twitter_monitor, "_tg_post_quiet", return_value={"ok": True}), \
+                 self._health(degraded=False, cookies_loaded=True, authed_success=5):
+                for _ in range(3):
+                    twitter_monitor.check_cookie_health("bot", "chat")
+                st = json.loads(Path(path).read_text())
+            self.assertEqual(sent, [])
+            self.assertEqual(st["consecutive_degraded"], 0)
 
 
 if __name__ == "__main__":

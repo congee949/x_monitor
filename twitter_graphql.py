@@ -37,6 +37,39 @@ AUTH_MODE = "cookie"
 _COOKIE_FAILURE_THRESHOLD = 3
 _cookie_fail_count = 0
 
+# Per-process auth health, for the run-level cookie watchdog in twitter_monitor.
+# Each cron tick is a fresh process, so these start at 0 every run — no reset
+# needed in production. auth_health_summary() reads them after the run to decide
+# whether this whole tick failed to reach authenticated access (silent guest
+# degradation), which per-account failure tracking cannot see.
+_cookies_loaded_this_run = False   # a valid auth_token+ct0 was ever loaded
+_authed_success_count = 0          # authed request that actually succeeded
+_cookie_degrade_count = 0          # authed request rejected → fell back to guest
+
+
+def _reset_auth_health():
+    """Reset per-process auth-health counters (tests exercise many runs in one process)."""
+    global _cookies_loaded_this_run, _authed_success_count, _cookie_degrade_count
+    _cookies_loaded_this_run = False
+    _authed_success_count = 0
+    _cookie_degrade_count = 0
+
+
+def auth_health_summary():
+    """Snapshot of this process's auth health for the run-level watchdog.
+
+    degraded == the run never achieved authenticated access: either no cookies
+    were loadable (missing / renamed to .stale), or cookies loaded but every
+    authed request was rejected and fell back to guest.
+    """
+    degraded = (not _cookies_loaded_this_run) or (_authed_success_count == 0)
+    return {
+        "cookies_loaded": _cookies_loaded_this_run,
+        "authed_success": _authed_success_count,
+        "degrade_events": _cookie_degrade_count,
+        "degraded": degraded,
+    }
+
 
 class CurlError(Exception):
     """curl subprocess failed or returned a non-2xx HTTP status."""
@@ -166,6 +199,8 @@ def _load_auth_cookies():
             with open(AUTH_COOKIE_CACHE) as f:
                 data = json.load(f)
             if data.get("auth_token") and data.get("ct0"):
+                global _cookies_loaded_this_run
+                _cookies_loaded_this_run = True
                 return data
         except Exception:
             pass
@@ -482,7 +517,7 @@ def fetch_tweets(username, limit=20):
     used_auth_for_success = use_auth
 
     if errors:
-        global _cookie_fail_count
+        global _cookie_fail_count, _cookie_degrade_count
         error_msgs = [e.get("message", "") for e in errors]
         if _account_gone(errors):
             invalidate_user_id(username)
@@ -491,6 +526,7 @@ def fetch_tweets(username, limit=20):
             used_auth_for_success = False
             print(f"  [GraphQL] cookie 认证失效，降级 guest 模式: {error_msgs}")
             _cookie_fail_count += 1
+            _cookie_degrade_count += 1
             if _cookie_fail_count >= _COOKIE_FAILURE_THRESHOLD:
                 _clear_auth_cookies()
                 _cookie_fail_count = 0
@@ -526,7 +562,9 @@ def fetch_tweets(username, limit=20):
 
     # Reset cookie failure counter only when the authed request itself succeeds.
     if used_auth_for_success:
+        global _authed_success_count
         _cookie_fail_count = 0
+        _authed_success_count += 1
 
     # No errors but an empty user node: typical signature of a deleted account
     # when fetching by a (possibly cached) rest_id. Invalidate the cache so the

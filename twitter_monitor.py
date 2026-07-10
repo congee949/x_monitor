@@ -125,6 +125,13 @@ FAILURES_PATH = os.path.join(SCRIPT_DIR, ".account_failures.json")
 DASHBOARD_PATH = os.path.join(SCRIPT_DIR, ".dashboard.json")
 DASHBOARD_REBUILD_FRACTION = 0.85  # 消息存活到 TTL 的 85% 时主动重建，避开 auto-delete
 FAIL_ALERT_THRESHOLD = 4  # 账号连续失败轮数达到阈值（*/30 cron ≈ 2 小时）发一次 TG 告警
+
+COOKIE_HEALTH_PATH = os.path.join(SCRIPT_DIR, ".cookie_health.json")
+# 连续多少轮"整轮未取得 authed 访问"（静默降级 guest）后告警一次。*/30 cron 每轮
+# ≈ 30min，6 轮 ≈ 3h：够滤掉 X 侧偶发 5xx/超时导致的单轮降级误报，而 cookie 真过期
+# 是持久的，必在当天早上触发。独立于按账号的 FAIL_ALERT_THRESHOLD（guest 仍能拉公开
+# 推文，账号不算 failure，故账号失败告警抓不到这种"认证整体失效"）。
+COOKIE_DEGRADE_ALERT_THRESHOLD = 6
 ARTICLE_MARKDOWN_CMD = os.environ.get("X_ARTICLE_MARKDOWN_CMD", "").strip()
 ARTICLE_URL_RE = re.compile(
     r"https?://(?:x\.com|twitter\.com)/(?:i/article|([a-zA-Z0-9_]+)/articles)/(\d+)",
@@ -1499,6 +1506,88 @@ def load_account_failures() -> dict:
 
 def save_account_failures(failures: dict) -> None:
     _atomic_write(FAILURES_PATH, json.dumps(failures, ensure_ascii=False, indent=2))
+
+
+def load_cookie_health() -> dict:
+    """读取 cookie 认证健康状态 {consecutive_degraded, alerted, alert_msg_id, ...}。"""
+    try:
+        with open(COOKIE_HEALTH_PATH) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_cookie_health(state: dict) -> None:
+    _atomic_write(COOKIE_HEALTH_PATH, json.dumps(state, ensure_ascii=False, indent=2))
+
+
+def check_cookie_health(bot_token: str, chat_id: str, dry_run: bool = False) -> None:
+    """轮末看门狗：本进程是否"整轮未取得 authed 访问"（cookie 失效→静默降级 guest）。
+
+    连续达到 COOKIE_DEGRADE_ALERT_THRESHOLD 轮只告警一次；authed 恢复后清零并取消置顶。
+
+    背景：Mac 端 refresh_x_cookies 因 macOS 更新重置完全磁盘访问而静默断了 18 天，
+    cookie 过期后监控整轮降级 guest 仍能拉公开推文 → 按账号的 note_account_failure
+    抓不到（guest 拉取不算 failure）。此看门狗独立盯"认证整体失效"，宁重勿漏。
+    """
+    try:
+        import twitter_graphql as tg
+        health = tg.auth_health_summary()
+    except Exception as e:
+        print(f"  cookie 健康检查跳过（读 auth 状态失败）: {e}", file=sys.stderr)
+        return
+
+    state = load_cookie_health()
+
+    # 恢复轮：本轮拿到了 authed 访问 → 清零；曾告警过则改文案 + 取消置顶。
+    if not health.get("degraded"):
+        if state.get("alerted") and not dry_run:
+            mid = state.get("alert_msg_id")
+            if mid:
+                _tg_post_quiet(bot_token, {"chat_id": chat_id, "message_id": mid},
+                               "unpinChatMessage")
+                _tg_post_quiet(bot_token,
+                               {"chat_id": chat_id, "message_id": mid,
+                                "text": "✅ X cookie 认证已恢复（authed 访问成功）。",
+                                "parse_mode": "HTML"}, "editMessageText")
+        save_cookie_health({"consecutive_degraded": 0, "alerted": False})
+        return
+
+    # 降级轮：累加连续计数。
+    count = int(state.get("consecutive_degraded", 0)) + 1
+    now_iso = datetime.now(timezone.utc).isoformat()
+    state["consecutive_degraded"] = count
+    state["last_degraded_at"] = now_iso
+    state.setdefault("first_degraded_at", now_iso)
+
+    if count >= COOKIE_DEGRADE_ALERT_THRESHOLD and not state.get("alerted"):
+        reason = ("cookie 文件缺失或被改名 .stale"
+                  if not health.get("cookies_loaded")
+                  else f"authed 请求全被拒（本轮降级 {health.get('degrade_events', 0)} 次）")
+        text = (f"🍪 <b>X cookie 认证告警</b>：已连续 {count} 轮未取得 authed 访问（降级 guest）。\n"
+                f"原因：{reason}。\n"
+                f"多半是 Mac 端 refresh_x_cookies 断了（常见：系统更新重置完全磁盘访问）。\n"
+                f"排查：launchd <code>com.apple.x-cookie-refresh</code> + "
+                f"<code>/tmp/x-cookie-refresh.log</code>。")
+        if dry_run:
+            print(f"  DRY RUN cookie 降级告警: 连续 {count} 轮")
+        else:
+            try:
+                r = send_telegram(bot_token, chat_id, text)
+                print(f"  cookie 降级告警推送 {'OK' if r.get('ok') else 'FAIL'}")
+                # 告警宁重勿漏：assumed_delivered（疑似送达）不落定 alerted，下轮重发。
+                if r.get("ok") and not r.get("assumed_delivered"):
+                    state["alerted"] = True
+                    mid = (r.get("result") or {}).get("message_id")
+                    if mid:
+                        state["alert_msg_id"] = mid
+                        _tg_post_quiet(bot_token, {"chat_id": chat_id, "message_id": mid},
+                                       "pinChatMessage")
+            except Exception as e:
+                print(f"  cookie 降级告警推送异常: {e}")
+
+    save_cookie_health(state)
 
 
 def note_account_failure(failures: dict, username: str, error: str,
@@ -3033,8 +3122,12 @@ def main() -> int:
                 save_account_failures(failures)
             except OSError as e:
                 print(f"  保存账号失败状态失败（忽略）: {e}", file=sys.stderr)
-        # 状态看板只在完整 cron 轮更新（seed/test/单账号手动运行不算）
+        # cookie 认证看门狗 + 状态看板：都只在完整 cron 轮跑（seed/test/单账号手动不算）
         if not (args.dry_run or args.test or args.seed or args.user):
+            try:
+                check_cookie_health(bot_token, chat_id, args.dry_run)
+            except Exception as e:
+                print(f"  cookie 健康检查失败（忽略）: {e}", file=sys.stderr)
             try:
                 update_status_dashboard(bot_token, chat_id, accounts, failures,
                                         pushed=total_push, articles=article_count,
