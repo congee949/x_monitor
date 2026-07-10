@@ -1,15 +1,18 @@
 [
   {
     "username": "vista8",
-    "enabled": true
+    "enabled": true,
+    "topic": "ai_cn"
   },
   {
     "username": "Vida_BWE",
-    "enabled": true
+    "enabled": true,
+    "topic": "biz"
   },
   {
     "username": "dotey",
-    "enabled": true
+    "enabled": true,
+    "topic": "ai_cn"
   },
   {
     "username": "kepano",
@@ -25,7 +28,8 @@
   },
   {
     "username": "dontbesilent",
-    "enabled": true
+    "enabled": true,
+    "topic": "biz"
   },
   {
     "username": "karpathy",
@@ -33,7 +37,8 @@
   },
   {
     "username": "MacroMargin",
-    "enabled": true
+    "enabled": true,
+    "topic": "biz"
   },
   {
     "username": "ClaudeDevs",

@@ -235,3 +235,22 @@ Addressed the remaining eval items the user explicitly opted into.
 
 ### 测试
 - 180→184：--test 守卫、逐次预算门槛、macrumors html 熔断、卡片计数联动。本地与 bwg 3.9 双绿。
+
+## 2026-07-10 — 统一主题分流：F2 账号级话题路由 + 话题失效自愈 + 部署
+
+### Design Decisions
+- **解析链** `account.topic → telegram_topic_threads → 默认 telegram_twitter_thread_id(19)`：EN 账号不写 topic 字段，靠回退落「X·AI 前沿」（19 改名），新增账号默认同路——map 只维护例外（ai_cn=1145: vista8/dotey；biz=1146: dontbesilent/Vida_BWE/MacroMargin）。
+- **路由表整表并入 overlay**：`apply_route_overlay` 把路由表 `topics` 全量 merge 进 `cfg["telegram_topic_threads"]`（路由表键优先，config 同名键回落）——话题名跨 fleet 同名（ai_cn/biz），x_monitor 无需再造第二份映射事实源。config.json 里的 map 是表缺失时的回落副本。
+- **thread_map 建于 --user 过滤之前**：article 队列按文件遍历不受 --user 限制，子集轮里其他账号的文章也要解析到各自话题。
+- **话题失效自愈**：send_telegram(_rich) 的确定性 400 命中 "message thread not found" → `_swap_thread_on_not_found` 换 `_THREAD_FALLBACK_ID` 重试一次（无回退话题则落 General），事件轮末 `_alert_thread_fallback` 汇总一条 DM。占用既有 3 次重试预算之一；歧义（TgAmbiguousDelivery）不触发。send_telegram 里该检查置于 parse_mode 剥离**之前**，否则先剥格式重进死话题后直接 raise 进 push_retry 死循环。
+- **测试防宿主污染**：`MainContentRoutingTest._run_main` 必须 patch `ROUTE_TABLE_PATH` 到不存在路径——Mac/服务器都有真实路由表，overlay 会把真实群 id 覆进 fake config（部署当天就在本机复现 2 个失败）。
+
+### Deviations
+- **growth(497) 未并入商业·投资**：spec 原计划 497 改名复用；登 bwg 核实 pool.json 后发现 growth 是 JamesClear 式个人成长语录（782 条），非商业内容——另建「商业·投资」=1146，growth 保持独占 497。market_recap 路由表 17→1146。
+- 话题改名用 Bot API `editForumTopic`（bot 有 can_manage_topics，实测 19/41 直接改成功），未动用 telethon。
+
+### 部署与验证（2026-07-10）
+- 话题：新建 X·中文 AI=1145、商业·投资=1146；改名 19→X·AI 前沿、41→科技·资讯。
+- 路由表 +ai_cn/biz、market_recap→1146，sync 到 r4s/bwg 回读一致；chat-daily config.yaml 删美女鉴赏社/哀酱/Gary Playa 三频道、投机之路 topic:biz（10:24 实跑：被删频道不再抓取、biz sender 正确指向 1146、科技圈照常 41）。
+- bwg 解析链活体验证 13 账号 map 正确；端到端探针 send→thread 1145 送达后删除。
+- 测试 184→195（MainContentRoutingTest+2 / ResolveTopicThreadTest+2 / ThreadNotFoundFallbackTest+5 / ApplyRouteOverlayTest+2，含 overlay 整表合并断言）；本地与 bwg 3.9 双绿。**服务器跑测试要避开整/半点**：与在跑的 cron 轮竞态会闪现假失败（本次 ff 后首跑撞上 10:00 轮）。
