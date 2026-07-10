@@ -42,6 +42,35 @@ except ImportError:
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
 ACCOUNTS_PATH = os.path.join(SCRIPT_DIR, "twitter_accounts.json")
+
+ROUTE_TABLE_PATH = os.path.expanduser("~/qwenproxy/.tg-notify-targets.json")
+# config.json 的 telegram_*_thread_id / telegram_group_chat_id → 话题 key 映射。
+_ROUTE_THREAD_KEYS = {
+    "telegram_twitter_thread_id": "twitter",
+    "telegram_macrumors_thread_id": "macrumors",
+    "telegram_growth_thread_id": "growth",
+}
+
+
+def apply_route_overlay(cfg):
+    """把 fleet 统一路由表的群 chat 与话题 thread 覆盖到 cfg，让 config.json 里的
+    telegram_group_chat_id / telegram_*_thread_id 退居回落安全网、路由表成为事实源
+    （Spec: 统一路由表 2026-07-09）。表缺失/损坏时保持 cfg 原值不变。就地修改并返回 cfg。"""
+    try:
+        with open(ROUTE_TABLE_PATH) as f:
+            t = json.load(f)
+    except Exception as e:
+        print(f"[warn] 路由表读取失败，沿用 config.json: {type(e).__name__}: {e}", file=sys.stderr)
+        return cfg
+    gid = t.get("chat_id")
+    topics = t.get("topics") or {}
+    if gid:
+        cfg["telegram_group_chat_id"] = str(gid)
+    for cfg_key, topic_key in _ROUTE_THREAD_KEYS.items():
+        tid = topics.get(topic_key)
+        if tid:
+            cfg[cfg_key] = tid
+    return cfg
 TOKENS_PATH = os.path.join(SCRIPT_DIR, "twitter_tokens.json")
 AI_CONFIG_PATH = os.path.join(SCRIPT_DIR, "twitter_ai.json")
 SEEN_DIR = os.path.join(SCRIPT_DIR, "twitter_seen")
@@ -2618,6 +2647,7 @@ def main() -> int:
 
         with open(CONFIG_PATH) as f:
             cfg = json.load(f)
+        apply_route_overlay(cfg)  # 路由表优先，config.json 作回落
         bot_token = args.bot_token or cfg["telegram_bot_token"]
         chat_id = args.chat_id or cfg["telegram_chat_id"]
         # X 内容（推文+article 摘要）路由到通知群「X」话题；--chat-id 手动覆盖时

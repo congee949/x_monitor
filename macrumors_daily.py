@@ -490,6 +490,7 @@ def main() -> int:
     # 复用 twitter_monitor 的配置路径（项目真源），避免文件被改名后再次断裂
     with open(tm.CONFIG_PATH) as f:
         cfg = json.load(f)
+    tm.apply_route_overlay(cfg)  # 路由表优先，config.json 作回落
     token = cfg["telegram_bot_token"]
     # digest 路由到通知群的「资讯」话题（与 twitter_monitor 同群同套路）；未配置
     # telegram_group_chat_id 时回落到 telegram_chat_id（DM），行为不变。thread_id

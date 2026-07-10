@@ -2335,6 +2335,8 @@ class MainContentRoutingTest(unittest.TestCase):
         argv = ["twitter_monitor.py"] + (argv_extra or [])
         try:
             with patch.object(twitter_monitor, "CONFIG_PATH", str(config_path)), \
+                 patch.object(twitter_monitor, "ROUTE_TABLE_PATH",
+                              "test_route_table_absent.json"), \
                  patch.object(twitter_monitor, "FAILURES_PATH", str(failures_path)), \
                  patch.object(twitter_monitor, "update_status_dashboard", return_value=None), \
                  patch.object(twitter_monitor.TokenPool, "load", return_value=None), \
@@ -2374,6 +2376,38 @@ class MainContentRoutingTest(unittest.TestCase):
         self.assertEqual(captured["chat_id"], "debug-chat")
         self.assertEqual(captured["content_chat_id"], "debug-chat")
         self.assertIsNone(captured["content_thread_id"])
+
+
+class ApplyRouteOverlayTest(unittest.TestCase):
+    """apply_route_overlay：舰队路由表存在时覆盖群 chat 与话题 thread（config.json
+    退居回落）；表缺失/损坏时 cfg 原样返回，不抛异常。"""
+
+    def test_overlay_overrides_group_and_known_threads(self):
+        table = Path("test_route_table_overlay.json")
+        table.write_text(json.dumps({
+            "chat_id": -100999,
+            "topics": {"twitter": 42, "macrumors": 43, "growth": 44, "unrelated": 99},
+        }))
+        cfg = {"telegram_group_chat_id": "-100123", "telegram_twitter_thread_id": 19,
+               "telegram_chat_id": "dm-chat"}
+        try:
+            with patch.object(twitter_monitor, "ROUTE_TABLE_PATH", str(table)):
+                out = twitter_monitor.apply_route_overlay(cfg)
+        finally:
+            table.unlink(missing_ok=True)
+        self.assertIs(out, cfg)
+        self.assertEqual(cfg["telegram_group_chat_id"], "-100999")
+        self.assertEqual(cfg["telegram_twitter_thread_id"], 42)
+        self.assertEqual(cfg["telegram_macrumors_thread_id"], 43)
+        self.assertEqual(cfg["telegram_growth_thread_id"], 44)
+        self.assertEqual(cfg["telegram_chat_id"], "dm-chat")  # DM 不受路由表影响
+
+    def test_overlay_missing_table_keeps_cfg(self):
+        cfg = {"telegram_group_chat_id": "-100123", "telegram_twitter_thread_id": 19}
+        with patch.object(twitter_monitor, "ROUTE_TABLE_PATH",
+                          "test_route_table_absent.json"):
+            out = twitter_monitor.apply_route_overlay(dict(cfg))
+        self.assertEqual(out, cfg)
 
 
 class TgPostDeliveryClassificationTest(unittest.TestCase):
