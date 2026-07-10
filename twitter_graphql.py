@@ -375,6 +375,11 @@ def _build_media(raw_media: list) -> list:
                 best = max(mp4s, key=lambda v: v.get("bitrate") or 0)
                 item["video_url"] = best.get("url")
                 item["bitrate"] = best.get("bitrate")
+                # 全部 mp4 档（按 bitrate 降序）：外链嵌入有 20MB 上限，消费方
+                # 需要「能塞进上限的最大档」而不是恒选 best（bitrate 是峰值声明）。
+                item["variants"] = sorted(
+                    ({"url": v["url"], "bitrate": v.get("bitrate") or 0} for v in mp4s),
+                    key=lambda v: v["bitrate"], reverse=True)
         media.append(item)
     return media
 
@@ -393,6 +398,7 @@ def fetch_tweets(username, limit=20):
           "type": "photo"|"video"|"animated_gif",
           "url": str,           # photo or fallback
           "video_url": str|None,# best mp4 for video/gif
+          "variants": list,     # all mp4s [{url, bitrate}] sorted desc (video/gif only)
           "width", "height",
           "duration_ms", "bitrate"
         }
