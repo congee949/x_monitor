@@ -254,3 +254,18 @@ Addressed the remaining eval items the user explicitly opted into.
 - 路由表 +ai_cn/biz、market_recap→1146，sync 到 r4s/bwg 回读一致；chat-daily config.yaml 删美女鉴赏社/哀酱/Gary Playa 三频道、投机之路 topic:biz（10:24 实跑：被删频道不再抓取、biz sender 正确指向 1146、科技圈照常 41）。
 - bwg 解析链活体验证 13 账号 map 正确；端到端探针 send→thread 1145 送达后删除。
 - 测试 184→195（MainContentRoutingTest+2 / ResolveTopicThreadTest+2 / ThreadNotFoundFallbackTest+5 / ApplyRouteOverlayTest+2，含 overlay 整表合并断言）；本地与 bwg 3.9 双绿。**服务器跑测试要避开整/半点**：与在跑的 cron 轮竞态会闪现假失败（本次 ff 后首跑撞上 10:00 轮）。
+
+## 2026-07-10 — F1 跨账号去重（纯转发 + Article，config 键 cross_account_dedup）
+
+### Design Decisions
+- **抑制面收窄到纯转发**：canonical = `t:原推id`（仅 `retweeted_status.id` 存在时可被抑制）；原创/引用壳登记 `t:自身id`、引用**不穿透**被引原推（带评论=新内容，Grok/GLM 双评审点名的价值损失点）。article 用 `a:rest_id` 跨账号。
+- **索引 `twitter_seen/.pushed_index.json`**：TTL 14 天 + 4000 条容量 GC（45min 推送窗口已挡旧推，索引只防迟到 RT 波）；单进程内存缓存即同轮跨账号共享；IO 全旁路容错（OSError 只打日志）。
+- **写点与 seen checkpoint 同点位**（send-then-mark）：`elif not args.test` 块内 save_seen 之后——dry-run/--test/--seed 天然不写；失败/tombstone/guest 残缺轮不落库；崩溃窗口=他号最多重复 1 条（重复优于丢失）。
+- **抑制点在 push_retry 判断之前**：上轮失败进 retry 的 RT 若期间已由他号送达，本轮抑制而非重发；tid 已在 new_ids → 轮末进 seen，retry 孤儿走既有 `push_retry∩seen` 清理，零新增状态机。
+- **article 双闸**：save_article 入队闸（挡后来者）+ 队列取件二闸（挡同轮双账号已各自入队）；`skipped` 纳入终态 7 天清理。sent 即刻落盘点登记 `a:` 指纹。
+
+### Deviations
+- 计划拆「RT 提交 + article 提交」两个提交；实际共享索引模块导致切分要拆碎公共代码，合为单提交（整体可回滚：删 config 键全短路）。
+
+### 测试
+- 195→206（CrossAccountDedupTest ×11：抑制/首推登记/同轮双账号/quote 不穿透/原创不抑制/dry-run 与 --test 不写/默认关/TTL+容量 GC/article 双闸+skipped 终态）。

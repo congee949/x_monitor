@@ -3,7 +3,7 @@ import json
 import sys
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -2307,6 +2307,162 @@ class ContentRoutingTest(unittest.TestCase):
                  patch.object(twitter_monitor.time, "sleep", return_value=None):
                 twitter_monitor.process_article_queue(FakeAI(True), "bot", "chat", thread_id=19)
         self.assertEqual(captured["rich"], [19])
+
+
+class CrossAccountDedupTest(unittest.TestCase):
+    """跨账号去重（F1）：纯转发按原推 id 全局去重、引用/原创不抑制；
+    索引 send-then-mark、--test/dry-run 不写、TTL/容量 GC、article 双闸。"""
+
+    FRESH = "Tue May 12 00:20:00 +0000 2026"
+
+    def setUp(self):
+        self._patches = [
+            patch.object(twitter_monitor, "_CROSS_DEDUP_ENABLED", True),
+            patch.object(twitter_monitor, "_PUSHED_INDEX_CACHE", {}),
+        ]
+        for p in self._patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _args(self, **kw):
+        base = dict(test=False, seed=False, dry_run=False, limit=20,
+                    max_push_age_minutes=45, test_count=1)
+        base.update(kw)
+        return argparse.Namespace(**base)
+
+    def _rt(self, tid="rt1", orig="orig9"):
+        return {"id": tid, "createdAt": self.FRESH,
+                "text": "RT @o: 这是一条足够长的正常转发推文内容用于通过分类过滤器检查",
+                "retweeted_status": {"id": orig, "screen_name": "o"}}
+
+    def _run(self, tweet, username="u", args=None, seen=None):
+        pushed, saved_seen = [], {}
+
+        def fake_send_tweet(token, chat_id, username, t, ai=None, thread_id=None):
+            pushed.append(t["id"])
+            return {"ok": True}
+
+        def fake_save_seen(u, s, ts=None):
+            saved_seen["final"] = set(s)
+
+        with patch.object(twitter_monitor, "datetime", FixedDatetime), \
+             patch.object(twitter_monitor, "fetch_tweets", return_value=[tweet]), \
+             patch.object(twitter_monitor, "load_seen",
+                          return_value=(seen if seen is not None else {"warm"}, None)), \
+             patch.object(twitter_monitor, "save_seen", side_effect=fake_save_seen), \
+             patch.object(twitter_monitor, "save_pushed_index", lambda: None), \
+             patch.object(twitter_monitor, "send_tweet", side_effect=fake_send_tweet), \
+             patch.object(twitter_monitor.time, "sleep", return_value=None):
+            twitter_monitor.process_user(
+                pool=None, ai=FakeAI(False), username=username,
+                bot_token="b", chat_id="c", args=args or self._args())
+        return pushed, saved_seen.get("final", set())
+
+    def test_rt_suppressed_when_origin_in_index(self):
+        twitter_monitor._PUSHED_INDEX_CACHE["t:orig9"] = {"ts": "2026-05-12T00:00:00+00:00",
+                                                          "by": "other"}
+        pushed, final_seen = self._run(self._rt())
+        self.assertEqual(pushed, [])
+        self.assertIn("rt1", final_seen)  # 被抑制的壳 id 仍进 seen，下轮不复查
+
+    def test_first_rt_pushes_and_records_origin(self):
+        pushed, _ = self._run(self._rt())
+        self.assertEqual(pushed, ["rt1"])
+        self.assertEqual(
+            twitter_monitor._PUSHED_INDEX_CACHE.get("t:orig9", {}).get("by"), "u")
+
+    def test_same_run_two_accounts_rt_same_origin(self):
+        p1, _ = self._run(self._rt(tid="rt1"), username="u1")
+        p2, _ = self._run(self._rt(tid="rt2"), username="u2")
+        self.assertEqual(p1, ["rt1"])
+        self.assertEqual(p2, [])  # 内存缓存即同轮共享
+
+    def test_quote_not_suppressed_records_own_id(self):
+        twitter_monitor._PUSHED_INDEX_CACHE["t:orig9"] = {"ts": "2026-05-12T00:00:00+00:00",
+                                                          "by": "other"}
+        quote = {"id": "qt1", "createdAt": self.FRESH,
+                 "text": "带评论的引用是新内容不应该被跨账号去重抑制掉的完整推文",
+                 "quoted_status": {"id": "orig9", "screen_name": "o"}}
+        pushed, _ = self._run(quote)
+        self.assertEqual(pushed, ["qt1"])
+        self.assertEqual(
+            twitter_monitor._PUSHED_INDEX_CACHE.get("t:qt1", {}).get("by"), "u")
+        self.assertEqual(
+            twitter_monitor._PUSHED_INDEX_CACHE["t:orig9"]["by"], "other")  # 不穿透覆盖
+
+    def test_original_not_suppressed_even_if_in_index(self):
+        twitter_monitor._PUSHED_INDEX_CACHE["t:og1"] = {"ts": "2026-05-12T00:00:00+00:00",
+                                                        "by": "other"}
+        original = {"id": "og1", "createdAt": self.FRESH,
+                    "text": "原创推文即使原推 id 已在索引中也不该被抑制（只抑制纯转发）"}
+        pushed, _ = self._run(original)
+        self.assertEqual(pushed, ["og1"])
+
+    def test_dry_run_does_not_record(self):
+        self._run(self._rt(), args=self._args(dry_run=True))
+        self.assertNotIn("t:orig9", twitter_monitor._PUSHED_INDEX_CACHE)
+
+    def test_test_mode_pushes_but_does_not_record(self):
+        pushed, _ = self._run(self._rt(), args=self._args(test=True))
+        self.assertEqual(pushed, ["rt1"])  # --test 发调试目标
+        self.assertNotIn("t:orig9", twitter_monitor._PUSHED_INDEX_CACHE)  # 不写生产索引
+
+    def test_disabled_by_default_no_suppress(self):
+        with patch.object(twitter_monitor, "_CROSS_DEDUP_ENABLED", False):
+            twitter_monitor._PUSHED_INDEX_CACHE["t:orig9"] = {"ts": "x", "by": "other"}
+            pushed, _ = self._run(self._rt())
+        self.assertEqual(pushed, ["rt1"])
+
+    def test_index_ttl_gc_and_cap(self):
+        import os as _os
+        import tempfile
+        old = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+        fresh = datetime.now(timezone.utc).isoformat()
+        cache = {"t:old": {"ts": old, "by": "a"}}
+        for i in range(twitter_monitor.PUSHED_INDEX_MAX_ENTRIES + 5):
+            cache[f"t:{i}"] = {"ts": fresh, "by": "a"}
+        with tempfile.TemporaryDirectory() as d:
+            path = _os.path.join(d, "idx.json")
+            with patch.object(twitter_monitor, "PUSHED_INDEX_PATH", path), \
+                 patch.object(twitter_monitor, "_PUSHED_INDEX_CACHE", cache):
+                twitter_monitor.save_pushed_index()
+                saved = json.load(open(path))["entries"]
+        self.assertNotIn("t:old", saved)
+        self.assertLessEqual(len(saved), twitter_monitor.PUSHED_INDEX_MAX_ENTRIES)
+
+    def test_save_article_cross_dup_skips_enqueue(self):
+        import os as _os
+        import tempfile
+        twitter_monitor._PUSHED_INDEX_CACHE["a:art1"] = {"ts": "x", "by": "other"}
+        with tempfile.TemporaryDirectory() as d:
+            with patch.object(twitter_monitor, "ARTICLE_QUEUE_DIR", d):
+                twitter_monitor.save_article("u", "art1", {"id": "1", "text": "t"})
+                qpath = _os.path.join(d, "u_queue.json")
+                self.assertFalse(_os.path.exists(qpath))
+
+    def test_article_queue_second_gate_marks_skipped(self):
+        import json as _json
+        import os as _os
+        import tempfile
+        twitter_monitor._PUSHED_INDEX_CACHE["a:art1"] = {"ts": "x", "by": "other"}
+        entry = {"article_id": "art1", "tweet_id": "1", "author": "o",
+                 "status": "pending", "attempts": 0, "content": None}
+        with tempfile.TemporaryDirectory() as d:
+            qpath = _os.path.join(d, "u_queue.json")
+            with open(qpath, "w") as f:
+                _json.dump([entry], f)
+            with patch.object(twitter_monitor, "ARTICLE_QUEUE_DIR", d), \
+                 patch.object(twitter_monitor, "ARTICLE_CACHE_DIR",
+                              _os.path.join(d, "cache")):
+                twitter_monitor.process_article_queue(FakeAI(True), "bot", "chat")
+            saved = _json.load(open(qpath))[0]
+        self.assertEqual(saved["status"], "skipped")
+        self.assertEqual(saved["skip_reason"], "cross_dup")
+        # skipped 是终态，纳入 7 天保留期清理
+        expired = twitter_monitor._article_entry_expired(
+            {"status": "skipped",
+             "updated_at": (datetime.now(timezone.utc) - timedelta(days=8)).isoformat()})
+        self.assertTrue(expired)
 
 
 class MainContentRoutingTest(unittest.TestCase):

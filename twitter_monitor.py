@@ -82,6 +82,10 @@ def apply_route_overlay(cfg):
 TOKENS_PATH = os.path.join(SCRIPT_DIR, "twitter_tokens.json")
 AI_CONFIG_PATH = os.path.join(SCRIPT_DIR, "twitter_ai.json")
 SEEN_DIR = os.path.join(SCRIPT_DIR, "twitter_seen")
+# 跨账号去重索引（纯转发原推 id / article rest_id → 首推记录）
+PUSHED_INDEX_PATH = os.path.join(SEEN_DIR, ".pushed_index.json")
+PUSHED_INDEX_TTL_DAYS = 14      # 45min 推送窗口已挡旧推，索引只防迟到的 RT 波
+PUSHED_INDEX_MAX_ENTRIES = 4000
 # 歧义按已送达处理的发送痕迹（下一轮汇总 DM 核对后清除）
 ASSUMED_DELIVERY_PATH = os.path.join(SEEN_DIR, ".assumed_delivered.json")
 
@@ -193,6 +197,10 @@ def save_article(username: str, article_id: str, tweet: dict) -> None:
         except Exception:
             queue = []
     if any(a.get("article_id") == article_id for a in queue):
+        return
+    if _CROSS_DEDUP_ENABLED and ("a:" + str(article_id)) in load_pushed_index():
+        by = (load_pushed_index().get("a:" + str(article_id)) or {}).get("by")
+        print(f"    skip cross-dup article: {article_id}（已由 @{by} 推送摘要，不入队）")
         return
     # Store note_tweet text and article data from GraphQL
     note = tweet.get("note_tweet") or {}
@@ -1347,6 +1355,75 @@ def save_push_retry(username: str, retry: set[str]) -> None:
     _atomic_write(path, json.dumps(sorted(retry), ensure_ascii=False, indent=2))
 
 
+# ── 跨账号去重索引（纯转发 + Article；config 键 cross_account_dedup 开关）──
+_CROSS_DEDUP_ENABLED = False        # main 从 cfg 置位；默认关 = 行为与现状一致
+_PUSHED_INDEX_CACHE: "dict | None" = None   # 单进程内存缓存 = 同轮跨账号共享
+
+
+def load_pushed_index() -> dict:
+    """惰性读全局已推索引 {canonical_key: {ts, by}}；损坏/缺失回空（旁路容错）。"""
+    global _PUSHED_INDEX_CACHE
+    if _PUSHED_INDEX_CACHE is not None:
+        return _PUSHED_INDEX_CACHE
+    data: dict = {}
+    try:
+        with open(PUSHED_INDEX_PATH) as f:
+            raw = json.load(f)
+        entries = raw.get("entries")
+        if isinstance(entries, dict):
+            data = {str(k): v for k, v in entries.items() if isinstance(v, dict)}
+    except Exception:
+        data = {}
+    _PUSHED_INDEX_CACHE = data
+    return data
+
+
+def save_pushed_index() -> None:
+    """TTL + 容量 GC 后原子落盘。索引是旁路：任何失败都不该打断发送主线，
+    调用方需捕获 OSError 只打日志。"""
+    idx = load_pushed_index()
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=PUSHED_INDEX_TTL_DAYS)).isoformat()
+    for k in [k for k, v in idx.items() if str(v.get("ts") or "") < cutoff]:
+        del idx[k]
+    if len(idx) > PUSHED_INDEX_MAX_ENTRIES:
+        overflow = sorted(idx, key=lambda k: str(idx[k].get("ts") or ""))
+        for k in overflow[: len(idx) - PUSHED_INDEX_MAX_ENTRIES]:
+            del idx[k]
+    _atomic_write(PUSHED_INDEX_PATH,
+                  json.dumps({"version": 1, "entries": idx}, ensure_ascii=False, indent=1))
+
+
+def _canonical_key(t: dict) -> str:
+    """推文的跨账号规范 id：纯转发 → 原推 id；原创/引用壳 → 自身 id。
+    引用是新内容（带评论），只登记自身、不穿透到被引原推。"""
+    rt = t.get("retweeted_status") or {}
+    if rt.get("id"):
+        return "t:" + str(rt["id"])
+    return "t:" + str(t.get("id"))
+
+
+def _cross_dup_hit(t: dict) -> "dict | None":
+    """仅纯转发可被抑制：原推 canonical 已在索引中则返回命中条目，否则 None。"""
+    rt = t.get("retweeted_status") or {}
+    if not rt.get("id"):
+        return None
+    return load_pushed_index().get("t:" + str(rt["id"]))
+
+
+def _record_pushed(t: dict, username: str) -> None:
+    """送达 checkpoint 同点位登记 canonical（send-then-mark：崩溃窗口最多重复一条，
+    重复优于丢失；失败/tombstone/降级轮不会走到这里 → 残缺快照不落库）。"""
+    idx = load_pushed_index()
+    idx[_canonical_key(t)] = {"ts": datetime.now(timezone.utc).isoformat(), "by": username}
+    save_pushed_index()
+
+
+def _record_pushed_article(article_id: str, username: str) -> None:
+    idx = load_pushed_index()
+    idx["a:" + str(article_id)] = {"ts": datetime.now(timezone.utc).isoformat(), "by": username}
+    save_pushed_index()
+
+
 def _alert_seen_save_failure(bot_token: str, chat_id: str, username: str, error: Exception) -> None:
     """seen 写盘失败时发 TG 告警，避免推送已送达但状态未落盘时无人知晓。"""
     if not (bot_token and chat_id):
@@ -2297,6 +2374,15 @@ def process_user(
                 # （misattributed），形成「长推 + 摘要」两条消息（见 Issue 4）。
                 # tid 已加入 new_ids → 仍会被标记 seen，下轮不重复检测。
                 continue
+            if _CROSS_DEDUP_ENABLED:
+                hit = _cross_dup_hit(t)
+                if hit:
+                    # 跨账号去重：同一原推的纯转发只推首见一条。置于 push_retry
+                    # 判断之前——上轮失败进 retry 的 RT 若期间已由他号送达，本轮
+                    # 应抑制而非重发；tid 在 new_ids → 轮末进 seen，其 retry 孤儿
+                    # 由下轮 push_retry∩seen 清理兜走，零新增状态机。
+                    print(f"    skip cross-dup: {tid} ← 原推已由 @{hit.get('by')} 推送")
+                    continue
             if tid in push_retry:
                 # 上轮 TG 推送失败：绕过 push-age 窗口重试，避免超龄后静默标 seen 丢推。
                 to_push.append((t, "push_retry"))
@@ -2376,6 +2462,11 @@ def process_user(
                             save_push_retry(username, push_retry)
                     except OSError as e:
                         print(f"    checkpoint 落盘失败（忽略，末尾统一落盘）: {e}")
+                    if _CROSS_DEDUP_ENABLED:
+                        try:
+                            _record_pushed(t, username)
+                        except OSError as e:
+                            print(f"    pushed_index 落盘失败（忽略）: {e}")
                 time.sleep(1.2)
             except Exception as e:
                 print(f"    推送异常: {e}")
@@ -2426,7 +2517,7 @@ def _article_entry_expired(entry: dict, now: datetime | None = None) -> bool:
     没有可解析时间戳的条目一律保留（宁可不删）。
     """
     status = entry.get("status")
-    terminal = status == "sent" or (
+    terminal = status in ("sent", "skipped") or (
         status == "failed" and int(entry.get("attempts", 0)) >= ARTICLE_MAX_ATTEMPTS)
     if not terminal:
         return False
@@ -2531,6 +2622,17 @@ def process_article_queue(ai: AIClassifier, bot_token: str, chat_id: str, dry_ru
                 break
 
             aid = entry["article_id"]
+            if _CROSS_DEDUP_ENABLED and ("a:" + str(aid)) in load_pushed_index():
+                # 二闸：同轮两账号已各自入队（入队闸只能挡后来者）——他号先送达
+                # 后本队列同 article 直接终态 skipped，纳入 7 天清理。
+                by = (load_pushed_index().get("a:" + str(aid)) or {}).get("by")
+                entry["status"] = "skipped"
+                entry["skip_reason"] = "cross_dup"
+                entry["updated_at"] = datetime.now(timezone.utc).isoformat()
+                changed = True
+                _save_article_queue(queue_path, queue, dry_run)
+                print(f"  @{username}: article {aid} 跨账号去重（已由 @{by} 推送），跳过")
+                continue
             entry["status"] = "processing"
             entry["attempts"] = int(entry.get("attempts", 0)) + 1
             entry["updated_at"] = datetime.now(timezone.utc).isoformat()
@@ -2654,6 +2756,11 @@ def process_article_queue(ai: AIClassifier, bot_token: str, chat_id: str, dry_ru
                             _save_article_queue(queue_path, queue, dry_run)
                         except OSError as e:
                             print(f"    sent 状态即刻落盘失败（忽略，末尾统一落盘）: {e}")
+                        if _CROSS_DEDUP_ENABLED and not dry_run:
+                            try:
+                                _record_pushed_article(aid, username)
+                            except OSError as e:
+                                print(f"    pushed_index 落盘失败（忽略）: {e}")
                         delete_article_cache(entry)
                         _fmid = entry.pop("failure_msg_id", None)
                         if _fmid:
@@ -2733,7 +2840,7 @@ def main() -> int:
     try:
         # 每轮起止时间戳：日志此前无任何时间标记，无法事后审计运行时长/定位轮次
         run_started = time.monotonic()
-        global _ARTICLE_QUEUE_RUN_START, _THREAD_FALLBACK_ID
+        global _ARTICLE_QUEUE_RUN_START, _THREAD_FALLBACK_ID, _CROSS_DEDUP_ENABLED
         _ARTICLE_QUEUE_RUN_START = run_started
         print(f"\n==== monitor run {datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S %z')} ====")
 
@@ -2753,6 +2860,10 @@ def main() -> int:
         topic_threads = (cfg.get("telegram_topic_threads") or {}) if group_chat_id else {}
         # 话题失效自愈的回退目标（默认 X 话题）；无群组路由时无话题可回退
         _THREAD_FALLBACK_ID = content_thread_id
+        # 跨账号去重（纯转发 + Article）：config 键开关，默认关 = 行为与现状一致
+        _CROSS_DEDUP_ENABLED = bool(cfg.get("cross_account_dedup"))
+        if _CROSS_DEDUP_ENABLED:
+            print("  跨账号去重已启用（纯转发 + Article）")
 
         # Load token pool for 6551.io fallback (optional if GraphQL works)
         try:
