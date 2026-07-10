@@ -70,6 +70,14 @@ def apply_route_overlay(cfg):
         tid = topics.get(topic_key)
         if tid:
             cfg[cfg_key] = tid
+    # 话题名→thread 整表映射（账号级主题路由 topic 字段用）：路由表键优先，
+    # config.json 的 telegram_topic_threads 同名键退居回落。
+    merged = dict(cfg.get("telegram_topic_threads") or {})
+    for name, tid in topics.items():
+        if tid:
+            merged[name] = tid
+    if merged:
+        cfg["telegram_topic_threads"] = merged
     return cfg
 TOKENS_PATH = os.path.join(SCRIPT_DIR, "twitter_tokens.json")
 AI_CONFIG_PATH = os.path.join(SCRIPT_DIR, "twitter_ai.json")
@@ -1068,6 +1076,28 @@ def load_accounts() -> list[dict]:
     with open(ACCOUNTS_PATH) as f:
         accounts = json.load(f)
     return [a for a in accounts if a.get("enabled", True)]
+
+
+# 未知 topic 每轮只告警一次（进程即轮次，无需跨轮持久化）
+_UNKNOWN_TOPIC_WARNED: set = set()
+
+
+def _resolve_topic_thread(account: dict, topic_threads: dict,
+                          default_thread_id: "int | None") -> "int | None":
+    """账号级主题路由：account["topic"] → topic_threads[topic] → 默认 thread。
+
+    未配置 topic 的账号（含未来新增账号）落默认话题；topic 配了但映射表里
+    没有（话题被删/拼写错/路由表未同步）时回退默认并告警一次，绝不静默丢。"""
+    topic = (account.get("topic") or "").strip()
+    if not topic:
+        return default_thread_id
+    tid = (topic_threads or {}).get(topic)
+    if tid:
+        return tid
+    if topic not in _UNKNOWN_TOPIC_WARNED:
+        _UNKNOWN_TOPIC_WARNED.add(topic)
+        print(f"  ⚠️ WARN: 未知 topic '{topic}'（@{account.get('username')}），回退默认 thread")
+    return default_thread_id
 
 
 # ── 过滤规则 ───────────────────────────────────────
@@ -2391,11 +2421,13 @@ def _article_queue_time_remaining() -> float:
 
 
 def process_article_queue(ai: AIClassifier, bot_token: str, chat_id: str, dry_run: bool = False,
-                          *, thread_id: "int | None" = None) -> int:
+                          *, thread_id: "int | None" = None,
+                          thread_map: "dict | None" = None) -> int:
     """处理 Article 队列：抓 Markdown、AI 摘要、推送，成功后删除缓存。
 
     chat_id 在 main() 已解析为 content 目标（配置了群组则为群组，否则回落 DM）；
     本函数发的都是文章相关内容（含失败通知），不区分 alert，全部带 thread_id。
+    thread_map（监控账号→thread）存在时按队列文件对应账号解析话题，缺席回落 thread_id。
     """
     if not os.path.exists(ARTICLE_QUEUE_DIR):
         print("No article queue directory")
@@ -2414,6 +2446,7 @@ def process_article_queue(ai: AIClassifier, bot_token: str, chat_id: str, dry_ru
             continue
 
         username = fname.replace("_queue.json", "")
+        file_thread = (thread_map or {}).get(username, thread_id)
         before = len(queue)
         queue = [a for a in queue if not _article_entry_expired(a)]
         changed = len(queue) != before
@@ -2456,7 +2489,7 @@ def process_article_queue(ai: AIClassifier, bot_token: str, chat_id: str, dry_ru
                     print(f"    DRY RUN failure notice: {err}")
                 else:
                     try:
-                        r = send_telegram(bot_token, chat_id, msg, link, thread_id=thread_id)
+                        r = send_telegram(bot_token, chat_id, msg, link, thread_id=file_thread)
                         print(f"    Failure notice push {'OK' if r.get('ok') else 'FAIL'}")
                         _mid = (r.get("result") or {}).get("message_id")
                         if _mid:
@@ -2484,7 +2517,7 @@ def process_article_queue(ai: AIClassifier, bot_token: str, chat_id: str, dry_ru
                     print(f"    DRY RUN summary failure notice: {err}")
                 else:
                     try:
-                        r = send_telegram(bot_token, chat_id, msg, link, thread_id=thread_id)
+                        r = send_telegram(bot_token, chat_id, msg, link, thread_id=file_thread)
                         print(f"    Failure notice push {'OK' if r.get('ok') else 'FAIL'}")
                         _mid = (r.get("result") or {}).get("message_id")
                         if _mid:
@@ -2518,7 +2551,7 @@ def process_article_queue(ai: AIClassifier, bot_token: str, chat_id: str, dry_ru
                     # 优先 sendRichMessage（单条 32k、原生渲染 Markdown）；
                     # 被拒/未开放/超长时回退旧的 HTML 分块多条路径。
                     if len(rich_md) <= RICH_MESSAGE_MAX_CHARS:
-                        r = send_telegram_rich(bot_token, chat_id, rich_md, article_link, thread_id=thread_id)
+                        r = send_telegram_rich(bot_token, chat_id, rich_md, article_link, thread_id=file_thread)
                         last_resp = r
                         ok = r.get("ok", False)
                         if not ok and img_urls and r.get("rich_fallback"):
@@ -2527,7 +2560,7 @@ def process_article_queue(ai: AIClassifier, bot_token: str, chat_id: str, dry_ru
                             r = send_telegram_rich(
                                 bot_token, chat_id,
                                 format_article_summary_rich(username, entry, summary),
-                                article_link, thread_id=thread_id)
+                                article_link, thread_id=file_thread)
                             last_resp = r
                             ok = r.get("ok", False)
                         if ok:
@@ -2542,7 +2575,7 @@ def process_article_queue(ai: AIClassifier, bot_token: str, chat_id: str, dry_ru
                         if not messages:
                             last_resp = {"ok": False, "description": "empty_rendered_summary"}
                         for idx, part in enumerate(messages, 1):
-                            r = send_telegram(bot_token, chat_id, part, article_link, thread_id=thread_id)
+                            r = send_telegram(bot_token, chat_id, part, article_link, thread_id=file_thread)
                             last_resp = r
                             part_ok = r.get("ok", False)
                             print(f"    Article summary part {idx}/{len(messages)} push {'OK' if part_ok else 'FAIL'}")
@@ -2656,6 +2689,9 @@ def main() -> int:
         group_chat_id = None if args.chat_id else cfg.get("telegram_group_chat_id")
         content_chat_id = group_chat_id or chat_id
         content_thread_id = cfg.get("telegram_twitter_thread_id") if group_chat_id else None
+        # 账号级主题路由映射（accounts.json 的 topic 字段 → 话题 thread）；
+        # --chat-id 覆盖时随群组路由一起让位（全部落覆盖目标、无 thread）。
+        topic_threads = (cfg.get("telegram_topic_threads") or {}) if group_chat_id else {}
 
         # Load token pool for 6551.io fallback (optional if GraphQL works)
         try:
@@ -2669,6 +2705,12 @@ def main() -> int:
         ai = AIClassifier.load()
 
         accounts = load_accounts()
+        # thread 映射建于 --user 过滤之前：article 队列按文件遍历、不受 --user 限制，
+        # 子集轮里其他账号的文章也要能解析到各自话题。
+        account_thread_map = {
+            a["username"]: _resolve_topic_thread(a, topic_threads, content_thread_id)
+            for a in accounts
+        }
         if args.user:
             accounts = [a for a in accounts if a["username"] == args.user]
             if not accounts:
@@ -2708,7 +2750,8 @@ def main() -> int:
                 new, pushed, filtered, ai_ov = process_user(
                     pool=pool, ai=ai, username=username,
                     bot_token=bot_token, chat_id=chat_id, args=args,
-                    content_chat_id=content_chat_id, content_thread_id=content_thread_id,
+                    content_chat_id=content_chat_id,
+                    content_thread_id=account_thread_map.get(username, content_thread_id),
                 )
             except TokenExhausted as e:
                 print(f"  @{username}: {e}", file=sys.stderr)
@@ -2730,7 +2773,8 @@ def main() -> int:
         article_count = 0
         try:
             article_count = process_article_queue(ai, bot_token, content_chat_id, args.dry_run,
-                                                  thread_id=content_thread_id)
+                                                  thread_id=content_thread_id,
+                                                  thread_map=account_thread_map)
             if article_count:
                 print(f"  Articles processed: {article_count}")
         except Exception as e:

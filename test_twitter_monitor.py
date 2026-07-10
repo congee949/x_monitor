@@ -2313,8 +2313,8 @@ class MainContentRoutingTest(unittest.TestCase):
     """main()：telegram_group_chat_id/telegram_twitter_thread_id 解析为 content 路由目标；
     --chat-id 手动覆盖时整体让位（content_thread_id 同时清空）。"""
 
-    def _run_main(self, config_extra="", argv_extra=None):
-        captured = {}
+    def _run_main(self, config_extra="", argv_extra=None, accounts=None):
+        captured = {"threads": {}}
         config_path = Path("test_config_routing.json")
         config_path.write_text(
             '{"telegram_bot_token": "bot", "telegram_chat_id": "dm-chat"' + config_extra + '}')
@@ -2325,11 +2325,14 @@ class MainContentRoutingTest(unittest.TestCase):
             captured["chat_id"] = chat_id
             captured["content_chat_id"] = content_chat_id
             captured["content_thread_id"] = content_thread_id
+            captured["threads"][username] = content_thread_id
             return 1, 1, 0, 0
 
-        def fake_process_article_queue(ai, bot_token, chat_id, dry_run=False, *, thread_id=None):
+        def fake_process_article_queue(ai, bot_token, chat_id, dry_run=False, *,
+                                       thread_id=None, thread_map=None):
             captured["article_chat_id"] = chat_id
             captured["article_thread_id"] = thread_id
+            captured["article_thread_map"] = thread_map
             return 0
 
         argv = ["twitter_monitor.py"] + (argv_extra or [])
@@ -2341,7 +2344,8 @@ class MainContentRoutingTest(unittest.TestCase):
                  patch.object(twitter_monitor, "update_status_dashboard", return_value=None), \
                  patch.object(twitter_monitor.TokenPool, "load", return_value=None), \
                  patch.object(twitter_monitor.AIClassifier, "load", return_value=FakeAI(False)), \
-                 patch.object(twitter_monitor, "load_accounts", return_value=[{"username": "u"}]), \
+                 patch.object(twitter_monitor, "load_accounts",
+                              return_value=accounts or [{"username": "u"}]), \
                  patch.object(twitter_monitor, "process_user", side_effect=fake_process_user), \
                  patch.object(twitter_monitor, "process_article_queue",
                               side_effect=fake_process_article_queue), \
@@ -2377,6 +2381,58 @@ class MainContentRoutingTest(unittest.TestCase):
         self.assertEqual(captured["content_chat_id"], "debug-chat")
         self.assertIsNone(captured["content_thread_id"])
 
+    def test_topic_field_routes_accounts_to_mapped_threads(self):
+        twitter_monitor._UNKNOWN_TOPIC_WARNED.clear()
+        captured = self._run_main(
+            config_extra=(', "telegram_group_chat_id": "-100123", "telegram_twitter_thread_id": 19'
+                          ', "telegram_topic_threads": {"biz": 497}'),
+            accounts=[{"username": "u"},
+                      {"username": "v", "topic": "biz"},
+                      {"username": "w", "topic": "nope"}])
+        # 无 topic → 默认 19；命中 map → 497；未知 topic → 回退 19（不丢）
+        self.assertEqual(captured["threads"], {"u": 19, "v": 497, "w": 19})
+        # article 队列拿到同一份全量映射（不受 --user 影响的解析源）
+        self.assertEqual(captured["article_thread_map"], {"u": 19, "v": 497, "w": 19})
+        self.assertEqual(captured["article_thread_id"], 19)
+
+    def test_chat_id_override_neutralizes_topic_map(self):
+        twitter_monitor._UNKNOWN_TOPIC_WARNED.clear()
+        captured = self._run_main(
+            config_extra=(', "telegram_group_chat_id": "-100123", "telegram_twitter_thread_id": 19'
+                          ', "telegram_topic_threads": {"biz": 497}'),
+            argv_extra=["--chat-id", "debug-chat"],
+            accounts=[{"username": "v", "topic": "biz"}])
+        # --chat-id 覆盖：topic map 随群组路由整体让位，thread 全空
+        self.assertEqual(captured["threads"], {"v": None})
+        self.assertEqual(captured["article_thread_map"], {"v": None})
+
+
+class ResolveTopicThreadTest(unittest.TestCase):
+    """_resolve_topic_thread：topic→map→默认 的解析优先级与未知 topic 告警一次。"""
+
+    def setUp(self):
+        twitter_monitor._UNKNOWN_TOPIC_WARNED.clear()
+
+    def test_priority_and_fallback(self):
+        m = {"biz": 497}
+        self.assertEqual(
+            twitter_monitor._resolve_topic_thread({"username": "a", "topic": "biz"}, m, 19), 497)
+        self.assertEqual(
+            twitter_monitor._resolve_topic_thread({"username": "b"}, m, 19), 19)
+        self.assertEqual(
+            twitter_monitor._resolve_topic_thread({"username": "c", "topic": "  "}, m, 19), 19)
+        self.assertEqual(
+            twitter_monitor._resolve_topic_thread({"username": "d", "topic": "nope"}, m, 19), 19)
+
+    def test_unknown_topic_warns_once(self):
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            twitter_monitor._resolve_topic_thread({"username": "a", "topic": "nope"}, {}, 19)
+            twitter_monitor._resolve_topic_thread({"username": "b", "topic": "nope"}, {}, 19)
+        self.assertEqual(buf.getvalue().count("未知 topic"), 1)
+
 
 class ApplyRouteOverlayTest(unittest.TestCase):
     """apply_route_overlay：舰队路由表存在时覆盖群 chat 与话题 thread（config.json
@@ -2389,7 +2445,8 @@ class ApplyRouteOverlayTest(unittest.TestCase):
             "topics": {"twitter": 42, "macrumors": 43, "growth": 44, "unrelated": 99},
         }))
         cfg = {"telegram_group_chat_id": "-100123", "telegram_twitter_thread_id": 19,
-               "telegram_chat_id": "dm-chat"}
+               "telegram_chat_id": "dm-chat",
+               "telegram_topic_threads": {"twitter": 1, "cfg_only": 7}}
         try:
             with patch.object(twitter_monitor, "ROUTE_TABLE_PATH", str(table)):
                 out = twitter_monitor.apply_route_overlay(cfg)
@@ -2401,6 +2458,10 @@ class ApplyRouteOverlayTest(unittest.TestCase):
         self.assertEqual(cfg["telegram_macrumors_thread_id"], 43)
         self.assertEqual(cfg["telegram_growth_thread_id"], 44)
         self.assertEqual(cfg["telegram_chat_id"], "dm-chat")  # DM 不受路由表影响
+        # 话题整表合并：路由表键覆盖 config 同名键，config 独有键保留
+        self.assertEqual(cfg["telegram_topic_threads"],
+                         {"twitter": 42, "macrumors": 43, "growth": 44,
+                          "unrelated": 99, "cfg_only": 7})
 
     def test_overlay_missing_table_keeps_cfg(self):
         cfg = {"telegram_group_chat_id": "-100123", "telegram_twitter_thread_id": 19}
