@@ -1,5 +1,13 @@
 [
   {
+    "username": "ClaudeDevs",
+    "enabled": true
+  },
+  {
+    "username": "OpenAIDevs",
+    "enabled": true
+  },
+  {
     "username": "vista8",
     "enabled": true,
     "topic": "ai_cn"
@@ -39,14 +47,6 @@
     "username": "MacroMargin",
     "enabled": true,
     "topic": "biz"
-  },
-  {
-    "username": "ClaudeDevs",
-    "enabled": true
-  },
-  {
-    "username": "OpenAIDevs",
-    "enabled": true
   },
   {
     "username": "bcherny",
