@@ -31,10 +31,6 @@
     "enabled": true
   },
   {
-    "username": "aborninblood",
-    "enabled": false
-  },
-  {
     "username": "dontbesilent",
     "enabled": true,
     "topic": "biz"
