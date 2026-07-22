@@ -280,3 +280,28 @@ Addressed the remaining eval items the user explicitly opted into.
 
 ### 测试
 - 206→216（RichVideoEmbedTest ×10：开关开时嵌 video/HEAD 选档/估算回退/全超限回封面/gif/混排 collage/剥视频重试不落 HTML/两级拒后落 HTML/歧义恰一发/默认关封面行为）。
+
+## 2026-07-22 — 碎碎念（musing）过滤，全账号
+
+### Context
+- 触发样例：`@vista8`「把pocket3充满电，准备去钓鱼。」+ Photo 被推到 TG（`📢 @vista8`）。
+- 既有 `classify()` 只挡过短/推广 hashtag/联盟链/商业词/纯链壳；18 字生活状态全过。
+
+### Design Decisions
+- **规则优先 + AI 复核**，与推广过滤同构：`classify` 标 `suspicious`，`process_user` 按 reason 前缀分流。
+  - `commercial*` / `self_disclose*` → 既有 `confirm_promo`
+  - `musing*` → 新 `confirm_musing`
+- **不新增 status 枚举**，用 `REASON_MUSING_PREFIX = "musing"` 字符串协议，少改 `process_user` 分支面。
+- **启发式（零 API）**：`musing_short_photo`（有图且 body≤40）/ `musing_life_kw`（生活词）/ `musing_status_photo`（有图+状态句式且 body<60）；实质信号（非媒体 URL / 技术词 / 长 note≥120 / article）短路不做 musing。
+- **AI**：`MUSING_SYSTEM_PROMPT` + `AIBackend.classify_musing` / `AIClassifier.confirm_musing`；`_parse_result` 泛化为 `flag_key`（`promo`/`musing`）。
+- **全账号生效**，不改 `twitter_accounts.json`；阈值/词表先做模块常量。
+
+### Tradeoffs
+- **无 AI 时 musing fail-closed（filter），promo fail-open（放行）**：兴趣门控优先安静；商业讨论避免无 AI 时误杀。注释与测试对照写死。
+- **AI 全失败同样 filter**（与 promo P0-4 一致）。
+- `MUSING_SHORT_MAX=40`：覆盖样例 18 字及稍长状态句；过宽靠 AI 复核/实质信号兜。
+- 首版不做视觉看图判碎碎念（成本高；媒体类型+正文足够）。
+
+### 测试
+- 216→234（MusingClassifyTest ×9 + MusingProcessUserTest ×5 + confirm_musing fail-closed + FakeAI 补 confirm_*）。
+- 本地 3.14 全绿。部署 bwg 后观察 log 中 `musing_*` / `ai:` 过滤原因。

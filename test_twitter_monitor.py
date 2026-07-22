@@ -18,15 +18,26 @@ class FixedDatetime(datetime):
 
 
 class FakeAI:
-    def __init__(self, available=False, summary=None):
+    def __init__(self, available=False, summary=None, *,
+                 promo=False, musing=False, promo_reason="ok", musing_reason="ok"):
         self.available = available
         self.summary = summary
+        self.promo = promo
+        self.musing = musing
+        self.promo_reason = promo_reason
+        self.musing_reason = musing_reason
 
     def is_available(self):
         return self.available
 
     def complete(self, prompt, max_tokens=1200, temperature=0.2):
         return self.summary, "fake"
+
+    def confirm_promo(self, username, text):
+        return self.promo, f"fake:{self.promo_reason}"
+
+    def confirm_musing(self, username, text):
+        return self.musing, f"fake:{self.musing_reason}"
 
 
 class BacklogGuardTest(unittest.TestCase):
@@ -2129,12 +2140,22 @@ class AIFailClosedTest(unittest.TestCase):
         def classify(self, username: str, text: str):
             raise RuntimeError("api down")
 
+        def classify_musing(self, username: str, text: str):
+            raise RuntimeError("api down")
+
     def test_confirm_promo_all_failed_returns_fail_closed(self):
         ai = twitter_monitor.AIClassifier([self.FailingBackend()])
         self.assertEqual(ai.confirm_promo("u", "text"), (False, "all_ai_failed"))
 
         empty_ai = twitter_monitor.AIClassifier([])
         self.assertEqual(empty_ai.confirm_promo("u", "text"), (False, "all_ai_failed"))
+
+    def test_confirm_musing_all_failed_returns_fail_closed(self):
+        ai = twitter_monitor.AIClassifier([self.FailingBackend()])
+        self.assertEqual(ai.confirm_musing("u", "text"), (False, "all_ai_failed"))
+
+        empty_ai = twitter_monitor.AIClassifier([])
+        self.assertEqual(empty_ai.confirm_musing("u", "text"), (False, "all_ai_failed"))
 
     def test_process_user_suspicious_all_ai_failed_goes_to_filtered(self):
         args = argparse.Namespace(test=False, seed=False, dry_run=False,
@@ -2166,6 +2187,162 @@ class AIFailClosedTest(unittest.TestCase):
         self.assertEqual(filt, 1)
         self.assertEqual(ov, 0)
         self.assertEqual(pushed_ids, [])
+
+
+class MusingClassifyTest(unittest.TestCase):
+    """碎碎念规则层：classify 启发式 + 不误伤实质内容。"""
+
+    def test_pocket3_fishing_sample_is_musing_suspicious(self):
+        t = {
+            "text": "把pocket3充满电，准备去钓鱼。",
+            "media": [{"type": "photo", "url": "https://pbs.twimg.com/media/x.jpg"}],
+        }
+        status, reason = twitter_monitor.classify(t)
+        self.assertEqual(status, "suspicious")
+        self.assertTrue(
+            reason.startswith(twitter_monitor.REASON_MUSING_PREFIX),
+            msg=reason,
+        )
+
+    def test_short_photo_status_is_musing(self):
+        t = {
+            # ≥ MIN_LEN=18，否则会先被 too_short 硬过滤
+            "text": "今天天气真的不错呀，出门去晒太阳了。",
+            "media": [{"type": "photo", "url": "https://pbs.twimg.com/media/x.jpg"}],
+        }
+        status, reason = twitter_monitor.classify(t)
+        self.assertEqual(status, "suspicious")
+        self.assertTrue(reason.startswith(twitter_monitor.REASON_MUSING_PREFIX), msg=reason)
+
+    def test_life_kw_without_photo_is_musing(self):
+        t = {"text": "周末宅家追剧，什么都不想干就这样过。"}
+        status, reason = twitter_monitor.classify(t)
+        self.assertEqual(status, "suspicious")
+        self.assertIn("musing_life_kw", reason)
+
+    def test_technical_post_still_passes(self):
+        t = {"text": "Claude 新 API 支持 prompt caching，延迟降一半。"}
+        status, reason = twitter_monitor.classify(t)
+        self.assertEqual((status, reason), ("pass", "ok"))
+
+    def test_substantive_keyword_blocks_musing(self):
+        # 含生活词「充电」但有实质信号「模型/评测」
+        t = {
+            "text": "把手机充满电后继续跑本地模型评测，结果很意外。",
+            "media": [{"type": "photo", "url": "https://pbs.twimg.com/media/x.jpg"}],
+        }
+        status, reason = twitter_monitor.classify(t)
+        self.assertEqual((status, reason), ("pass", "ok"))
+
+    def test_non_media_url_blocks_musing(self):
+        t = {
+            "text": "出门钓鱼前看这篇 https://example.com/guide 讲得不错。",
+            "media": [{"type": "photo", "url": "https://pbs.twimg.com/media/x.jpg"}],
+            "entities": {
+                "urls": [{"url": "https://t.co/abc", "expanded_url": "https://example.com/guide"}],
+            },
+        }
+        status, reason = twitter_monitor.classify(t)
+        self.assertEqual((status, reason), ("pass", "ok"))
+
+    def test_too_short_still_hard_filter(self):
+        status, reason = twitter_monitor.classify({"text": "短"})
+        self.assertEqual(status, "filter")
+        self.assertTrue(reason.startswith("too_short"), msg=reason)
+
+    def test_long_note_tweet_not_musing(self):
+        t = {
+            "text": "把pocket3充满电，准备去钓鱼。",  # 壳短，但 note 很长
+            "note_tweet": {"text": "关于 AI agent 工作流的一些观察：" + ("细节" * 80)},
+            "media": [{"type": "photo", "url": "https://pbs.twimg.com/media/x.jpg"}],
+        }
+        status, reason = twitter_monitor.classify(t)
+        self.assertEqual((status, reason), ("pass", "ok"))
+
+    def test_commercial_still_suspicious_not_musing(self):
+        t = {
+            "text": "byteplus seedance 2.0 api 文档访问体验开通模型冲 200 立即体验方舟平台",
+        }
+        status, reason = twitter_monitor.classify(t)
+        self.assertEqual(status, "suspicious")
+        self.assertTrue(reason.startswith("commercial"), msg=reason)
+
+
+class MusingProcessUserTest(unittest.TestCase):
+    """碎碎念 process_user：AI 确认/否决/失败/无 AI 默认 filter。"""
+
+    SAMPLE = {
+        "id": "m1",
+        "text": "把pocket3充满电，准备去钓鱼。",
+        "media": [{"type": "photo", "url": "https://pbs.twimg.com/media/x.jpg"}],
+        "createdAt": "Tue May 12 00:20:00 +0000 2026",
+    }
+
+    def _run(self, ai, tweet=None):
+        args = argparse.Namespace(test=False, seed=False, dry_run=False,
+                                  limit=20, max_push_age_minutes=45)
+        pushed_ids = []
+
+        def fake_send_tweet(token, chat_id, username, t, ai=None, thread_id=None):
+            pushed_ids.append(t["id"])
+            return {"ok": True}
+
+        with patch.object(twitter_monitor, "datetime", FixedDatetime), \
+             patch.object(twitter_monitor, "fetch_tweets",
+                          return_value=[tweet or self.SAMPLE]), \
+             patch.object(twitter_monitor, "load_seen", return_value=({"old"}, None)), \
+             patch.object(twitter_monitor, "save_seen", return_value=None), \
+             patch.object(twitter_monitor, "send_tweet", side_effect=fake_send_tweet), \
+             patch.object(twitter_monitor, "_alert_ai_all_failed", return_value=None), \
+             patch.object(twitter_monitor.time, "sleep", return_value=None):
+            new, pushed, filt, ov = twitter_monitor.process_user(
+                pool=None, ai=ai, username="vista8",
+                bot_token="b", chat_id="c", args=args)
+        return new, pushed, filt, ov, pushed_ids
+
+    def test_ai_confirms_musing_filters(self):
+        new, pushed, filt, ov, ids = self._run(FakeAI(True, musing=True, musing_reason="life"))
+        self.assertEqual((new, pushed, filt, ov), (1, 0, 1, 0))
+        self.assertEqual(ids, [])
+
+    def test_ai_rejects_musing_pushes(self):
+        new, pushed, filt, ov, ids = self._run(
+            FakeAI(True, musing=False, musing_reason="has_insight"))
+        self.assertEqual((new, pushed, filt), (1, 1, 0))
+        self.assertEqual(ov, 1)
+        self.assertEqual(ids, ["m1"])
+
+    def test_no_ai_filters_musing_by_default(self):
+        # 与 promo 无 AI 放行不对称：musing 无 AI → filter
+        new, pushed, filt, ov, ids = self._run(FakeAI(False))
+        self.assertEqual((new, pushed, filt, ov), (1, 0, 1, 0))
+        self.assertEqual(ids, [])
+
+    def test_ai_all_failed_filters_musing(self):
+        class FailAI:
+            def is_available(self):
+                return True
+
+            def confirm_musing(self, username, text):
+                return False, "all_ai_failed"
+
+            def confirm_promo(self, username, text):
+                return False, "all_ai_failed"
+
+        new, pushed, filt, ov, ids = self._run(FailAI())
+        self.assertEqual((new, pushed, filt, ov), (1, 0, 1, 0))
+        self.assertEqual(ids, [])
+
+    def test_promo_no_ai_still_passes(self):
+        # 对照：promo suspicious 无 AI 仍放行（既有行为）
+        promo = {
+            "id": "p1",
+            "text": "byteplus seedance 2.0 api 文档访问体验开通模型冲 200 立即体验方舟平台",
+            "createdAt": "Tue May 12 00:20:00 +0000 2026",
+        }
+        new, pushed, filt, ov, ids = self._run(FakeAI(False), tweet=promo)
+        self.assertEqual((new, pushed, filt), (1, 1, 0))
+        self.assertEqual(ids, ["p1"])
 
 
 class LoadSeenCorruptedTest(unittest.TestCase):
