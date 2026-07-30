@@ -280,3 +280,20 @@ Addressed the remaining eval items the user explicitly opted into.
 
 ### 测试
 - 206→216（RichVideoEmbedTest ×10：开关开时嵌 video/HEAD 选档/估算回退/全超限回封面/gif/混排 collage/剥视频重试不落 HTML/两级拒后落 HTML/歧义恰一发/默认关封面行为）。
+
+## 2026-07-25 — strip_ansi on failure paths
+
+- Symptom class: colored CLI stderr (ANSI SGR, e.g. `ESC[1m`/`ESC[22m`) can leak into Telegram failure reasons if an external article-fetch command prints color.
+- Production logs/TG had no live hits; added defense-in-depth:
+  - `strip_ansi()` helper (CSI sequences)
+  - applied in `fetch_article_markdown` failure packaging, `format_article_failure_message` reason, `note_account_failure` stored `last_error`
+- Tests: `StripAnsiTest` (6 cases). Deployed to BWG `/root/x_monitor`.
+
+## 2026-07-29 — X GraphQL 文本 HTML 实体归一化
+
+### Design Decisions
+- 在 X GraphQL 数据边界仅解码一次正文、长推、转推与文章展示文本；Telegram 渲染层继续负责一次安全 HTML 转义。
+- 不递归解码，也不处理 URL 或本程序生成的 markup。
+
+### Verification
+- 新增回归测试：-&gt; 不再变为 &amp;gt;；实体解码不削弱 script 内容的 Telegram HTML 转义。

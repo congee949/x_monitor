@@ -1,16 +1,37 @@
 [
   {
     "username": "ClaudeDevs",
-    "enabled": true
+    "enabled": true,
+    "user_id": "2024518793679294464",
+    "push_policy": "claude_dev_original"
   },
   {
     "username": "OpenAIDevs",
-    "enabled": true
+    "enabled": true,
+    "user_id": "1633874951508721686",
+    "push_policy": "openai_dev_original"
+  },
+  {
+    "username": "claudeai",
+    "enabled": true,
+    "user_id": "1943306828697550848",
+    "push_policy": "claude_entitlement_original"
+  },
+  {
+    "username": "OpenAI",
+    "enabled": true,
+    "user_id": "4398626122",
+    "push_policy": "openai_major_original"
+  },
+  {
+    "username": "thsottiaux",
+    "enabled": true,
+    "user_id": "1953337039510003712",
+    "push_policy": "codex_quota_original"
   },
   {
     "username": "vista8",
-    "enabled": true,
-    "topic": "ai_cn"
+    "enabled": true
   },
   {
     "username": "Vida_BWE",
@@ -19,8 +40,7 @@
   },
   {
     "username": "dotey",
-    "enabled": true,
-    "topic": "ai_cn"
+    "enabled": true
   },
   {
     "username": "kepano",
@@ -58,7 +78,6 @@
   },
   {
     "username": "Khazix0918",
-    "enabled": true,
-    "topic": "ai_cn"
+    "enabled": true
   }
 ]

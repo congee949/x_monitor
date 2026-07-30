@@ -114,6 +114,18 @@ def _atomic_write(path: str, data: str) -> None:
         os.fsync(f.fileno())
     os.replace(tmp, path)
 
+
+# CSI / SGR sequences (e.g. CLI bold/color). Strip before any text reaches TG.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+
+
+def strip_ansi(text: str | None) -> str:
+    """Remove ANSI escape sequences from external CLI / error text."""
+    if not text:
+        return ""
+    return _ANSI_RE.sub("", str(text))
+
+
 # ── Article 处理 ─────────────────────────────────────
 
 ARTICLE_QUEUE_DIR = os.path.join(SCRIPT_DIR, "twitter_articles")
@@ -186,6 +198,7 @@ def _quote_comment_text(tweet: dict) -> str:
     连续空白压成单空格、3+ 连续空行收敛为一个，末尾大上限 2000 兜住 rich 预算。
     """
     text = (tweet.get("note_tweet") or {}).get("text") or tweet.get("text") or ""
+    text = _expand_tco(text, tweet)  # 分享链接先还原真实 URL，再剥尾部残留媒体短链
     text = re.sub(r"\s*https?://t\.co/\w+\s*$", "", text)  # 去尾部 t.co 短链
     text = re.sub(r"[ \t]+", " ", text)          # 行内连续空白 → 单空格（不动换行）
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
@@ -332,7 +345,7 @@ def fetch_article_markdown(username: str, entry: dict) -> tuple[str | None, str 
     except Exception as e:
         return None, f"markdown_fetch_exception:{e}"
     if result.returncode != 0:
-        err = (result.stderr or result.stdout or "").strip().replace("\n", " ")[:300]
+        err = strip_ansi(result.stderr or result.stdout or "").strip().replace("\n", " ")[:300]
         return None, f"markdown_fetch_failed:{err}"
 
     stdout = result.stdout.strip()
@@ -690,7 +703,7 @@ def format_article_failure_message(username: str, entry: dict, reason: str) -> t
         f"链接：{html.escape(link)}\n"
         f"阶段：{html.escape(entry.get('failed_stage', 'unknown'))}\n"
         f"尝试：{attempts}/{ARTICLE_MAX_ATTEMPTS}\n"
-        f"原因：{html.escape(reason[:500])}"
+        f"原因：{html.escape(strip_ansi(reason)[:500])}"
     )
     return msg, link
 
@@ -816,6 +829,20 @@ PROMO_SYSTEM_PROMPT = """你是一个推文内容审核员。判断以下推文�
 
 请只回复 JSON：{"promo": true/false, "reason": "简短理由"}"""
 
+MUSING_SYSTEM_PROMPT = """你是推文内容审核员。判断该推文对「AI/科技/商业信息订阅者」是否为无信息量的生活碎碎念。
+
+碎碎念特征：
+- 个人生活状态、出行/饮食/天气/心情、晒图说明
+- 无观点、无数据、无产品/行业结论
+- 纯打卡、行程准备、设备充电等日常琐事
+
+非碎碎念：
+- 技术讨论、产品/行业见解、工具评测
+- 带实质信息的分享（即便口语化）
+- 对订阅者有信息增量的内容
+
+请只回复 JSON：{"musing": true/false, "reason": "简短理由"}"""
+
 
 class AIBackend:
     """单个 AI 后端。"""
@@ -840,15 +867,24 @@ class AIBackend:
         if not self._available:
             raise RuntimeError("no api_key")
         if self.backend_type == "gemini":
-            return self._call_gemini(username, text)
-        return self._call_openai(username, text)
+            return self._call_gemini(username, text, PROMO_SYSTEM_PROMPT, "promo")
+        return self._call_openai(username, text, PROMO_SYSTEM_PROMPT, "promo")
 
-    def _call_openai(self, username: str, text: str) -> tuple[bool, str]:
+    def classify_musing(self, username: str, text: str) -> tuple[bool, str]:
+        """返回 (is_musing, reason)。失败抛异常。"""
+        if not self._available:
+            raise RuntimeError("no api_key")
+        if self.backend_type == "gemini":
+            return self._call_gemini(username, text, MUSING_SYSTEM_PROMPT, "musing")
+        return self._call_openai(username, text, MUSING_SYSTEM_PROMPT, "musing")
+
+    def _call_openai(self, username: str, text: str, system_prompt: str,
+                     flag_key: str) -> tuple[bool, str]:
         user_msg = f"@{username} 发的推文：\n\n{text[:500]}"
         body = json.dumps({
             "model": self.model,
             "messages": [
-                {"role": "system", "content": PROMO_SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_msg},
             ],
             "temperature": 0.1,
@@ -865,11 +901,12 @@ class AIBackend:
         with urllib.request.urlopen(req, timeout=self.timeout) as r:
             resp = json.loads(r.read().decode("utf-8"))
         content = resp["choices"][0]["message"]["content"].strip()
-        return self._parse_result(content)
+        return self._parse_result(content, flag_key)
 
-    def _call_gemini(self, username: str, text: str) -> tuple[bool, str]:
+    def _call_gemini(self, username: str, text: str, system_prompt: str,
+                     flag_key: str) -> tuple[bool, str]:
         user_msg = f"@{username} 发的推文：\n\n{text[:500]}"
-        prompt = f"{PROMO_SYSTEM_PROMPT}\n\n{user_msg}"
+        prompt = f"{system_prompt}\n\n{user_msg}"
         body = json.dumps({
             "contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {
@@ -886,7 +923,7 @@ class AIBackend:
         with urllib.request.urlopen(req, timeout=self.timeout) as r:
             resp = json.loads(r.read().decode("utf-8"))
         content = resp["candidates"][0]["content"]["parts"][0]["text"].strip()
-        return self._parse_result(content)
+        return self._parse_result(content, flag_key)
 
     def complete(self, prompt: str, max_tokens: int = 1200, temperature: float = 0.2) -> str:
         if not self._available:
@@ -983,14 +1020,14 @@ class AIBackend:
             resp = json.loads(r.read().decode("utf-8"))
         return resp["candidates"][0]["content"]["parts"][0]["text"].strip()
 
-    def _parse_result(self, content: str) -> tuple[bool, str]:
+    def _parse_result(self, content: str, flag_key: str = "promo") -> tuple[bool, str]:
         # 去掉 markdown 代码块包裹
         cleaned = re.sub(r'```(?:json)?\s*', '', content).strip().rstrip('`').strip()
         m = re.search(r'\{.*\}', cleaned, re.DOTALL)
         if m:
             try:
                 result = json.loads(m.group())
-                return bool(result.get("promo", False)), result.get("reason", "")
+                return bool(result.get(flag_key, False)), result.get("reason", "")
             except json.JSONDecodeError:
                 pass
         return False, f"parse_error:{content[:60]}"
@@ -1044,13 +1081,24 @@ class AIClassifier:
         return bool(self._backends)
 
     def confirm_promo(self, username: str, text: str) -> tuple[bool, str]:
-        """按顺序尝试各后端，第一个成功的结果返回。全部失败则放行。"""
+        """按顺序尝试各后端，第一个成功的结果返回。全部失败则 (False, all_ai_failed)。"""
         for backend in self._backends:
             try:
                 is_promo, reason = backend.classify(username, text)
                 return is_promo, f"{backend.name}:{reason}"
             except Exception as e:
                 print(f"    AI [{backend.name}] 失败: {e}")
+                continue
+        return False, "all_ai_failed"
+
+    def confirm_musing(self, username: str, text: str) -> tuple[bool, str]:
+        """碎碎念 AI 复核。全部失败则 (False, all_ai_failed)；调用方 fail-closed。"""
+        for backend in self._backends:
+            try:
+                is_musing, reason = backend.classify_musing(username, text)
+                return is_musing, f"{backend.name}:{reason}"
+            except Exception as e:
+                print(f"    AI [{backend.name}] 碎碎念识别失败: {e}")
                 continue
         return False, "all_ai_failed"
 
@@ -1084,13 +1132,238 @@ class AIClassifier:
 
 # ── 账号配置 ───────────────────────────────────────
 
+# 官方账号的即时推送策略。账号配置只引用稳定名字；未知名字必须启动失败，
+# 避免拼写错误把高流量官号静默降级成「全量推送」。
+OFFICIAL_PUSH_POLICIES = {
+    "claude_dev_original",
+    "openai_dev_original",
+    "claude_entitlement_original",
+    "openai_major_original",
+    "codex_quota_original",
+}
+_ACCOUNT_CONFIG_BY_USERNAME: dict[str, dict] = {}
+
+
+def _canonical_username(value: str) -> str:
+    return (value or "").strip().lstrip("@").casefold()
+
+
+def _policy_tweet_text(tweet: dict) -> str:
+    note = tweet.get("note_tweet") or {}
+    return (note.get("text") or tweet.get("text") or "").strip()
+
+
+def _originality_gate(tweet: dict) -> tuple[bool, str]:
+    """官方即时通道只收原创；结构与文本任一显示 RT 都 fail-closed。"""
+    text = _policy_tweet_text(tweet)
+    if tweet.get("retweeted_status") or tweet.get("is_retweet") is True:
+        return False, "originality:retweet"
+    if re.match(r"^\s*RT\s+@[A-Za-z0-9_]+\s*:", text, re.IGNORECASE):
+        return False, "originality:rt_prefix"
+    if tweet.get("quoted_status"):
+        # 引用壳必须有实质性的账号自述；只写 this/great/emoji 不算原创事件。
+        comment = URL_RE.sub("", text).strip(" \t\r\n.,!?:;-—_#")
+        if len(comment) < 12 or comment.casefold() in {
+            "this", "great", "exactly", "yes", "big news", "check this out",
+        }:
+            return False, "originality:empty_quote_comment"
+    return True, "originality:original"
+
+
+def _contains_any(text: str, terms: tuple[str, ...]) -> bool:
+    return any(term in text for term in terms)
+
+
+# 营销性 credits（黑客松奖金、startup program 等）不算权益变化，两个 Claude 官号通用。
+_PROMO_CREDIT_TERMS = (
+    "hackathon", "startup program", "prize", "competition", "api credits for",
+    "grant program", "apply for credits",
+)
+
+
+def _entitlement_event(low: str) -> str | None:
+    """识别套餐权益/额度政策变化，claudeai 与 ClaudeDevs 共用。
+
+    调用方自行先排除 _PROMO_CREDIT_TERMS。命中返回事件名，未命中返回 None。
+    """
+    entitlement = _contains_any(low, (
+        "pro", "max", "team", "enterprise", "plan", "subscription", "weekly",
+        "5-hour", "5 hour", "usage limit", "rate limit", "usage credits",
+        "model access", "available to", "included in",
+    ))
+    change = _contains_any(low, (
+        "now available", "rolling out", "will be", "starting", "effective",
+        "included", "access", "limit", "allocation", "credit", "price", "pricing",
+    ))
+    if not (entitlement and change):
+        return None
+    if _contains_any(low, ("weekly", "5-hour", "5 hour", "limit", "allocation", "credit")):
+        return "quota_policy"
+    if _contains_any(low, ("model access", "available to")):
+        return "model_access"
+    return "plan_entitlement"
+
+
+def classify_official_push(policy: str, tweet: dict) -> tuple[str, str, str | None]:
+    """Return (pass|filter, reason, event_type).
+
+    Rules intentionally favor precision. Ambiguous official posts remain visible in the
+    user's normal lookup tools but do not interrupt via Telegram.
+    """
+    if policy not in OFFICIAL_PUSH_POLICIES:
+        raise ValueError(f"unknown push_policy: {policy}")
+    original, reason = _originality_gate(tweet)
+    if not original:
+        return "filter", reason, None
+
+    text = _policy_tweet_text(tweet)
+    low = re.sub(r"\s+", " ", text.casefold())
+
+    if policy == "codex_quota_original":
+        negative = (
+            r"\b(?:should|could|would)\s+we\b.*\breset\b",
+            r"\bthinking\b.*\b(?:reset|announce)\b",
+            r"\bbut\s+no\b",
+            r"\bowe\b.*\breset\b",
+            r"\bif\b.{0,80}\b(?:owe|reset)\b",
+            r"\bmaybe\b.{0,60}\breset\b",
+            r"\bpoll\b",
+        )
+        if any(re.search(pattern, low) for pattern in negative):
+            return "filter", "policy:conditional_or_negated", None
+        subject = _contains_any(low, (
+            "codex", "chatgpt work", "paid users", "all users", "everyone",
+            "pro users", "max users", "team users", "usage limits", "rate limits",
+            "banked reset",
+        ))
+        action = _contains_any(low, (
+            "reset", "banked reset", "credit", "refund", "reimburse", "compensat",
+            "limit increase", "limits increase", "limit removal", "limits removed",
+            "doubled the limit", "doubled limits", "grant",
+        ))
+        result = bool(re.search(
+            r"(?:\b(?:all|everyone|paid|pro|max|team|weekly|today|now|banked)\b|"
+            r"\b5[- ]?hour\b|\d|[$%])", low
+        ))
+        if not (subject and action and result):
+            return "filter", "policy:no_completed_quota_event", None
+        if _contains_any(low, ("refund", "reimburse", "compensat")):
+            event = "quota_compensation"
+        elif _contains_any(low, ("credit", "banked reset", "grant")):
+            event = "credit_grant"
+        elif "reset" in low:
+            event = "quota_reset"
+        else:
+            event = "quota_policy"
+        return "pass", f"policy:{event}", event
+
+    if policy == "claude_entitlement_original":
+        if _contains_any(low, _PROMO_CREDIT_TERMS):
+            return "filter", "policy:promotional_credits", None
+        event = _entitlement_event(low)
+        if not event:
+            return "filter", "policy:no_entitlement_change", None
+        return "pass", f"policy:{event}", event
+
+    if policy == "openai_major_original":
+        if _contains_any(low, (
+            "research paper", "our research", "customer story", "case study", "podcast",
+            "merch", "swag", "event recap", "join us live",
+        )):
+            return "filter", "policy:non_product_announcement", None
+        launch = _contains_any(low, (
+            "introducing", "we're launching", "we are launching", "now available",
+            "rolling out", "we released", "we’re releasing", "we are releasing",
+        ))
+        model = bool(re.search(r"\b(?:gpt[- ]?\d|o\d(?:[- ]|\b)|codex model)\b", low))
+        product = _contains_any(low, ("chatgpt", "codex", "api"))
+        permanent_plan = (
+            _contains_any(low, ("plan", "subscription", "price", "pricing"))
+            and _contains_any(low, ("effective", "permanent", "monthly", "annual", "starting"))
+        )
+        if model and launch:
+            return "pass", "policy:model_launch", "model_launch"
+        if product and launch:
+            return "pass", "policy:major_product_launch", "major_product_launch"
+        if permanent_plan:
+            return "pass", "policy:permanent_plan_change", "permanent_plan_change"
+        return "filter", "policy:not_major_openai_event", None
+
+    # ClaudeDevs / OpenAIDevs share the developer-event skeleton, with quota
+    # operations allowed only for ClaudeDevs.
+    if policy == "openai_dev_original" and _contains_any(low, (
+        "office hours", "join us", "livestream", "community showcase", "showcase",
+        "podcast", "merch", "swag", "meetup",
+    )):
+        return "filter", "policy:developer_promo", None
+    dev_subject = _contains_any(low, (
+        "claude code", "codex", "api", "sdk", "model", "mcp", "tool use",
+        "agent sdk", "responses api", "chat completions", "endpoint", "pull request",
+        "code review", "inline code", "developer console",
+    ))
+    dev_change = _contains_any(low, (
+        "introducing", "now available", "rolling out", "we released", "we've released",
+        "we added", "we've added", "new ", "support for", "lets you", "can now",
+        "updated", "preview", "beta", "review pull requests",
+    ))
+    if dev_subject and dev_change:
+        event = "model_api" if _contains_any(low, ("api", "sdk", "model", "endpoint")) else "dev_release"
+        return "pass", f"policy:{event}", event
+    if policy == "claude_dev_original":
+        quota = _contains_any(low, (
+            "reset", "refund", "reimburse", "compensat", "overcharged", "usage limits",
+            "rate limits", "weekly limit", "5-hour", "5 hour",
+        ))
+        completed = _contains_any(low, (
+            "we've reset", "we have reset", "has been reset", "refunded", "reimbursed",
+            "compensated", "restored", "resolved", "fixed",
+        ))
+        if quota and completed:
+            event = "quota_compensation" if _contains_any(low, ("refund", "reimburse", "compensat", "overcharged")) else "quota_reset"
+            return "pass", f"policy:{event}", event
+        # 额度政策公告实际会发在 ClaudeDevs 而非只在 claudeai（2026-07-18 漏推
+        # "weekly limits 50% higher through Aug 19"）。dev 号只放行额度类权益事件；
+        # model_access / plan_entitlement 仍归 claudeai。
+        if not _contains_any(low, _PROMO_CREDIT_TERMS):
+            event = _entitlement_event(low)
+            if event == "quota_policy":
+                return "pass", f"policy:{event}", event
+    return "filter", "policy:no_developer_event", None
+
+
+def _verify_configured_account_identity(username: str, account: dict) -> None:
+    expected = str(account.get("user_id") or "").strip()
+    if not expected:
+        return
+    if not HAS_GRAPHQL or not hasattr(twitter_graphql, "get_user_id"):
+        raise RuntimeError(f"@{username}: cannot verify configured user_id")
+    actual = str(twitter_graphql.get_user_id(username) or "").strip()
+    if actual != expected:
+        raise RuntimeError(
+            f"@{username}: immutable user_id mismatch (expected {expected}, got {actual or 'none'})"
+        )
+
 def load_accounts() -> list[dict]:
     if not os.path.exists(ACCOUNTS_PATH):
         print(f"配置文件不存在: {ACCOUNTS_PATH}", file=sys.stderr)
         sys.exit(1)
     with open(ACCOUNTS_PATH) as f:
         accounts = json.load(f)
-    return [a for a in accounts if a.get("enabled", True)]
+    enabled = [a for a in accounts if a.get("enabled", True)]
+    seen_names: set[str] = set()
+    for account in enabled:
+        username = _canonical_username(account.get("username", ""))
+        if not username:
+            raise ValueError("enabled account is missing username")
+        if username in seen_names:
+            raise ValueError(f"duplicate account username: {account.get('username')}")
+        seen_names.add(username)
+        policy = account.get("push_policy")
+        if policy and policy not in OFFICIAL_PUSH_POLICIES:
+            raise ValueError(f"@{account.get('username')}: unknown push_policy: {policy}")
+        if policy and not str(account.get("user_id") or "").isdigit():
+            raise ValueError(f"@{account.get('username')}: official policy requires numeric user_id")
+    return enabled
 
 
 # 未知 topic 每轮只告警一次（进程即轮次，无需跨轮持久化）
@@ -1128,6 +1401,24 @@ COMMERCIAL_KEYWORDS = [
 ]
 COMMERCIAL_HIT_THRESHOLD = 2
 DEFAULT_MAX_PUSH_AGE_MINUTES = 45
+# 官方号高价值事件按 _push_event_type 覆盖统一 45 分钟新鲜度窗口（分钟）。
+# cron 每 30 分钟一轮，一轮失败或推文发在边缘时刻，45 分钟窗口会把额度/权益
+# 公告判 stale 静默丢弃（2026-07-19：ClaudeDevs weekly limits 公告补投时已 39 分钟）。
+# 窗口值出自 chat-daily-tg 仓库 docs/spark/2026-07-18-official-x-push-policy-design.md：
+# reset/发布类 6h，套餐/权益/定价/模型访问类 24h。
+EVENT_PUSH_WINDOW_MINUTES = {
+    "quota_reset": 360,
+    "quota_compensation": 360,
+    "credit_grant": 360,
+    "dev_release": 360,
+    "model_api": 360,
+    "model_launch": 360,
+    "major_product_launch": 360,
+    "quota_policy": 1440,
+    "plan_entitlement": 1440,
+    "model_access": 1440,
+    "permanent_plan_change": 1440,
+}
 URL_RE = re.compile(r"https?://\S+")
 AFFILIATE_URL_RE = re.compile(
     r"/invite/|/referral/|[?&](ref|aff|affiliate|inviter|invitecode|promo)=",
@@ -1138,9 +1429,125 @@ COMMERCIAL_SELF_DISCLOSE = [
     "扫码体验", "立即开通", "限时优惠",
 ]
 
+# 碎碎念（musing）启发式：reason 以 REASON_MUSING_PREFIX 开头，process_user 据此分流 AI。
+# 与 promo 不对称：无 AI 时 musing 默认 filter（兴趣门控优先安静），promo 默认放行。
+REASON_MUSING_PREFIX = "musing"
+MUSING_SHORT_MAX = 40
+MUSING_STATUS_MAX = 60
+MUSING_NOTE_LONG_MIN = 120
+# 生活场景词（子串匹配，小写后）；按日志可增补。
+MUSING_LIFE_KEYWORDS = [
+    "钓鱼", "充电", "充满电", "出门", "散步", "跑步", "健身",
+    "午饭", "晚饭", "早餐", "外卖", "睡觉", "起床", "下班", "通勤",
+    "下雨", "晒太阳", "遛狗", "看电影", "追剧", "打卡", "周末", "宅家",
+    "口袋机", "pocket3", "pocket 3", "gopro", "相机充满",
+    "去玩", "晒图", "自拍", "好累", "好困", "摸鱼中",
+]
+# 实质信号：命中则不做 musing 可疑（避免口语化技术帖被 life_kw 误伤）。
+SUBSTANTIVE_KEYWORDS = [
+    "模型", "api", "发布", "开源", "论文", "评测", "对比", "价格", "额度",
+    "bug", "更新", "版本", "融资", "gpt", "claude", "gemini", "agent",
+    "prompt", "llm", "开源", "benchmark", "推理", "训练", "微调",
+    "token", "上下文", "多模态", "开源模型", "权重", "sota",
+    "产品", "上线", "changelog", "release", "sdk", "文档",
+]
+MUSING_STATUS_RE = re.compile(
+    r"(准备去|准备|要去|先.{0,6}再|出门了|到了|回来了)",
+)
+
+
+def _tweet_body_text(tweet: dict) -> str:
+    """优先 note_tweet 全文，否则 text；用于长度/关键词启发式。"""
+    note = tweet.get("note_tweet") or {}
+    note_text = (note.get("text") or "").strip()
+    if note_text:
+        return note_text
+    return (tweet.get("text") or "").strip()
+
+
+def _has_photo_media(tweet: dict) -> bool:
+    for m in tweet.get("media") or []:
+        if not isinstance(m, dict):
+            continue
+        if (m.get("type") or "") in ("photo", "animated_gif"):
+            return True
+    for m in ((tweet.get("extended_entities") or {}).get("media") or []):
+        if isinstance(m, dict) and (m.get("type") or "") in ("photo", "animated_gif"):
+            return True
+    return False
+
+
+def _has_non_media_url(tweet: dict, body: str) -> bool:
+    """正文里是否有「非媒体 t.co」的实质外链。"""
+    media_tcos: set[str] = set()
+    for m in ((tweet.get("extended_entities") or {}).get("media") or []):
+        if isinstance(m, dict) and m.get("url"):
+            media_tcos.add(m["url"])
+    for m in ((tweet.get("entities") or {}).get("media") or []):
+        if isinstance(m, dict) and m.get("url"):
+            media_tcos.add(m["url"])
+    urls = URL_RE.findall(body)
+    for u in urls:
+        if u not in media_tcos:
+            return True
+    for ent in ((tweet.get("entities") or {}).get("urls") or []):
+        if not isinstance(ent, dict):
+            continue
+        expanded = (ent.get("expanded_url") or ent.get("url") or "").strip()
+        if not expanded:
+            continue
+        if "pbs.twimg.com" in expanded or "pic.twitter.com" in expanded:
+            continue
+        if "twitter.com" in expanded and "/status/" in expanded and "/photo/" in expanded:
+            continue
+        return True
+    return False
+
+
+def _has_substantive_signal(tweet: dict, body: str) -> bool:
+    """任一实质信号 → 不做 musing 可疑。"""
+    if tweet.get("article"):
+        return True
+    note = tweet.get("note_tweet") or {}
+    note_text = (note.get("text") or "").strip()
+    if len(note_text) >= MUSING_NOTE_LONG_MIN:
+        return True
+    if _has_non_media_url(tweet, body):
+        return True
+    low = body.lower()
+    for kw in SUBSTANTIVE_KEYWORDS:
+        if kw.lower() in low:
+            return True
+    return False
+
+
+def _musing_reason(tweet: dict, body: str):
+    """若像碎碎念，返回 reason（以 musing 开头）；否则 None。"""
+    if _has_substantive_signal(tweet, body):
+        return None
+    low = body.lower()
+    has_photo = _has_photo_media(tweet)
+    life_hits = [kw for kw in MUSING_LIFE_KEYWORDS if kw.lower() in low]
+
+    if has_photo and len(body) <= MUSING_SHORT_MAX:
+        return f"{REASON_MUSING_PREFIX}_short_photo({len(body)}字)"
+
+    if life_hits:
+        return f"{REASON_MUSING_PREFIX}_life_kw({','.join(life_hits[:3])})"
+
+    if has_photo and len(body) < MUSING_STATUS_MAX and MUSING_STATUS_RE.search(body):
+        return f"{REASON_MUSING_PREFIX}_status_photo({len(body)}字)"
+
+    return None
+
 
 def classify(tweet: dict) -> tuple[str, str]:
-    """返回 (status, reason)。status: pass / suspicious / filter"""
+    """返回 (status, reason)。status: pass / suspicious / filter
+
+    suspicious 的 reason 前缀分流 AI：
+      commercial* / self_disclose* → confirm_promo
+      musing*                      → confirm_musing
+    """
     text = (tweet.get("text") or "").strip()
     low = text.lower()
 
@@ -1165,6 +1572,12 @@ def classify(tweet: dict) -> tuple[str, str]:
     stripped = URL_RE.sub("", text).strip()
     if len(stripped) < 10:
         return "filter", f"link_only({len(stripped)}字)"
+
+    # 碎碎念启发式（promo 之后、pass 之前）：用全文 body（含 note_tweet）
+    body = _tweet_body_text(tweet)
+    musing = _musing_reason(tweet, body)
+    if musing:
+        return "suspicious", musing
 
     return "pass", "ok"
 
@@ -1599,7 +2012,7 @@ def note_account_failure(failures: dict, username: str, error: str,
     """
     rec = failures.get(username) or {"count": 0, "alerted": False}
     rec["count"] = int(rec.get("count", 0)) + 1
-    rec["last_error"] = str(error)[:300]
+    rec["last_error"] = strip_ansi(error)[:300]
     rec["last_failed_at"] = datetime.now(timezone.utc).isoformat()
     if rec["count"] >= FAIL_ALERT_THRESHOLD and not rec.get("alerted"):
         text = (f"⚠️ <b>X 监控告警</b>：@{username} 已连续 {rec['count']} 轮拉取失败\n"
@@ -1753,6 +2166,18 @@ def is_within_push_window(t: dict, max_age_minutes: int) -> bool:
     if dt is None:
         return True
     return datetime.now(timezone.utc) - dt <= timedelta(minutes=max_age_minutes)
+
+
+def effective_push_window_minutes(t: dict, base_minutes: int) -> int:
+    """按 _push_event_type 取事件级新鲜度窗口，与基础窗口取较大者。
+
+    取 max 而非直接替换：seen 损坏安全模式的 1440 放宽和 CLI 显式调大的
+    窗口都不能被事件窗口反向缩小。base_minutes <= 0 表示窗口关闭（不限龄），
+    原样透传；无事件注解的普通账号推文维持基础窗口。"""
+    if base_minutes <= 0:
+        return base_minutes
+    event_window = EVENT_PUSH_WINDOW_MINUTES.get(t.get("_push_event_type") or "", 0)
+    return max(base_minutes, event_window)
 
 
 # ── Telegram ───────────────────────────────────────
@@ -1941,6 +2366,201 @@ def _rich_media_block(t: dict, embed_video: bool = True) -> str:
     return block + f"<br><br>{media_html}"
 
 
+def _tweet_url_entities(t: dict) -> list[dict]:
+    """Return distinct user-shared URL entities for the text actually rendered.
+
+    Long-note entities are preferred because their text replaces the 280-character
+    shell. Media t.co URLs live in entities.media and intentionally stay out.
+    """
+    note = t.get("note_tweet") or {}
+    groups = []
+    if note.get("text"):
+        groups.append((note.get("entities") or {}).get("urls") or [])
+    groups.append((t.get("entities") or {}).get("urls") or [])
+    out: list[dict] = []
+    seen: set[str] = set()
+    for group in groups:
+        for entity in group:
+            if not isinstance(entity, dict):
+                continue
+            short = entity.get("url")
+            if not isinstance(short, str) or not short or short in seen:
+                continue
+            seen.add(short)
+            out.append(entity)
+    return out
+
+
+def _safe_http_url(value: object) -> str:
+    """Only permit normal web destinations in a Telegram href/preview field."""
+    if (not isinstance(value, str) or not value or len(value) > 2048
+            or any(ord(c) < 32 for c in value)):
+        return ""
+    parsed = urllib.parse.urlsplit(value)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return ""
+    return value
+
+
+def _entity_destination(entity: dict) -> str:
+    """Prefer X's fully unwound destination, then its normal expanded URL."""
+    candidates: list[object] = []
+    unwound = entity.get("unwound")
+    if isinstance(unwound, dict):
+        candidates.append(unwound.get("url"))
+    candidates.extend((entity.get("unwound_url"), entity.get("expanded_url")))
+    for candidate in candidates:
+        destination = _safe_http_url(candidate)
+        if destination:
+            return destination
+    return ""
+
+
+def _tweet_link_replacements(t: dict) -> dict[str, tuple[str, str]]:
+    """Map an X t.co entity to (safe destination, short visible label)."""
+    replacements: dict[str, tuple[str, str]] = {}
+    for entity in _tweet_url_entities(t):
+        short = entity.get("url")
+        destination = _entity_destination(entity)
+        if not isinstance(short, str) or not destination:
+            continue
+        label = entity.get("display_url")
+        if not isinstance(label, str) or not label.strip() or any(ord(c) < 32 for c in label):
+            parsed = urllib.parse.urlsplit(destination)
+            label = parsed.netloc + parsed.path
+            if parsed.query:
+                label += "?" + parsed.query
+        label = label.strip()
+        # display_url is upstream data and ends up in the rendered message; cap it
+        # so a malformed entity cannot defeat the Rich Message size guard.
+        if len(label) > 512:
+            label = label[:511] + "…"
+        replacements[short] = (destination, label)
+    return replacements
+
+
+def _render_tweet_urls(text: str, t: dict, *, rich: bool) -> str:
+    """Escape tweet text while converting only X-provided t.co entities to anchors."""
+    replacements = _tweet_link_replacements(t)
+    preserve = _rich_preserve if rich else html.escape
+    if not replacements:
+        return preserve(text)
+
+    def replace(match: "re.Match") -> str:
+        item = replacements.get(match.group(0))
+        if not item:
+            return preserve(match.group(0))
+        destination, label = item
+        return (f'<a href="{html.escape(destination, quote=True)}">'
+                f'{html.escape(label)}</a>')
+
+    # X t.co keys contain only ASCII letters and digits. Matching just that token
+    # prevents a short URL at the end of a sentence from swallowing punctuation.
+    parts: list[str] = []
+    cursor = 0
+    for match in re.finditer(r"https?://t\.co/[A-Za-z0-9]+", text):
+        parts.append(preserve(text[cursor:match.start()]))
+        parts.append(replace(match))
+        cursor = match.end()
+    parts.append(preserve(text[cursor:]))
+    return "".join(parts)
+
+
+def _expand_tco(text: str, t: dict) -> str:
+    """Plain-text URL expansion used by non-rendering callers such as quote comments."""
+    if not text:
+        return text
+    for short, (destination, _label) in _tweet_link_replacements(t).items():
+        text = text.replace(short, destination)
+    return text
+
+
+def _primary_external_url(t: dict) -> str:
+    """First rendered user link, eligible as the sole Telegram preview target."""
+    return _primary_external_link(t)[0]
+
+
+def _primary_external_link(t: dict) -> tuple[str, str]:
+    """First rendered user link and its short visible label, if there is one."""
+    source = ((t.get("note_tweet") or {}).get("text") or t.get("text") or "")
+    for short, (destination, _label) in _tweet_link_replacements(t).items():
+        if short in source:
+            return destination, _label
+    return "", ""
+
+
+def _has_renderable_media(t: dict) -> bool:
+    """True only when the rich-message renderer can show original X media."""
+    for media in t.get("media") or []:
+        if not isinstance(media, dict):
+            continue
+        url = media.get("url")
+        if isinstance(url, str) and url.startswith("https://") and '"' not in url and "<" not in url:
+            return True
+    return False
+
+
+def _fallback_photo_url(t: dict) -> str:
+    """First safe X media URL usable as a native sendPhoto fallback.
+
+    Rich Messages can render up to four original media items, but a 400/404 from
+    that endpoint used to turn a media tweet into text-only output.  sendPhoto is
+    deliberately a *representative-image* fallback: it preserves the first photo
+    (or video/GIF poster) together with the source button in one atomic message.
+    """
+    for media in t.get("media") or []:
+        if not isinstance(media, dict):
+            continue
+        url = media.get("url")
+        if (isinstance(url, str) and url.startswith("https://")
+                and '"' not in url and "<" not in url):
+            return url
+    return ""
+
+
+PHOTO_CAPTION_MAX_UTF16 = 900
+
+
+def _utf16_len(value: str) -> int:
+    return len(value.encode("utf-16-le")) // 2
+
+
+def _truncate_utf16(value: str, limit: int) -> str:
+    """Trim user-facing text without splitting a UTF-16 surrogate pair."""
+    if _utf16_len(value) <= limit:
+        return value
+    suffix = "…"
+    room = max(limit - _utf16_len(suffix), 0)
+    kept: list[str] = []
+    used = 0
+    for char in value:
+        width = _utf16_len(char)
+        if used + width > room:
+            break
+        kept.append(char)
+        used += width
+    return "".join(kept) + suffix
+
+
+def _tweet_photo_caption(html_text: str, t: dict) -> str:
+    """Compact, safe HTML caption for the native-photo fallback.
+
+    Photo captions are limited to 1024 characters after entity parsing.  Keep a
+    900 UTF-16-unit envelope, then append an explicit external anchor when the
+    tweet has one so the media-first fallback does not regress link interaction.
+    """
+    destination, label = _primary_external_link(t)
+    link_label = f"↗ {label}" if destination else ""
+    link_units = _utf16_len(link_label) + (2 if link_label else 0)
+    plain = _html_to_plain(html_text).replace("\u200b", "").strip()
+    body_limit = max(160, PHOTO_CAPTION_MAX_UTF16 - link_units)
+    caption = html.escape(_truncate_utf16(plain, body_limit))
+    if destination:
+        caption += (f'\n\n<a href="{html.escape(destination, quote=True)}">'
+                    f'{html.escape(link_label)}</a>')
+    return caption
+
+
 def _strip_media_tco(text: str, t: dict) -> str:
     """去掉 full_text 里「媒体对应」的 t.co 短链（图片已作为媒体块内嵌，裸链冗余）。
 
@@ -1956,6 +2576,29 @@ def _strip_media_tco(text: str, t: dict) -> str:
     return text.strip()
 
 
+def _tweet_source_url(username: str, t: dict) -> str:
+    """Canonical X status for the content being rendered.
+
+    Non-article retweets are normalized to the original post's text/media, so the
+    source action must follow that same original status rather than point at the
+    monitor account's short RT shell.  Quote tweets keep their own status because
+    their displayed body/media are the quoting tweet's own content.
+    """
+    source_user = username
+    source_id = t.get("id") or t.get("conversation_id_str") or ""
+    retweeted = t.get("retweeted_status") or {}
+    if isinstance(retweeted, dict):
+        rt_user = retweeted.get("screen_name")
+        rt_id = retweeted.get("id")
+        if rt_user and rt_id:
+            source_user, source_id = rt_user, rt_id
+    if not source_user or not source_id:
+        return ""
+    return ("https://x.com/"
+            f"{urllib.parse.quote(str(source_user), safe='')}/status/"
+            f"{urllib.parse.quote(str(source_id), safe='')}")
+
+
 def format_message(
     username: str, t: dict, ai: "AIClassifier | None" = None,
     *, embed_video: bool = True,
@@ -1968,8 +2611,7 @@ def format_message(
     rich_html targets sendRichMessage's html field (RICH_MESSAGE_MAX_CHARS budget)
     and folds the full note text with a much larger cap so long tweets show in full.
     """
-    tid = t.get("id") or t.get("conversation_id_str") or ""
-    link = f"https://x.com/{username}/status/{tid}" if tid else ""
+    link = _tweet_source_url(username, t)
     hidden = f'<a href="{link}">​</a>' if link else ""
     note = t.get("note_tweet") or {}
     # 长推(note_tweet)与普通推文都平铺全文（用户指定 2026-07-01：不再 TL;DR/折叠/140 截断）；
@@ -1978,8 +2620,9 @@ def format_message(
     full_text = note_text
     if not full_text and not t.get("article"):
         full_text = _break_rt_prefix(t.get("text", "").strip())
-    if full_text and any((m or {}).get("type") == "photo" for m in (t.get("media") or [])):
-        # 图片已作为 rich 媒体块内嵌，正文里对应的 t.co 短链冗余，剥掉（不碰其它真实分享链接）。
+    if full_text and t.get("media"):
+        # 媒体（图/视频/GIF）都会作为 rich 媒体块内嵌（视频至少嵌封面+时长），
+        # 正文里对应的媒体 t.co 短链冗余，剥掉（不碰其它真实分享链接）。
         full_text = _strip_media_tco(full_text, t)
     rich_body = ""
     if full_text:
@@ -1992,16 +2635,16 @@ def format_message(
         # _rich_preserve 的 <br>/&nbsp; 会让长度膨胀，故按「渲染后」UTF-16 长度收缩到
         # 27000 单位以内，留 header/标签余量保持在 RICH_MESSAGE_MAX_CHARS 下。
         rich_src = full_text if len(full_text) <= 28000 else full_text[:28000] + "…"
-        rich_body = _rich_preserve(rich_src)
+        rich_body = _render_tweet_urls(rich_src, t, rich=True)
         while len(rich_body.encode("utf-16-le")) // 2 > 27000 and len(rich_src) > 100:
             rich_src = rich_src[: int(len(rich_src) * 0.9)] + "…"
-            rich_body = _rich_preserve(rich_src)
+            rich_body = _render_tweet_urls(rich_src, t, rich=True)
     elif t.get("article"):
         body = article_preview_text(t)
     else:
         body = ""
     if body:
-        text = f'📢 @{username}{hidden}\n\n{html.escape(body)}'
+        text = f'📢 @{username}{hidden}\n\n{_render_tweet_urls(body, t, rich=False)}'
     else:
         text = f'📢 @{username}{hidden}'
     # Rich HTML variant: tweet body/note is raw user content → _rich_preserve it
@@ -2291,8 +2934,93 @@ def send_telegram_rich(token: str, chat_id: str, markdown: str = "", link: str =
     raise RuntimeError("send_telegram_rich: exhausted retries")
 
 
+def send_telegram_photo(token: str, chat_id: str, photo: str, caption: str = "", link: str = "",
+                        *, thread_id: "str | int | None" = None) -> dict:
+    """Send one native representative image when Rich Message media is rejected.
+
+    A native photo supports both an HTML caption and reply markup, so this keeps
+    the original image, a clickable external link in the caption, and the X
+    "打开原文" button in one message.  400/404 is a safe no-delivery signal here;
+    return ``photo_fallback`` so the caller can still send the full text path.
+    """
+    payload: dict = {
+        "chat_id": chat_id,
+        "photo": photo,
+        "caption": caption,
+        "parse_mode": "HTML",
+    }
+    if thread_id is not None:
+        payload["message_thread_id"] = thread_id
+    if link:
+        payload["reply_markup"] = {
+            "inline_keyboard": [[{"text": "\U0001f517 打开原文", "url": link}]]
+        }
+
+    last_err = None
+    for attempt in range(3):
+        if _article_queue_time_remaining() < SEND_ATTEMPT_MIN_REMAINING_SECONDS:
+            raise last_err or RuntimeError(
+                "send_telegram_photo: 剩余预算不足以发起尝试，本轮放弃（进 push_retry）")
+        try:
+            return _tg_post(token, payload, method="sendPhoto")
+        except TgAmbiguousDelivery as e:
+            if not _register_ambiguous_send():
+                print(f"  ⚠ sendPhoto 连续歧义（疑似 Telegram 故障），按失败进重试: {e}")
+                raise
+            _record_assumed_delivery("sendPhoto", link)
+            print(f"  ⚠ sendPhoto 响应缺失，按已送达处理（防重复）: {e}")
+            return {"ok": True, "assumed_delivered": True}
+        except urllib.error.HTTPError as e:
+            last_err = e
+            try:
+                body = e.read().decode("utf-8", "replace")
+            except Exception:
+                body = ""
+            if e.code == 429:
+                retry_after = 3
+                try:
+                    retry_after = int(json.loads(body)["parameters"]["retry_after"])
+                except Exception:
+                    pass
+                time.sleep(min(max(retry_after, 1), 30))
+                continue
+            if e.code >= 500:
+                time.sleep(2 * (attempt + 1))
+                continue
+            desc = ""
+            try:
+                desc = json.loads(body).get("description", "")
+            except Exception:
+                desc = body[:200]
+            if e.code == 400:
+                # Thread disappearance is recoverable exactly as for text/rich.
+                fixed = _swap_thread_on_not_found(payload, desc)
+                if fixed is not None:
+                    payload = fixed
+                    continue
+                # A malformed caption should not make the original image vanish.
+                # Retry once without entities before admitting the photo endpoint
+                # itself rejected the media URL/shape.
+                if payload.get("parse_mode"):
+                    payload = dict(payload)
+                    payload["caption"] = _html_to_plain(caption)
+                    payload.pop("parse_mode", None)
+                    continue
+            if e.code in (400, 404):
+                return {"ok": False, "photo_fallback": True,
+                        "error_code": e.code, "description": desc}
+            raise
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            last_err = e
+            time.sleep(2 * (attempt + 1))
+            continue
+    if last_err:
+        raise last_err
+    raise RuntimeError("send_telegram_photo: exhausted retries")
+
+
 def send_telegram(token: str, chat_id: str, text: str, link: str = "",
-                  *, thread_id: "str | int | None" = None) -> dict:
+                  *, preview_url: str = "", thread_id: "str | int | None" = None) -> dict:
     payload: dict = {
         "chat_id": chat_id,
         "text": text,
@@ -2300,17 +3028,19 @@ def send_telegram(token: str, chat_id: str, text: str, link: str = "",
     }
     if thread_id is not None:
         payload["message_thread_id"] = thread_id
-    if link:
+    preview_target = preview_url or link
+    if preview_target:
         payload["link_preview_options"] = {
-            "url": link,
+            "url": preview_target,
             "is_disabled": False,
             "prefer_large_media": True,
         }
+    else:
+        payload["link_preview_options"] = {"is_disabled": True}
+    if link:
         payload["reply_markup"] = {
             "inline_keyboard": [[{"text": "\U0001f517 打开原文", "url": link}]]
         }
-    else:
-        payload["link_preview_options"] = {"is_disabled": True}
 
     # Resilient send (REL-1/FMT-1): retry 429 honoring retry_after and 5xx with bounded
     # backoff; on a 400 (usually an HTML parse error) degrade once to plain text so the
@@ -2380,15 +3110,23 @@ def send_tweet(
     token: str, chat_id: str, username: str, t: dict, ai: "AIClassifier | None" = None,
     *, thread_id: "str | int | None" = None,
 ) -> dict:
-    """统一推文推送入口：rich-first → HTML fallback。
+    """统一推文推送入口：rich-first → native-photo → HTML fallback。
 
     username/t/ai 与原 format_message 调用点（process_user 循环）的实参一致。
     返回发送响应 dict，调用方仍用 r.get("ok") 做 push_failed/seen 判定。
     - rich 优先：rich_html 不超 RICH_MESSAGE_MAX_CHARS 时走 send_telegram_rich
       的 html 字段；成功直接返回；非 rich_fallback 的失败（如 429 已重试穷尽）原样返回。
-    - rich 被拒（rich_fallback）或超长 → 回退现有 HTML 路径 send_telegram。
+    - rich 被拒（rich_fallback）或超长：有原媒体时先用 sendPhoto 保住代表性
+      原图/视频封面、正文外链与「打开原文」按钮；photo 也被拒才回退 HTML。
     """
     html_text, rich_html, link = format_message(username, t, ai)
+    preview_url = _primary_external_url(t)
+    # Rich Messages preserve original X media, but their API has no link-preview
+    # field. For text-only posts, take the standard-message path so Telegram can
+    # render one external website card while the inline button still opens X.
+    if preview_url and not _has_renderable_media(t):
+        return send_telegram(token, chat_id, html_text, link,
+                             preview_url=preview_url, thread_id=thread_id)
     if len(rich_html) <= RICH_MESSAGE_MAX_CHARS:
         r = send_telegram_rich(token, chat_id, link=link, html=rich_html, thread_id=thread_id)
         if r.get("ok"):
@@ -2409,6 +3147,17 @@ def send_tweet(
                     return r
                 if not r.get("rich_fallback"):
                     return r
+    # Rich 的 400/404 明确表示它未送达；用原帖首张图（或视频/GIF 封面）走
+    # sendPhoto。这样不会出现此前「rich 带图被拒 → 纯文字」的用户可见降级。
+    photo_url = _fallback_photo_url(t)
+    if photo_url:
+        print("    rich 不可用，保留原媒体走 sendPhoto 降级")
+        photo_result = send_telegram_photo(
+            token, chat_id, photo_url, _tweet_photo_caption(html_text, t), link,
+            thread_id=thread_id)
+        if photo_result.get("ok") or not photo_result.get("photo_fallback"):
+            return photo_result
+        print(f"    sendPhoto 被拒({str(photo_result.get('description', ''))[:60]})，回退 HTML")
     return send_telegram(token, chat_id, html_text, link, thread_id=thread_id)
 
 
@@ -2435,6 +3184,8 @@ def process_user(
     print(f"  @{username}")
     print(f"{'='*40}")
 
+    account = _ACCOUNT_CONFIG_BY_USERNAME.get(_canonical_username(username), {})
+    _verify_configured_account_identity(username, account)
     tweets = fetch_tweets(pool, username, limit=args.limit)
     if not tweets:
         # Every data source returned an empty timeline — anomalous (auth break,
@@ -2476,10 +3227,48 @@ def process_user(
         if not tid:
             continue
 
-        status, reason = classify(t)
+        policy = account.get("push_policy")
+        if policy:
+            status, reason, event_type = classify_official_push(policy, t)
+            if event_type:
+                # Ephemeral annotation consumed by rendering/logging and the
+                # per-event freshness window; provider payload/state stays unchanged.
+                t["_push_event_type"] = event_type
+        else:
+            status, reason = classify(t)
         text = (t.get("text") or "").strip()
+        is_musing_suspect = (
+            (not policy)
+            and status == "suspicious"
+            and reason.startswith(REASON_MUSING_PREFIX)
+        )
 
-        if status == "suspicious" and ai.is_available():
+        if is_musing_suspect:
+            # 碎碎念：有 AI 则复核；无 AI / AI 全失败 → fail-closed filter。
+            # 与 promo 不对称：promo 无 AI 时放行（避免误杀商业讨论），
+            # musing 无 AI 时过滤（兴趣门控优先安静）。
+            if ai.is_available():
+                is_musing, ai_reason = ai.confirm_musing(username, text)
+                if is_musing:
+                    status = "filter"
+                    reason = f"{reason}|ai:{ai_reason}"
+                    print(f"    AI 确认碎碎念 [{reason}] {text[:50]}")
+                elif ai_reason == "all_ai_failed":
+                    status = "filter"
+                    reason = f"{reason}|ai:{ai_reason}"
+                    print(f"    AI 全部失败，碎碎念可疑推文降级为 filter: {text[:50]}")
+                    if not ai_all_failed_alerted:
+                        ai_all_failed_alerted = True
+                        _alert_ai_all_failed(bot_token, chat_id, username)
+                else:
+                    status = "pass"
+                    ai_overridden += 1
+                    print(f"    AI 否决碎碎念 [{reason} -> {ai_reason}] {text[:50]}")
+            else:
+                status = "filter"
+                reason = f"{reason}|no_ai"
+                print(f"    无 AI，碎碎念可疑直接 filter [{reason}] {text[:50]}")
+        elif not policy and status == "suspicious" and ai.is_available():
             is_promo, ai_reason = ai.confirm_promo(username, text)
             if is_promo:
                 status = "filter"
@@ -2541,7 +3330,7 @@ def process_user(
                 # 上轮 TG 推送失败：绕过 push-age 窗口重试，避免超龄后静默标 seen 丢推。
                 to_push.append((t, "push_retry"))
                 continue
-            if not is_within_push_window(t, push_age_minutes):
+            if not is_within_push_window(t, effective_push_window_minutes(t, push_age_minutes)):
                 print(f"    skip stale: {tid}")
                 continue
             if status == "pass":
@@ -2549,6 +3338,7 @@ def process_user(
             elif status == "filter":
                 filtered.append((t, reason))
             else:
+                # 残留 suspicious：仅 promo 路径在无 AI 时走到这里 → 放行
                 if ai.is_available():
                     filtered.append((t, reason))
                 else:
@@ -2995,6 +3785,7 @@ def main() -> int:
         # 每轮起止时间戳：日志此前无任何时间标记，无法事后审计运行时长/定位轮次
         run_started = time.monotonic()
         global _ARTICLE_QUEUE_RUN_START, _THREAD_FALLBACK_ID, _CROSS_DEDUP_ENABLED
+        global _ACCOUNT_CONFIG_BY_USERNAME
         _ARTICLE_QUEUE_RUN_START = run_started
         print(f"\n==== monitor run {datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S %z')} ====")
 
@@ -3036,6 +3827,9 @@ def main() -> int:
         ai = AIClassifier.load()
 
         accounts = load_accounts()
+        _ACCOUNT_CONFIG_BY_USERNAME = {
+            _canonical_username(a["username"]): a for a in accounts
+        }
         # thread 映射建于 --user 过滤之前：article 队列按文件遍历、不受 --user 限制，
         # 子集轮里其他账号的文章也要能解析到各自话题。
         account_thread_map = {

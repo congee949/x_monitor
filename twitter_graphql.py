@@ -5,6 +5,7 @@ Guest token from api.x.com/1.1/guest/activate.json,
 then standard bearer token for GraphQL API calls.
 """
 
+import html
 import json
 import os
 import re
@@ -45,6 +46,11 @@ _cookie_fail_count = 0
 _cookies_loaded_this_run = False   # a valid auth_token+ct0 was ever loaded
 _authed_success_count = 0          # authed request that actually succeeded
 _cookie_degrade_count = 0          # authed request rejected → fell back to guest
+
+
+def normalize_x_text(value):
+    """Decode X HTML entities once at the source boundary."""
+    return html.unescape(value) if isinstance(value, str) else ""
 
 
 def _reset_auth_health():
@@ -583,7 +589,21 @@ def fetch_tweets(username, limit=20):
 
     tweets = []
     for inst in instructions:
+        flat_entries = []
         for entry in inst.get("entries", []):
+            content = entry.get("content", {}) or {}
+            # X groups self-reply threads into TimelineTimelineModule entries. Some
+            # accounts (notably @claudeai) currently return *only* modules, so reading
+            # entry.content.itemContent alone makes a healthy timeline look empty.
+            # Flatten both shapes; non-tweet module items (for example who-to-follow)
+            # naturally fall through because they have no tweet_results.result.
+            if content.get("itemContent"):
+                flat_entries.append(entry)
+            for module_item in content.get("items", []) or []:
+                item = module_item.get("item", {}) or {}
+                if item.get("itemContent"):
+                    flat_entries.append({"content": {"itemContent": item["itemContent"]}})
+        for entry in flat_entries:
             tweet_result = (
                 entry.get("content", {})
                 .get("itemContent", {})
@@ -600,7 +620,7 @@ def fetch_tweets(username, limit=20):
                 continue
 
             tid = legacy.get("id_str", "")
-            text = legacy.get("full_text", "")
+            text = normalize_x_text(legacy.get("full_text", ""))
 
             # RT: article 节点挂在内层原推上，转推壳本体没有
             rt_result = (legacy.get("retweeted_status_result") or {}).get("result") or {}
@@ -628,14 +648,16 @@ def fetch_tweets(username, limit=20):
             # Extract note_tweet (longform)
             note_data = tweet_result.get("note_tweet", {})
             note_results = note_data.get("note_tweet_results", {}).get("result", {})
-            note_text = note_results.get("text", "")
+            note_text = normalize_x_text(note_results.get("text", ""))
+            note_entities = (note_results.get("entity_set")
+                             or note_results.get("entities") or {})
 
             # Extract article (Twitter Article format)；转推/引用时读原推的 article
             # 优先级：转推 > 引用 > 本体
             article_data = (rt_result or quoted_result or tweet_result).get("article", {})
             article_result = article_data.get("article_results", {}).get("result", {})
-            article_title = article_result.get("title", "")
-            article_preview = article_result.get("preview_text", "")
+            article_title = normalize_x_text(article_result.get("title", ""))
+            article_preview = normalize_x_text(article_result.get("preview_text", ""))
             article_rest_id = article_result.get("rest_id", "")
 
             entities = legacy.get("entities", {}) or {}
@@ -650,13 +672,16 @@ def fetch_tweets(username, limit=20):
             # + note_tweet（长推 → format_message 走平铺全文）+ 媒体（配图），
             # 使转推与本博主自己发长推/带图推同款展示；article 转推仍走摘要队列不重建。
             if rt_result and rt_screen and not article_rest_id:
-                rt_note = ((rt_result.get("note_tweet") or {})
-                           .get("note_tweet_results") or {}).get("result", {}).get("text", "")
-                rt_full = rt_legacy.get("full_text", "")
+                rt_note_result = ((rt_result.get("note_tweet") or {})
+                                  .get("note_tweet_results") or {}).get("result", {})
+                rt_note = normalize_x_text(rt_note_result.get("text", ""))
+                rt_full = normalize_x_text(rt_legacy.get("full_text", ""))
                 if rt_note or rt_full:
                     text = f"RT @{rt_screen}: {rt_note or rt_full}"
                     if rt_note:
                         note_text = f"RT @{rt_screen}: {rt_note}"
+                        note_entities = (rt_note_result.get("entity_set")
+                                         or rt_note_result.get("entities") or {})
                 if not media:
                     rt_ext = rt_legacy.get("extended_entities") or {}
                     rt_ent = rt_legacy.get("entities") or {}
@@ -685,7 +710,8 @@ def fetch_tweets(username, limit=20):
             }
 
             if note_text:
-                normalized["note_tweet"] = {"text": note_text}
+                normalized["note_tweet"] = {"text": note_text,
+                                            "entities": note_entities}
 
             # rest_id 是去重/缓存/抓取键：无 id 的 article 节点既不可入队也无法 fetch。
             # 不挂节点 → 与 process_user 的节点兜底（按 rest_id）和 format_message 的
@@ -709,7 +735,7 @@ def fetch_tweets(username, limit=20):
 
             tweets.append(normalized)
 
-    return tweets
+    return tweets[:limit]
 
 
 def fetch_article_tweet(tweet_id: str):

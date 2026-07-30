@@ -18,15 +18,164 @@ class FixedDatetime(datetime):
 
 
 class FakeAI:
-    def __init__(self, available=False, summary=None):
+    def __init__(self, available=False, summary=None, *,
+                 promo=False, musing=False, promo_reason="ok", musing_reason="ok"):
         self.available = available
         self.summary = summary
+        self.promo = promo
+        self.musing = musing
+        self.promo_reason = promo_reason
+        self.musing_reason = musing_reason
 
     def is_available(self):
         return self.available
 
     def complete(self, prompt, max_tokens=1200, temperature=0.2):
         return self.summary, "fake"
+
+    def confirm_promo(self, username, text):
+        return self.promo, f"fake:{self.promo_reason}"
+
+    def confirm_musing(self, username, text):
+        return self.musing, f"fake:{self.musing_reason}"
+
+
+class OfficialPushPolicyTest(unittest.TestCase):
+    def classify(self, policy, text, **extra):
+        tweet = {"id": "1", "text": text}
+        tweet.update(extra)
+        return twitter_monitor.classify_official_push(policy, tweet)
+
+    def test_all_official_policies_reject_retweets(self):
+        for policy in twitter_monitor.OFFICIAL_PUSH_POLICIES:
+            with self.subTest(policy=policy):
+                status, reason, event = self.classify(
+                    policy,
+                    "We've reset weekly usage limits for all paid users.",
+                    retweeted_status={"id": "99", "screen_name": "source"},
+                )
+                self.assertEqual((status, event), ("filter", None))
+                self.assertIn("originality", reason)
+
+    def test_claude_dev_reset_and_developer_release_pass(self):
+        self.assertEqual(
+            self.classify(
+                "claude_dev_original",
+                "We've reset 5-hour and weekly rate limits for all users.",
+            )[2],
+            "quota_reset",
+        )
+        self.assertEqual(
+            self.classify(
+                "claude_dev_original",
+                "Claude Code can now run code review with new effort levels.",
+            )[2],
+            "dev_release",
+        )
+
+    def test_claude_dev_quota_policy_announcement_passes(self):
+        # 2026-07-18 实测漏推样本：额度政策公告发在 ClaudeDevs 而非 claudeai
+        status, reason, event = self.classify(
+            "claude_dev_original",
+            "We're also keeping Claude Code weekly limits 50% higher, now through "
+            "August 19, for all Pro, Max, Team, and seat-based Enterprise users.",
+        )
+        self.assertEqual((status, event), ("pass", "quota_policy"))
+
+    def test_claude_dev_promotional_credits_still_filtered(self):
+        self.assertEqual(
+            self.classify(
+                "claude_dev_original",
+                "Compete for weekly API credit prizes in our Claude Code hackathon.",
+            )[0],
+            "filter",
+        )
+
+    def test_claude_dev_non_quota_entitlement_still_filtered(self):
+        # model_access / plan_entitlement 类权益仍归 claudeai，不从 dev 号放行
+        self.assertEqual(
+            self.classify(
+                "claude_dev_original",
+                "Claude Fable is now included in the Max plan.",
+            )[0],
+            "filter",
+        )
+
+    def test_openai_devs_filters_events_but_keeps_codex_features(self):
+        self.assertEqual(
+            self.classify(
+                "openai_dev_original",
+                "Join us for Codex Office Hours and a community showcase.",
+            )[0],
+            "filter",
+        )
+        self.assertEqual(
+            self.classify(
+                "openai_dev_original",
+                "Review pull requests in Codex. Inline code editing lets you update the patch.",
+            )[2],
+            "dev_release",
+        )
+
+    def test_claude_entitlement_does_not_confuse_hackathon_credits(self):
+        self.assertEqual(
+            self.classify(
+                "claude_entitlement_original",
+                "Win $100k API credits in our developer hackathon.",
+            )[0],
+            "filter",
+        )
+        self.assertEqual(
+            self.classify(
+                "claude_entitlement_original",
+                "Starting July 20, Max and Team plans include weekly usage credits.",
+            )[2],
+            "quota_policy",
+        )
+
+    def test_openai_major_filters_research_and_keeps_model_launch(self):
+        self.assertEqual(
+            self.classify(
+                "openai_major_original",
+                "Our research paper explores new approaches to interpretability.",
+            )[0],
+            "filter",
+        )
+        self.assertEqual(
+            self.classify(
+                "openai_major_original",
+                "Introducing GPT-5.6, now available in ChatGPT, Codex, and the API.",
+            )[2],
+            "model_launch",
+        )
+
+    def test_tibo_completed_resets_pass_and_jokes_fail(self):
+        good = (
+            "We've reset usage limits for all paid users, including Codex and ChatGPT Work."
+        )
+        self.assertEqual(self.classify("codex_quota_original", good)[2], "quota_reset")
+        self.assertEqual(
+            self.classify("codex_quota_original", "Should we reset Codex limits for all paid users?")[0],
+            "filter",
+        )
+        self.assertEqual(
+            self.classify(
+                "codex_quota_original",
+                "Thinking I am about to announce a Codex reset for everyone. But no.",
+            )[0],
+            "filter",
+        )
+        self.assertEqual(
+            self.classify(
+                "codex_quota_original",
+                "If this gets blocked, I owe all Codex users a reset.",
+            )[0],
+            "filter",
+        )
+
+    def test_unknown_policy_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "unknown push_policy"):
+            self.classify("typo_policy", "anything")
 
 
 class BacklogGuardTest(unittest.TestCase):
@@ -82,6 +231,131 @@ class BacklogGuardTest(unittest.TestCase):
         self.assertEqual(ai_overridden, 0)
         self.assertEqual(sent, ["https://x.com/vista8/status/recent-tweet"])
         self.assertEqual(saved["seen"], {"already-seen", "old-tweet", "recent-tweet"})
+
+
+class EventPushWindowTest(unittest.TestCase):
+    """官方号高价值事件按 _push_event_type 覆盖统一 45 分钟新鲜度窗口。"""
+
+    RELEASE_CLASS = (
+        "quota_reset", "quota_compensation", "credit_grant",
+        "dev_release", "model_api", "model_launch", "major_product_launch",
+    )
+    ENTITLEMENT_CLASS = (
+        "quota_policy", "plan_entitlement", "model_access", "permanent_plan_change",
+    )
+
+    def test_no_annotation_keeps_base_window(self):
+        self.assertEqual(twitter_monitor.effective_push_window_minutes({}, 45), 45)
+
+    def test_unknown_event_type_falls_back_to_base(self):
+        t = {"_push_event_type": "mystery_event"}
+        self.assertEqual(twitter_monitor.effective_push_window_minutes(t, 45), 45)
+
+    def test_release_class_events_extend_to_360(self):
+        for event in self.RELEASE_CLASS:
+            with self.subTest(event=event):
+                t = {"_push_event_type": event}
+                self.assertEqual(twitter_monitor.effective_push_window_minutes(t, 45), 360)
+
+    def test_entitlement_class_events_extend_to_1440(self):
+        for event in self.ENTITLEMENT_CLASS:
+            with self.subTest(event=event):
+                t = {"_push_event_type": event}
+                self.assertEqual(twitter_monitor.effective_push_window_minutes(t, 45), 1440)
+
+    def test_event_window_never_shrinks_relaxed_base(self):
+        # seen 损坏安全模式放宽到 1440，事件窗口 360 不得反向缩小
+        t = {"_push_event_type": "quota_reset"}
+        self.assertEqual(twitter_monitor.effective_push_window_minutes(t, 1440), 1440)
+
+    def test_disabled_window_stays_disabled(self):
+        # base <= 0 表示不限龄，事件窗口不得重新收紧
+        t = {"_push_event_type": "quota_policy"}
+        self.assertEqual(twitter_monitor.effective_push_window_minutes(t, 0), 0)
+
+    def test_official_events_survive_beyond_default_window(self):
+        """20h 前的 quota_policy 与 5h 前的 quota_reset 补推；8h 前的 reset 超窗只记 seen。"""
+        # FixedDatetime now = 2026-05-12 00:30 UTC
+        tweets = [
+            {   # quota_policy → 1440min 窗口，20h 前应补推
+                "id": "policy-20h",
+                "text": "Weekly usage limits will be 50% higher for all paid users through August 19.",
+                "createdAt": "Mon May 11 04:30:00 +0000 2026",
+            },
+            {   # quota_reset → 360min 窗口，5h 前应补推
+                "id": "reset-5h",
+                "text": "We've reset 5-hour and weekly rate limits for all users.",
+                "createdAt": "Mon May 11 19:30:00 +0000 2026",
+            },
+            {   # quota_reset 8h 前，超 360min 窗口 → skip stale，只记 seen
+                "id": "reset-8h",
+                "text": "We've reset the weekly rate limits for Pro users after the incident.",
+                "createdAt": "Mon May 11 16:30:00 +0000 2026",
+            },
+        ]
+        args = argparse.Namespace(test=False, seed=False, dry_run=False,
+                                  limit=20, max_push_age_minutes=45)
+        pushed_ids = []
+        saved = {}
+
+        def fake_send_tweet(token, chat_id, username, t, ai=None, thread_id=None):
+            pushed_ids.append(t["id"])
+            return {"ok": True}
+
+        def fake_save_seen(username, seen, last_post_ts=None):
+            saved["seen"] = set(seen)
+
+        with patch.object(twitter_monitor, "datetime", FixedDatetime), \
+             patch.object(twitter_monitor, "_ACCOUNT_CONFIG_BY_USERNAME",
+                          {"officialu": {"push_policy": "claude_dev_original"}}), \
+             patch.object(twitter_monitor, "fetch_tweets", return_value=tweets), \
+             patch.object(twitter_monitor, "load_seen",
+                          return_value=({"already-seen"}, "2026-05-11T00:00:00+00:00")), \
+             patch.object(twitter_monitor, "save_seen", side_effect=fake_save_seen), \
+             patch.object(twitter_monitor, "load_push_retry", return_value=set()), \
+             patch.object(twitter_monitor, "save_push_retry", return_value=None), \
+             patch.object(twitter_monitor, "send_tweet", side_effect=fake_send_tweet), \
+             patch.object(twitter_monitor.time, "sleep", return_value=None):
+            new, pushed, filt, ov = twitter_monitor.process_user(
+                pool=None, ai=FakeAI(False), username="officialu",
+                bot_token="b", chat_id="c", args=args)
+        self.assertEqual(new, 3)
+        self.assertEqual(pushed, 2)
+        self.assertEqual(pushed_ids, ["policy-20h", "reset-5h"])
+        # 超窗的 reset-8h 仍进 seen，不进 push_retry
+        self.assertIn("reset-8h", saved["seen"])
+
+    def test_normal_account_not_extended_by_event_windows(self):
+        """无 push_policy 的普通账号不带事件注解，46 分钟前的推文仍判 stale。"""
+        tweets = [{
+            "id": "plain-46m",
+            "text": "This ordinary tweet is long enough to pass the classifier filters easily.",
+            "createdAt": "Mon May 11 23:44:00 +0000 2026",
+        }]
+        args = argparse.Namespace(test=False, seed=False, dry_run=False,
+                                  limit=20, max_push_age_minutes=45)
+        pushed_ids = []
+
+        def fake_send_tweet(token, chat_id, username, t, ai=None, thread_id=None):
+            pushed_ids.append(t["id"])
+            return {"ok": True}
+
+        with patch.object(twitter_monitor, "datetime", FixedDatetime), \
+             patch.object(twitter_monitor, "_ACCOUNT_CONFIG_BY_USERNAME", {}), \
+             patch.object(twitter_monitor, "fetch_tweets", return_value=tweets), \
+             patch.object(twitter_monitor, "load_seen",
+                          return_value=({"already-seen"}, "2026-05-11T00:00:00+00:00")), \
+             patch.object(twitter_monitor, "save_seen", return_value=None), \
+             patch.object(twitter_monitor, "load_push_retry", return_value=set()), \
+             patch.object(twitter_monitor, "save_push_retry", return_value=None), \
+             patch.object(twitter_monitor, "send_tweet", side_effect=fake_send_tweet), \
+             patch.object(twitter_monitor.time, "sleep", return_value=None):
+            new, pushed, filt, ov = twitter_monitor.process_user(
+                pool=None, ai=FakeAI(False), username="plainu",
+                bot_token="b", chat_id="c", args=args)
+        self.assertEqual(new, 1)
+        self.assertEqual(pushed, 0)
+        self.assertEqual(pushed_ids, [])
 
 
 class AccountIsolationTest(unittest.TestCase):
@@ -392,20 +666,24 @@ class RichVideoEmbedTest(unittest.TestCase):
         self.assertIn("<img", rich_calls[1])
         self.assertEqual(legacy_calls, [])          # 不落 HTML
 
-    def test_send_tweet_video_then_second_reject_falls_to_html(self):
+    def test_send_tweet_video_then_second_reject_keeps_poster_photo(self):
         t = self._video_tweet([{"url": "https://video.twimg.com/hi.mp4", "bitrate": 1000}])
-        legacy_calls = []
+        photo_calls, legacy_calls = [], []
 
         def fake_rich(token, chat_id, markdown="", link="", *, html="", thread_id=None):
             return {"ok": False, "rich_fallback": True, "description": "nope"}
 
         with patch.object(twitter_monitor, "_head_content_length", return_value=1000), \
              patch.object(twitter_monitor, "send_telegram_rich", side_effect=fake_rich), \
+             patch.object(twitter_monitor, "send_telegram_photo",
+                          side_effect=lambda *a, **k: photo_calls.append((a, k)) or {"ok": True}), \
              patch.object(twitter_monitor, "send_telegram",
                           side_effect=lambda *a, **k: legacy_calls.append(a) or {"ok": True}):
             r = twitter_monitor.send_tweet("b", "c", "u", t, None)
         self.assertTrue(r.get("ok"))
-        self.assertEqual(len(legacy_calls), 1)      # 两级 rich 均拒 → HTML 兜底
+        self.assertEqual(len(photo_calls), 1)       # 两级 rich 均拒 → 保留视频封面
+        self.assertEqual(photo_calls[0][0][2], "https://pbs.twimg.com/thumb/img/abc")
+        self.assertEqual(legacy_calls, [])
 
     def test_send_tweet_ambiguous_video_never_retries(self):
         t = self._video_tweet([{"url": "https://video.twimg.com/hi.mp4", "bitrate": 1000}])
@@ -428,6 +706,72 @@ class RichVideoEmbedTest(unittest.TestCase):
             _msg, rich, _ = twitter_monitor.format_message("u", t, None)
         self.assertNotIn("<video", rich)
         self.assertIn("▶️ 视频", rich)
+
+
+class StripAnsiTest(unittest.TestCase):
+    """ANSI escape codes from colored CLI stderr must not reach TG alerts."""
+
+    def test_strip_ansi_removes_sgr_bold(self):
+        raw = "\x1b[1mgrok-4.5[1M]\x1b[22m failed"
+        self.assertEqual(twitter_monitor.strip_ansi(raw), "grok-4.5[1M] failed")
+
+    def test_strip_ansi_removes_colors_and_keeps_text(self):
+        raw = "\x1b[31mERROR\x1b[0m: boom \x1b[1mbold\x1b[22m"
+        self.assertEqual(twitter_monitor.strip_ansi(raw), "ERROR: boom bold")
+
+    def test_strip_ansi_none_and_empty(self):
+        self.assertEqual(twitter_monitor.strip_ansi(""), "")
+        self.assertEqual(twitter_monitor.strip_ansi(None), "")
+
+    def test_fetch_article_markdown_failure_strips_ansi_from_cli_stderr(self):
+        colored = "\x1b[31mfetch failed\x1b[0m: cookie expired"
+        entry = {
+            "article_id": "123",
+            "author": "dotey",
+            "tweet_id": "999",
+        }
+        fake = argparse.Namespace(
+            returncode=1, stdout="", stderr=colored,
+        )
+        with patch.object(twitter_monitor, "load_article_markdown_cmd",
+                          return_value="/usr/local/bin/x-article-to-markdown"), \
+             patch.object(twitter_monitor.subprocess, "run", return_value=fake):
+            md, err = twitter_monitor.fetch_article_markdown("dotey", entry)
+        self.assertIsNone(md)
+        self.assertTrue(err.startswith("markdown_fetch_failed:"))
+        self.assertNotIn("\x1b", err)
+        self.assertNotIn("[31m", err)
+        self.assertNotIn("[0m", err)
+        self.assertIn("fetch failed: cookie expired", err)
+
+    def test_format_article_failure_message_reason_has_no_ansi(self):
+        entry = {
+            "article_id": "123",
+            "author": "dotey",
+            "article_title": "t",
+            "attempts": 1,
+            "failed_stage": "fetch",
+        }
+        reason = "markdown_fetch_failed:\x1b[1mbad\x1b[22m"
+        msg, _ = twitter_monitor.format_article_failure_message("dotey", entry, reason)
+        self.assertNotIn("\x1b", msg)
+        self.assertNotIn("[1m", msg)
+        self.assertNotIn("[22m", msg)
+        self.assertIn("markdown_fetch_failed:bad", msg)
+
+    def test_note_account_failure_strips_ansi_in_stored_and_alert(self):
+        failures = {}
+        err = "HTTP 401: \x1b[31munauthorized\x1b[0m"
+        with patch.object(twitter_monitor, "send_telegram",
+                          return_value={"ok": True, "result": {"message_id": 1}}) as send, \
+             patch.object(twitter_monitor, "_tg_post_quiet", return_value={"ok": True}), \
+             patch.object(twitter_monitor, "FAIL_ALERT_THRESHOLD", 1):
+            twitter_monitor.note_account_failure(
+                failures, "dotey", err, "tok", "chat", dry_run=False)
+        self.assertEqual(failures["dotey"]["last_error"], "HTTP 401: unauthorized")
+        sent_text = send.call_args[0][2]
+        self.assertNotIn("\x1b", sent_text)
+        self.assertIn("HTTP 401: unauthorized", sent_text)
 
 
 class StripMediaTcoTest(unittest.TestCase):
@@ -462,16 +806,100 @@ class StripMediaTcoTest(unittest.TestCase):
         self.assertIn("https://t.co/REALLINK", msg)
         self.assertNotIn("https://t.co/MEDIALINK", msg)
 
-    def test_no_strip_without_photo_media(self):
-        # 没有 photo 媒体（纯文字 / 仅视频）→ 不触发剥离，正文里的 t.co 原样保留
+    def test_no_strip_without_media(self):
+        # 没有任何媒体（t['media'] 缺失，GraphQL 未提取到）→ 门控不成立，不剥，
+        # 正文里的 t.co 原样保留
         t = {"id": "3",
              "text": "分享一个链接 https://t.co/PLAINLINK",
              "extended_entities": {"media": [
                  {"type": "photo", "url": "https://t.co/PLAINLINK",
                   "media_url_https": "https://pbs.twimg.com/media/p.jpg"}]}}
-        # 注意：t['media'] 缺失（GraphQL 未提取到 photo）→ 门控不成立，不剥
         _msg, rich, _ = twitter_monitor.format_message("vista8", t, None)
         self.assertIn("https://t.co/PLAINLINK", rich)
+
+    def test_media_tco_stripped_for_video_tweet(self):
+        # 视频推文（2026-07-13 修复）：视频已嵌 rich 媒体块（可播放 video 或封面+时长），
+        # 正文尾部的媒体 t.co 同样冗余，必须剥掉——此前门控只认 photo，视频推文漏剥。
+        t = {"id": "4",
+             "text": "新版的ChatGPT对话学英语 https://t.co/VIDEOLINK",
+             "media": [{"type": "video", "url": "https://pbs.twimg.com/cover.jpg",
+                        "duration_ms": 67000}],
+             "extended_entities": {"media": [
+                 {"type": "video", "url": "https://t.co/VIDEOLINK",
+                  "media_url_https": "https://pbs.twimg.com/cover.jpg"}]}}
+        with patch.object(twitter_monitor, "_RICH_VIDEO_ENABLED", False):
+            msg, rich, _ = twitter_monitor.format_message("vista8", t, None)
+        self.assertNotIn("https://t.co/VIDEOLINK", msg)   # HTML 回退不含媒体裸链
+        self.assertNotIn("https://t.co/VIDEOLINK", rich)  # rich 也不含
+        self.assertIn("新版的ChatGPT对话学英语", rich)      # 正文其余部分保留
+
+    def test_user_shared_tco_expanded_to_real_url(self):
+        # 用户主动分享的链接（entities.urls）：t.co 还原为 expanded_url，而不是保留
+        # 不透明短链，也不能误删（2026-07-13 第二形态：vista8 QMReader 推文）。
+        t = {"id": "5",
+             "text": "介绍视频不错。\n\nhttps://t.co/SHARELINK https://t.co/VIDEOLINK",
+             "media": [{"type": "video", "url": "https://pbs.twimg.com/cover.jpg",
+                        "duration_ms": 62000}],
+             "entities": {"urls": [
+                 {"url": "https://t.co/SHARELINK",
+                  "expanded_url": "https://rss.example.ai/",
+                  "display_url": "rss.example.ai"}]},
+             "extended_entities": {"media": [
+                 {"type": "video", "url": "https://t.co/VIDEOLINK",
+                  "media_url_https": "https://pbs.twimg.com/cover.jpg"}]}}
+        with patch.object(twitter_monitor, "_RICH_VIDEO_ENABLED", False):
+            msg, rich, _ = twitter_monitor.format_message("vista8", t, None)
+        for out in (msg, rich):
+            self.assertNotIn("https://t.co/SHARELINK", out)  # 短链不裸露
+            self.assertIn("https://rss.example.ai/", out)     # 换成真实 URL
+            self.assertNotIn("https://t.co/VIDEOLINK", out)  # 媒体短链仍剥掉
+
+    def test_shared_url_is_explicit_clickable_anchor_with_media(self):
+        t = {"id": "5a", "text": "开源地址 https://t.co/SHARELINK",
+             "entities": {"urls": [{
+                 "url": "https://t.co/SHARELINK",
+                 "expanded_url": "https://github.com/joeseesun/qiaomu-youtube-download",
+                 "display_url": "github.com/joeseesun/qiaomu-youtube-download"}]},
+             "media": [{"type": "photo", "url": "https://pbs.twimg.com/media/p1.jpg"}]}
+        msg, rich, _ = twitter_monitor.format_message("vista8", t, None)
+        anchor = ('<a href="https://github.com/joeseesun/qiaomu-youtube-download">'
+                  'github.com/joeseesun/qiaomu-youtube-download</a>')
+        self.assertIn(anchor, msg)
+        self.assertIn(anchor, rich)
+        self.assertIn('<img src="https://pbs.twimg.com/media/p1.jpg"/>', rich)
+
+    def test_unsafe_entity_destination_is_not_rendered_as_anchor(self):
+        t = {"id": "5b", "text": "不要打开 https://t.co/BADLINK",
+             "entities": {"urls": [{"url": "https://t.co/BADLINK",
+                                      "expanded_url": "javascript:alert(1)"}]}}
+        msg, rich, _ = twitter_monitor.format_message("vista8", t, None)
+        self.assertNotIn('<a href="javascript:', msg)
+        self.assertNotIn('<a href="javascript:', rich)
+        self.assertEqual(twitter_monitor._primary_external_url(t), "")
+
+    def test_link_label_is_escaped_and_capped(self):
+        t = {"id": "5c", "text": "链接 https://t.co/LABEL",
+             "entities": {"urls": [{
+                 "url": "https://t.co/LABEL", "expanded_url": "https://example.com/post",
+                 "display_url": "<b>not markup</b>" + "x" * 600}]}}
+        _msg, rich, _ = twitter_monitor.format_message("vista8", t, None)
+        self.assertNotIn("<b>not markup</b>", rich)
+        self.assertIn("&lt;b&gt;not markup&lt;/b&gt;", rich)
+        self.assertLessEqual(len(twitter_monitor._tweet_link_replacements(t)["https://t.co/LABEL"][1]),
+                             512)
+
+    def test_note_tweet_urls_expanded(self):
+        # 长推（note_tweet）里的分享短链也要用 note_tweet.entities.urls 还原
+        t = {"id": "6",
+             "text": "壳截断…",
+             "note_tweet": {"text": "长文正文，推荐 https://t.co/NOTELINK 这篇。",
+                             "entities": {"urls": [
+                                 {"url": "https://t.co/NOTELINK",
+                                  "expanded_url": "https://blog.example.com/post"}]}}}
+        msg, rich, _ = twitter_monitor.format_message("vista8", t, None)
+        for out in (msg, rich):
+            self.assertNotIn("https://t.co/NOTELINK", out)
+            self.assertIn("https://blog.example.com/post", out)
 
     def test_rt_reconstructed_text_strips_media_tco(self):
         # 转推重建全文时媒体 t.co 也要剥离：normalizer 把 entities/extended_entities
@@ -554,6 +982,29 @@ class LatentFixRegressionTest(unittest.TestCase):
             ids = [t["id"] for t in tg.fetch_tweets("dotey", limit=20)]
         self.assertIn("100", ids)
         self.assertIn("200", ids)
+
+    def test_timeline_modules_are_flattened(self):
+        """Thread-heavy accounts can return only TimelineTimelineModule entries."""
+        import json as _json
+        import twitter_graphql as tg
+        def item(tweet_id, text):
+            return {"item": {"itemContent": {"tweet_results": {"result": {
+                "__typename": "Tweet",
+                "legacy": {"id_str": tweet_id, "full_text": text,
+                           "created_at": "Sat Jul 18 02:14:43 +0000 2026"},
+            }}}}}
+        synthetic = {"data": {"user": {"result": {"timeline_v2": {"timeline": {
+            "instructions": [{"entries": [{"content": {
+                "entryType": "TimelineTimelineModule",
+                "items": [item("301", "thread root"), item("302", "self reply")],
+            }}]}],
+        }}}}}}
+        with patch.object(tg, "_auth_headers", lambda: None), \
+             patch.object(tg, "_get_guest_token", lambda: "gt"), \
+             patch.object(tg, "get_user_id", lambda u: "123"), \
+             patch.object(tg, "_curl", lambda *a, **k: _json.dumps(synthetic)):
+            tweets = tg.fetch_tweets("claudeai", limit=20)
+        self.assertEqual([t["id"] for t in tweets], ["301", "302"])
 
 
 class ArticleQueuePruneTest(unittest.TestCase):
@@ -777,6 +1228,37 @@ class RetweetReconstructTest(unittest.TestCase):
         self.assertEqual(t["text"], "RT @orig: 原推完整正文一句话示意")
         self.assertNotIn("note_tweet", t)
         self.assertEqual(t.get("media", []), [])
+
+
+class NoteTweetEntityNormalizationTest(unittest.TestCase):
+    """Long-form URL entities must survive GraphQL normalization into rendering."""
+
+    def test_original_note_entity_becomes_clickable_link(self):
+        import json as _json
+        import twitter_graphql as tg
+        short = "https://t.co/NOTELINK"
+        raw = {
+            "__typename": "Tweet",
+            "legacy": {"id_str": "777", "full_text": "壳文本",
+                       "created_at": "Fri Jun 05 17:30:00 +0000 2026", "entities": {"urls": []}},
+            "note_tweet": {"note_tweet_results": {"result": {
+                "text": "完整长文推荐 " + short,
+                "entity_set": {"urls": [{
+                    "url": short, "expanded_url": "https://blog.example.com/post",
+                    "display_url": "blog.example.com/post"}]},
+            }}},
+        }
+        synthetic = {"data": {"user": {"result": {"timeline_v2": {"timeline": {"instructions": [
+            {"entries": [{"content": {"itemContent": {"tweet_results": {"result": raw}}}}]},
+        ]}}}}}}
+        with patch.object(tg, "_auth_headers", lambda: None), \
+             patch.object(tg, "_get_guest_token", lambda: "gt"), \
+             patch.object(tg, "get_user_id", lambda u: "1"), \
+             patch.object(tg, "_curl", lambda *a, **k: _json.dumps(synthetic)):
+            tweet = tg.fetch_tweets("vista8", limit=20)[0]
+        self.assertEqual(tweet["note_tweet"]["entities"]["urls"][0]["url"], short)
+        _msg, rich, _ = twitter_monitor.format_message("vista8", tweet)
+        self.assertIn('<a href="https://blog.example.com/post">blog.example.com/post</a>', rich)
 
 
 class QuoteArticleTest(unittest.TestCase):
@@ -1816,6 +2298,141 @@ class SendTweetTest(unittest.TestCase):
         self.assertEqual(calls["legacy"], 0)
         self.assertLessEqual(calls["html_len"], twitter_monitor.RICH_MESSAGE_MAX_CHARS)
 
+    def test_text_only_external_link_uses_standard_preview_path(self):
+        calls = {"rich": 0, "legacy": 0, "preview_url": "", "link": ""}
+        tweet = {
+            "id": "10", "text": "推荐 https://t.co/EXTERNAL",
+            "entities": {"urls": [{
+                "url": "https://t.co/EXTERNAL",
+                "expanded_url": "https://example.com/post",
+                "display_url": "example.com/post"}]},
+        }
+
+        def fake_rich(*args, **kwargs):
+            calls["rich"] += 1
+            return {"ok": True}
+
+        def fake_legacy(token, chat_id, text, link="", *, preview_url="", thread_id=None):
+            calls["legacy"] += 1
+            calls["preview_url"] = preview_url
+            calls["link"] = link
+            return {"ok": True}
+
+        with patch.object(twitter_monitor, "send_telegram_rich", side_effect=fake_rich), \
+             patch.object(twitter_monitor, "send_telegram", side_effect=fake_legacy):
+            r = twitter_monitor.send_tweet("tok", "42", "vista8", tweet)
+        self.assertTrue(r["ok"])
+        self.assertEqual(calls["rich"], 0)
+        self.assertEqual(calls["legacy"], 1)
+        self.assertEqual(calls["preview_url"], "https://example.com/post")
+        self.assertEqual(calls["link"], "https://x.com/vista8/status/10")
+
+    def test_unrenderable_media_does_not_suppress_external_preview(self):
+        tweet = {
+            "id": "11", "text": "推荐 https://t.co/EXTERNAL",
+            "entities": {"urls": [{"url": "https://t.co/EXTERNAL",
+                                      "expanded_url": "https://example.com/post"}]},
+            "media": [{"type": "photo", "url": "http://invalid.example/photo.jpg"}],
+        }
+        calls = {"rich": 0, "legacy": 0}
+
+        def fake_legacy(*args, **kwargs):
+            calls["legacy"] += 1
+            self.assertEqual(kwargs["preview_url"], "https://example.com/post")
+            return {"ok": True}
+
+        with patch.object(twitter_monitor, "send_telegram_rich",
+                          side_effect=lambda *a, **k: calls.__setitem__("rich", calls["rich"] + 1)), \
+             patch.object(twitter_monitor, "send_telegram", side_effect=fake_legacy):
+            r = twitter_monitor.send_tweet("tok", "42", "vista8", tweet)
+        self.assertTrue(r["ok"])
+        self.assertEqual(calls, {"rich": 0, "legacy": 1})
+
+    def test_rich_media_rejection_keeps_photo_external_anchor_and_x_button(self):
+        tweet = {
+            "id": "12", "text": "开源地址 https://t.co/EXTERNAL",
+            "entities": {"urls": [{
+                "url": "https://t.co/EXTERNAL",
+                "expanded_url": "https://github.com/joeseesun/qiaomu-youtube-download",
+                "display_url": "github.com/joeseesun/qiaomu-youtube-download",
+            }]},
+            "media": [{"type": "photo", "url": "https://pbs.twimg.com/media/original.jpg"}],
+        }
+        calls = {"rich": 0, "photo": [], "legacy": 0}
+
+        def fake_photo(token, chat_id, photo, caption="", link="", *, thread_id=None):
+            calls["photo"].append({"photo": photo, "caption": caption,
+                                   "link": link, "thread_id": thread_id})
+            return {"ok": True, "result": {"message_id": 12}}
+
+        with patch.object(twitter_monitor, "send_telegram_rich",
+                          side_effect=lambda *a, **k: calls.__setitem__("rich", calls["rich"] + 1)
+                          or {"ok": False, "rich_fallback": True}), \
+             patch.object(twitter_monitor, "send_telegram_photo", side_effect=fake_photo), \
+             patch.object(twitter_monitor, "send_telegram",
+                          side_effect=lambda *a, **k: calls.__setitem__("legacy", calls["legacy"] + 1)
+                          or {"ok": True}):
+            r = twitter_monitor.send_tweet("tok", "42", "vista8", tweet, thread_id=19)
+
+        self.assertTrue(r["ok"])
+        self.assertEqual(calls["rich"], 1)
+        self.assertEqual(calls["legacy"], 0)
+        self.assertEqual(len(calls["photo"]), 1)
+        sent = calls["photo"][0]
+        self.assertEqual(sent["photo"], "https://pbs.twimg.com/media/original.jpg")
+        self.assertIn('href="https://github.com/joeseesun/qiaomu-youtube-download"',
+                      sent["caption"])
+        self.assertEqual(sent["link"], "https://x.com/vista8/status/12")
+        self.assertEqual(sent["thread_id"], 19)
+
+    def test_rejected_photo_falls_back_to_full_html_text(self):
+        tweet = {"id": "13", "text": "带图正文", "media": [
+            {"type": "photo", "url": "https://pbs.twimg.com/media/original.jpg"}]}
+        calls = {"photo": 0, "legacy": 0}
+
+        def fake_legacy(token, chat_id, text, link="", *, preview_url="", thread_id=None):
+            calls["legacy"] += 1
+            self.assertIn("带图正文", text)
+            self.assertEqual(link, "https://x.com/vista8/status/13")
+            return {"ok": True}
+
+        with patch.object(twitter_monitor, "send_telegram_rich",
+                          return_value={"ok": False, "rich_fallback": True}), \
+             patch.object(twitter_monitor, "send_telegram_photo",
+                          side_effect=lambda *a, **k: calls.__setitem__("photo", calls["photo"] + 1)
+                          or {"ok": False, "photo_fallback": True, "description": "bad image"}), \
+             patch.object(twitter_monitor, "send_telegram", side_effect=fake_legacy):
+            r = twitter_monitor.send_tweet("tok", "42", "vista8", tweet)
+
+        self.assertTrue(r["ok"])
+        self.assertEqual(calls, {"photo": 1, "legacy": 1})
+
+    def test_photo_caption_stays_inside_caption_budget_with_external_link(self):
+        tweet = {
+            "text": "🐍" * 1200 + " https://t.co/EXTERNAL",
+            "entities": {"urls": [{
+                "url": "https://t.co/EXTERNAL", "expanded_url": "https://example.com/post",
+                "display_url": "example.com/post"}]},
+        }
+        caption = twitter_monitor._tweet_photo_caption(
+            "📢 @vista8\n\n" + twitter_monitor._render_tweet_urls(tweet["text"], tweet, rich=False), tweet)
+        self.assertLessEqual(len(twitter_monitor._html_to_plain(caption).encode("utf-16-le")) // 2,
+                             twitter_monitor.PHOTO_CAPTION_MAX_UTF16)
+        self.assertIn('href="https://example.com/post"', caption)
+
+    def test_send_telegram_keeps_x_button_but_previews_external_url(self):
+        captured = []
+        with patch.object(twitter_monitor, "_tg_post",
+                          side_effect=lambda token, payload, method="sendMessage": captured.append(payload) or {"ok": True}):
+            r = twitter_monitor.send_telegram(
+                "tok", "42", '<a href="https://example.com/post">example.com/post</a>',
+                "https://x.com/vista8/status/10", preview_url="https://example.com/post")
+        self.assertTrue(r["ok"])
+        payload = captured[0]
+        self.assertEqual(payload["link_preview_options"]["url"], "https://example.com/post")
+        self.assertEqual(payload["reply_markup"]["inline_keyboard"][0][0]["url"],
+                         "https://x.com/vista8/status/10")
+
 
 class _FakeBackend:
     def __init__(self, name, result=None, exc=None):
@@ -1906,6 +2523,12 @@ class RtBreakTest(unittest.TestCase):
             "dotey", {"id": "9", "note_tweet": {"text": note}}, None)
         self.assertIn("RT @bigaccount:\n\n", msg)
         self.assertIn("RT @bigaccount:<br><br>", rich)
+
+    def test_retweet_source_button_targets_rendered_original(self):
+        _msg, _rich, link = twitter_monitor.format_message(
+            "dotey", {"id": "999", "text": "RT @orig: 原推正文",
+                      "retweeted_status": {"id": "888", "screen_name": "orig"}}, None)
+        self.assertEqual(link, "https://x.com/orig/status/888")
 
 
 class RichPreserveTest(unittest.TestCase):
@@ -2129,12 +2752,22 @@ class AIFailClosedTest(unittest.TestCase):
         def classify(self, username: str, text: str):
             raise RuntimeError("api down")
 
+        def classify_musing(self, username: str, text: str):
+            raise RuntimeError("api down")
+
     def test_confirm_promo_all_failed_returns_fail_closed(self):
         ai = twitter_monitor.AIClassifier([self.FailingBackend()])
         self.assertEqual(ai.confirm_promo("u", "text"), (False, "all_ai_failed"))
 
         empty_ai = twitter_monitor.AIClassifier([])
         self.assertEqual(empty_ai.confirm_promo("u", "text"), (False, "all_ai_failed"))
+
+    def test_confirm_musing_all_failed_returns_fail_closed(self):
+        ai = twitter_monitor.AIClassifier([self.FailingBackend()])
+        self.assertEqual(ai.confirm_musing("u", "text"), (False, "all_ai_failed"))
+
+        empty_ai = twitter_monitor.AIClassifier([])
+        self.assertEqual(empty_ai.confirm_musing("u", "text"), (False, "all_ai_failed"))
 
     def test_process_user_suspicious_all_ai_failed_goes_to_filtered(self):
         args = argparse.Namespace(test=False, seed=False, dry_run=False,
@@ -2273,6 +2906,25 @@ class GraphqlEmptyListTest(unittest.TestCase):
 
 
 class GraphqlCurlTest(unittest.TestCase):
+    def test_x_html_entities_are_normalized_once_before_telegram_rendering(self):
+        import html as std_html
+        import twitter_graphql as tg
+        normalized = tg.normalize_x_text("写作 -&gt; 为了写作去学习实践 &amp; 分享")
+        self.assertEqual(normalized, "写作 -> 为了写作去学习实践 & 分享")
+        fallback, rich, _ = twitter_monitor.format_message("dotey", {"id": "entity-1", "text": normalized}, None)
+        self.assertNotIn("&amp;gt;", fallback)
+        self.assertNotIn("&amp;gt;", rich)
+        self.assertIn("写作 ->", std_html.unescape(fallback))
+        self.assertIn("写作 ->", std_html.unescape(rich))
+
+    def test_x_html_entity_normalization_does_not_weaken_html_escaping(self):
+        import twitter_graphql as tg
+        normalized = tg.normalize_x_text("&lt;script&gt;alert(1)&lt;/script&gt;")
+        fallback, rich, _ = twitter_monitor.format_message("dotey", {"id": "entity-2", "text": normalized}, None)
+        for rendered in (fallback, rich):
+            self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", rendered)
+            self.assertNotIn("<script>alert(1)</script>", rendered)
+
     def test_curl_file_not_found_returns_empty(self):
         import twitter_graphql as tg
         with patch.object(tg.subprocess, "run", side_effect=FileNotFoundError):
@@ -2344,6 +2996,26 @@ class ContentRoutingTest(unittest.TestCase):
         with patch.object(twitter_monitor, "_tg_post", side_effect=fake_post):
             twitter_monitor.send_telegram_rich("tok", "chat", html="hi", thread_id=19)
         self.assertEqual(captured["payload"].get("message_thread_id"), 19)
+
+    def test_send_telegram_photo_keeps_caption_button_and_thread(self):
+        captured = {}
+
+        def fake_post(token, payload, method="sendMessage"):
+            captured["payload"] = payload
+            captured["method"] = method
+            return {"ok": True}
+
+        with patch.object(twitter_monitor, "_tg_post", side_effect=fake_post):
+            r = twitter_monitor.send_telegram_photo(
+                "tok", "chat", "https://pbs.twimg.com/media/a.jpg",
+                '<a href="https://example.com">打开外链</a>',
+                "https://x.com/u/status/1", thread_id=19)
+        self.assertTrue(r["ok"])
+        self.assertEqual(captured["method"], "sendPhoto")
+        self.assertEqual(captured["payload"].get("message_thread_id"), 19)
+        self.assertEqual(captured["payload"]["photo"], "https://pbs.twimg.com/media/a.jpg")
+        self.assertEqual(captured["payload"]["reply_markup"]["inline_keyboard"][0][0]["url"],
+                         "https://x.com/u/status/1")
 
     def test_send_tweet_propagates_thread_id_to_rich_and_fallback(self):
         rich_calls = []
@@ -2814,6 +3486,15 @@ class ThreadNotFoundFallbackTest(unittest.TestCase):
             r = twitter_monitor.send_telegram_rich("bot", "chat", html="hi", thread_id=555)
         self.assertTrue(r.get("ok"))
         self.assertNotIn("rich_fallback", r)
+        self.assertEqual([c.get("message_thread_id") for c in calls], [555, 19])
+
+    def test_send_telegram_photo_falls_back_to_default_thread(self):
+        calls = []
+        with patch.object(twitter_monitor, "_tg_post",
+                          side_effect=self._thread_not_found_post(calls)):
+            r = twitter_monitor.send_telegram_photo(
+                "bot", "chat", "https://pbs.twimg.com/media/a.jpg", "hi", thread_id=555)
+        self.assertTrue(r.get("ok"))
         self.assertEqual([c.get("message_thread_id") for c in calls], [555, 19])
 
     def test_no_fallback_id_drops_to_general(self):
@@ -3497,6 +4178,160 @@ class CookieHealthAlertTest(unittest.TestCase):
                 st = json.loads(Path(path).read_text())
             self.assertEqual(sent, [])
             self.assertEqual(st["consecutive_degraded"], 0)
+
+
+class MusingClassifyTest(unittest.TestCase):
+    """碎碎念规则层：classify 启发式 + 不误伤实质内容。"""
+
+    def test_pocket3_fishing_sample_is_musing_suspicious(self):
+        t = {
+            "text": "把pocket3充满电，准备去钓鱼。",
+            "media": [{"type": "photo", "url": "https://pbs.twimg.com/media/x.jpg"}],
+        }
+        status, reason = twitter_monitor.classify(t)
+        self.assertEqual(status, "suspicious")
+        self.assertTrue(
+            reason.startswith(twitter_monitor.REASON_MUSING_PREFIX),
+            msg=reason,
+        )
+
+    def test_short_photo_status_is_musing(self):
+        t = {
+            # ≥ MIN_LEN=18，否则会先被 too_short 硬过滤
+            "text": "今天天气真的不错呀，出门去晒太阳了。",
+            "media": [{"type": "photo", "url": "https://pbs.twimg.com/media/x.jpg"}],
+        }
+        status, reason = twitter_monitor.classify(t)
+        self.assertEqual(status, "suspicious")
+        self.assertTrue(reason.startswith(twitter_monitor.REASON_MUSING_PREFIX), msg=reason)
+
+    def test_life_kw_without_photo_is_musing(self):
+        t = {"text": "周末宅家追剧，什么都不想干就这样过。"}
+        status, reason = twitter_monitor.classify(t)
+        self.assertEqual(status, "suspicious")
+        self.assertIn("musing_life_kw", reason)
+
+    def test_technical_post_still_passes(self):
+        t = {"text": "Claude 新 API 支持 prompt caching，延迟降一半。"}
+        status, reason = twitter_monitor.classify(t)
+        self.assertEqual((status, reason), ("pass", "ok"))
+
+    def test_substantive_keyword_blocks_musing(self):
+        t = {
+            "text": "把手机充满电后继续跑本地模型评测，结果很意外。",
+            "media": [{"type": "photo", "url": "https://pbs.twimg.com/media/x.jpg"}],
+        }
+        status, reason = twitter_monitor.classify(t)
+        self.assertEqual((status, reason), ("pass", "ok"))
+
+    def test_non_media_url_blocks_musing(self):
+        t = {
+            "text": "出门钓鱼前看这篇 https://example.com/guide 讲得不错。",
+            "media": [{"type": "photo", "url": "https://pbs.twimg.com/media/x.jpg"}],
+            "entities": {
+                "urls": [{"url": "https://t.co/abc", "expanded_url": "https://example.com/guide"}],
+            },
+        }
+        status, reason = twitter_monitor.classify(t)
+        self.assertEqual((status, reason), ("pass", "ok"))
+
+    def test_too_short_still_hard_filter(self):
+        status, reason = twitter_monitor.classify({"text": "短"})
+        self.assertEqual(status, "filter")
+        self.assertTrue(reason.startswith("too_short"), msg=reason)
+
+    def test_long_note_tweet_not_musing(self):
+        t = {
+            "text": "把pocket3充满电，准备去钓鱼。",
+            "note_tweet": {"text": "关于 AI agent 工作流的一些观察：" + ("细节" * 80)},
+            "media": [{"type": "photo", "url": "https://pbs.twimg.com/media/x.jpg"}],
+        }
+        status, reason = twitter_monitor.classify(t)
+        self.assertEqual((status, reason), ("pass", "ok"))
+
+    def test_commercial_still_suspicious_not_musing(self):
+        t = {
+            "text": "byteplus seedance 2.0 api 文档访问体验开通模型冲 200 立即体验方舟平台",
+        }
+        status, reason = twitter_monitor.classify(t)
+        self.assertEqual(status, "suspicious")
+        self.assertTrue(reason.startswith("commercial"), msg=reason)
+
+
+class MusingProcessUserTest(unittest.TestCase):
+    """碎碎念 process_user：AI 确认/否决/失败/无 AI 默认 filter。"""
+
+    SAMPLE = {
+        "id": "m1",
+        "text": "把pocket3充满电，准备去钓鱼。",
+        "media": [{"type": "photo", "url": "https://pbs.twimg.com/media/x.jpg"}],
+        "createdAt": "Tue May 12 00:20:00 +0000 2026",
+    }
+
+    def _run(self, ai, tweet=None):
+        args = argparse.Namespace(test=False, seed=False, dry_run=False,
+                                  limit=20, max_push_age_minutes=45)
+        pushed_ids = []
+
+        def fake_send_tweet(token, chat_id, username, t, ai=None, thread_id=None):
+            pushed_ids.append(t["id"])
+            return {"ok": True}
+
+        with patch.object(twitter_monitor, "datetime", FixedDatetime), \
+             patch.object(twitter_monitor, "fetch_tweets",
+                          return_value=[tweet or self.SAMPLE]), \
+             patch.object(twitter_monitor, "load_seen", return_value=({"old"}, None)), \
+             patch.object(twitter_monitor, "save_seen", return_value=None), \
+             patch.object(twitter_monitor, "send_tweet", side_effect=fake_send_tweet), \
+             patch.object(twitter_monitor, "_alert_ai_all_failed", return_value=None), \
+             patch.object(twitter_monitor.time, "sleep", return_value=None):
+            new, pushed, filt, ov = twitter_monitor.process_user(
+                pool=None, ai=ai, username="vista8",
+                bot_token="b", chat_id="c", args=args)
+        return new, pushed, filt, ov, pushed_ids
+
+    def test_ai_confirms_musing_filters(self):
+        new, pushed, filt, ov, ids = self._run(FakeAI(True, musing=True, musing_reason="life"))
+        self.assertEqual((new, pushed, filt, ov), (1, 0, 1, 0))
+        self.assertEqual(ids, [])
+
+    def test_ai_rejects_musing_pushes(self):
+        new, pushed, filt, ov, ids = self._run(
+            FakeAI(True, musing=False, musing_reason="has_insight"))
+        self.assertEqual((new, pushed, filt), (1, 1, 0))
+        self.assertEqual(ov, 1)
+        self.assertEqual(ids, ["m1"])
+
+    def test_no_ai_filters_musing_by_default(self):
+        new, pushed, filt, ov, ids = self._run(FakeAI(False))
+        self.assertEqual((new, pushed, filt, ov), (1, 0, 1, 0))
+        self.assertEqual(ids, [])
+
+    def test_ai_all_failed_filters_musing(self):
+        class FailAI:
+            def is_available(self):
+                return True
+
+            def confirm_musing(self, username, text):
+                return False, "all_ai_failed"
+
+            def confirm_promo(self, username, text):
+                return False, "all_ai_failed"
+
+        new, pushed, filt, ov, ids = self._run(FailAI())
+        self.assertEqual((new, pushed, filt, ov), (1, 0, 1, 0))
+        self.assertEqual(ids, [])
+
+    def test_promo_no_ai_still_passes(self):
+        promo = {
+            "id": "p1",
+            "text": "byteplus seedance 2.0 api 文档访问体验开通模型冲 200 立即体验方舟平台",
+            "createdAt": "Tue May 12 00:20:00 +0000 2026",
+        }
+        new, pushed, filt, ov, ids = self._run(FakeAI(False), tweet=promo)
+        self.assertEqual((new, pushed, filt), (1, 1, 0))
+        self.assertEqual(ids, ["p1"])
+
 
 
 if __name__ == "__main__":
