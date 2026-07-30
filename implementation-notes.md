@@ -297,3 +297,12 @@ Addressed the remaining eval items the user explicitly opted into.
 
 ### Verification
 - 新增回归测试：-&gt; 不再变为 &amp;gt;；实体解码不削弱 script 内容的 Telegram HTML 转义。
+
+## 2026-07-30 — BWG production consolidation
+
+### Design Decisions
+- 以 BWG 当前已运行且通过 277 项测试的实现作为合并基线，再回收到 Mac 本地修复测试隔离；避免从较旧的本地分支覆盖生产功能。
+- 完整测试必须隔离 `twitter_seen/` 等生产状态；部署后的 BWG 只执行语法、配置和无发送渲染验收。
+
+### Tradeoffs
+- 保留 BWG 现有账号策略和事件新鲜度配置，不在本次合并中重新设计推送规则。

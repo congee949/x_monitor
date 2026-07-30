@@ -10,6 +10,48 @@ from unittest.mock import patch
 import twitter_monitor
 
 
+_TEST_STATE_TMP = None
+_TEST_STATE_PATCHERS = []
+
+
+def setUpModule():
+    """Keep every default runtime-state path inside a disposable test sandbox."""
+    global _TEST_STATE_TMP, _TEST_STATE_PATCHERS
+    import macrumors_daily
+
+    _TEST_STATE_TMP = tempfile.TemporaryDirectory()
+    root = Path(_TEST_STATE_TMP.name)
+    paths = {
+        "SEEN_DIR": root / "twitter_seen",
+        "SEEN_RECOVERY_DIR": root / "twitter_seen" / ".seen_recovery",
+        "PUSHED_INDEX_PATH": root / "twitter_seen" / ".pushed_index.json",
+        "ASSUMED_DELIVERY_PATH": root / "twitter_seen" / ".assumed_delivered.json",
+        "ARTICLE_QUEUE_DIR": root / "twitter_articles",
+        "ARTICLE_CACHE_DIR": root / "twitter_articles" / "cache",
+        "FAILURES_PATH": root / ".account_failures.json",
+        "DASHBOARD_PATH": root / ".dashboard.json",
+        "COOKIE_HEALTH_PATH": root / ".cookie_health.json",
+    }
+    _TEST_STATE_PATCHERS = [
+        patch.object(twitter_monitor, name, str(path)) for name, path in paths.items()
+    ]
+    _TEST_STATE_PATCHERS.append(
+        patch.object(macrumors_daily, "SEEN_PATH", str(root / ".macrumors_seen.json"))
+    )
+    for patcher in _TEST_STATE_PATCHERS:
+        patcher.start()
+
+
+def tearDownModule():
+    global _TEST_STATE_TMP, _TEST_STATE_PATCHERS
+    for patcher in reversed(_TEST_STATE_PATCHERS):
+        patcher.stop()
+    _TEST_STATE_PATCHERS = []
+    if _TEST_STATE_TMP is not None:
+        _TEST_STATE_TMP.cleanup()
+        _TEST_STATE_TMP = None
+
+
 class FixedDatetime(datetime):
     @classmethod
     def now(cls, tz=None):
@@ -1838,6 +1880,8 @@ class PushCountTest(unittest.TestCase):
              patch.object(twitter_monitor, "fetch_tweets", return_value=tweets), \
              patch.object(twitter_monitor, "load_seen", return_value=({"old"}, None)), \
              patch.object(twitter_monitor, "save_seen", return_value=None), \
+             patch.object(twitter_monitor, "load_push_retry", return_value=set()), \
+             patch.object(twitter_monitor, "save_push_retry", return_value=None), \
              patch.object(twitter_monitor, "send_telegram", side_effect=flaky_send), \
              patch.object(twitter_monitor.time, "sleep", return_value=None):
             new, pushed, _f, _a = twitter_monitor.process_user(
@@ -3243,7 +3287,8 @@ class CrossAccountDedupTest(unittest.TestCase):
             with patch.object(twitter_monitor, "PUSHED_INDEX_PATH", path), \
                  patch.object(twitter_monitor, "_PUSHED_INDEX_CACHE", cache):
                 twitter_monitor.save_pushed_index()
-                saved = json.load(open(path))["entries"]
+                with open(path) as f:
+                    saved = json.load(f)["entries"]
         self.assertNotIn("t:old", saved)
         self.assertLessEqual(len(saved), twitter_monitor.PUSHED_INDEX_MAX_ENTRIES)
 
@@ -3272,7 +3317,8 @@ class CrossAccountDedupTest(unittest.TestCase):
                  patch.object(twitter_monitor, "ARTICLE_CACHE_DIR",
                               _os.path.join(d, "cache")):
                 twitter_monitor.process_article_queue(FakeAI(True), "bot", "chat")
-            saved = _json.load(open(qpath))[0]
+            with open(qpath) as f:
+                saved = _json.load(f)[0]
         self.assertEqual(saved["status"], "skipped")
         self.assertEqual(saved["skip_reason"], "cross_dup")
         # skipped 是终态，纳入 7 天保留期清理
@@ -3582,6 +3628,7 @@ class TgPostDeliveryClassificationTest(unittest.TestCase):
         import io
         import urllib.error
         err = urllib.error.HTTPError("url", 400, "Bad Request", {}, io.BytesIO(b"{}"))
+        self.addCleanup(err.close)
         with patch("urllib.request.urlopen", side_effect=err):
             with self.assertRaises(urllib.error.HTTPError) as ctx:
                 twitter_monitor._tg_post("tok", {"chat_id": "1"})
@@ -3647,6 +3694,7 @@ class TgPostDeliveryClassificationTest(unittest.TestCase):
         import urllib.error
         twitter_monitor._AMBIGUOUS_STREAK = 1
         err = urllib.error.HTTPError("url", 502, "Bad Gateway", {}, io.BytesIO(b""))
+        self.addCleanup(err.close)
         with patch("urllib.request.urlopen", side_effect=err):
             with self.assertRaises(urllib.error.HTTPError):
                 twitter_monitor._tg_post("tok", {"chat_id": "1"})
@@ -3658,6 +3706,7 @@ class TgPostDeliveryClassificationTest(unittest.TestCase):
         import urllib.error
         twitter_monitor._AMBIGUOUS_STREAK = 1
         err = urllib.error.HTTPError("url", 429, "Too Many Requests", {}, io.BytesIO(b"{}"))
+        self.addCleanup(err.close)
         with patch("urllib.request.urlopen", side_effect=err):
             with self.assertRaises(urllib.error.HTTPError):
                 twitter_monitor._tg_post("tok", {"chat_id": "1"})

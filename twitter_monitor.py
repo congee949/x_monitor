@@ -1640,6 +1640,8 @@ def fetch_tweets(pool: TokenPool, username: str, limit: int = 20) -> list[dict]:
                 err_body = e.read().decode("utf-8", errors="replace")
             except Exception:
                 err_body = ""
+            finally:
+                e.close()
             last_error = f"HTTP {code_err}: {err_body[:100]}"
             if code_err in (402, 429, 401, 403, 500, 502, 503):
                 pool.mark_failed(label)
@@ -2788,6 +2790,7 @@ def _tg_post(token: str, payload: dict, method: str = "sendMessage") -> dict:
             # 网关超时：上游已收到请求但未及时响应——与读超时同构的歧义
             # （请求可能已被处理），归入 TgAmbiguousDelivery，绝不能走
             # 5xx 盲重试路径重发。502/503 表示未到达后端，保留重试。
+            e.close()
             raise TgAmbiguousDelivery(f"HTTP 504: {e.reason}") from e
         # 4xx（含 429）由 Bot API 后端产生，证明链路在处理请求 → 清零熔断计数；
         # 其余 5xx 多为边缘 nginx 在后端不可达时直接生成，不证明任何事，不清零——
@@ -2817,6 +2820,16 @@ def _tg_post(token: str, payload: dict, method: str = "sendMessage") -> dict:
     return result
 
 
+def _consume_http_error_body(error: urllib.error.HTTPError) -> str:
+    """Read and close an HTTPError body owned by the current handler."""
+    try:
+        return error.read().decode("utf-8", "replace")
+    except Exception:
+        return ""
+    finally:
+        error.close()
+
+
 def _tg_post_quiet(token: str, payload: dict, method: str) -> dict:
     """编辑/置顶类锦上添花调用：失败只打日志，绝不打断本轮监控。
 
@@ -2825,10 +2838,7 @@ def _tg_post_quiet(token: str, payload: dict, method: str) -> dict:
     try:
         return _tg_post(token, payload, method=method)
     except urllib.error.HTTPError as e:
-        try:
-            body = e.read().decode("utf-8", "replace")
-        except Exception:
-            body = ""
+        body = _consume_http_error_body(e)
         if "message is not modified" in body:
             return {"ok": True, "not_modified": True}
         print(f"  {method} 失败（忽略）: {e} {body[:120]}")
@@ -2893,10 +2903,7 @@ def send_telegram_rich(token: str, chat_id: str, markdown: str = "", link: str =
             return {"ok": True, "assumed_delivered": True}
         except urllib.error.HTTPError as e:
             last_err = e
-            try:
-                body = e.read().decode("utf-8", "replace")
-            except Exception:
-                body = ""
+            body = _consume_http_error_body(e)
             if e.code == 429:
                 retry_after = 3
                 try:
@@ -2972,10 +2979,7 @@ def send_telegram_photo(token: str, chat_id: str, photo: str, caption: str = "",
             return {"ok": True, "assumed_delivered": True}
         except urllib.error.HTTPError as e:
             last_err = e
-            try:
-                body = e.read().decode("utf-8", "replace")
-            except Exception:
-                body = ""
+            body = _consume_http_error_body(e)
             if e.code == 429:
                 retry_after = 3
                 try:
@@ -3064,10 +3068,7 @@ def send_telegram(token: str, chat_id: str, text: str, link: str = "",
             return {"ok": True, "assumed_delivered": True}
         except urllib.error.HTTPError as e:
             last_err = e
-            try:
-                body = e.read().decode("utf-8", "replace")
-            except Exception:
-                body = ""
+            body = _consume_http_error_body(e)
             if e.code == 429:
                 retry_after = 3
                 try:

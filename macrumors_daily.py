@@ -463,7 +463,7 @@ def send_html(token: str, chat_id: str, text: str, trace_id: str = "",
             print(f"sendMessage 响应缺失，按已送达处理（防重复）: {e}", file=sys.stderr)
             return
         except urllib.error.HTTPError as e:
-            body = e.read().decode("utf-8", "replace") if hasattr(e, "read") else ""
+            body = tm._consume_http_error_body(e)
             if e.code == 429:
                 try:
                     time.sleep(min(int(json.loads(body)["parameters"]["retry_after"]), 30))
