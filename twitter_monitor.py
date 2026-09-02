@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import http.client
 import json
 import os
@@ -26,8 +27,10 @@ import shlex
 import subprocess
 import re
 import signal
+import sqlite3
 import sys
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -82,12 +85,42 @@ def apply_route_overlay(cfg):
 TOKENS_PATH = os.path.join(SCRIPT_DIR, "twitter_tokens.json")
 AI_CONFIG_PATH = os.path.join(SCRIPT_DIR, "twitter_ai.json")
 SEEN_DIR = os.path.join(SCRIPT_DIR, "twitter_seen")
+# Confirmed content deliveries copied to r4s for Hermes' heart/preference lookup.
+# This ledger is intentionally separate from twitter_seen and chat-daily's media
+# ledger: it is append-only provenance, never a delivery/checkpoint dependency.
+SENT_CONTENT_LEDGER_PATH = os.path.join(
+    SCRIPT_DIR, "state", "x_monitor_sent_content_ledger.jsonl")
+SENT_CONTENT_MAX_CHARS = 12000
+_SENT_CONTENT_LEDGER_ENABLED = True
 # 跨账号去重索引（纯转发原推 id / article rest_id → 首推记录）
 PUSHED_INDEX_PATH = os.path.join(SEEN_DIR, ".pushed_index.json")
 PUSHED_INDEX_TTL_DAYS = 14      # 45min 推送窗口已挡旧推，索引只防迟到的 RT 波
 PUSHED_INDEX_MAX_ENTRIES = 4000
 # 歧义按已送达处理的发送痕迹（下一轮汇总 DM 核对后清除）
 ASSUMED_DELIVERY_PATH = os.path.join(SEEN_DIR, ".assumed_delivered.json")
+EVENT_LEDGER_PATH = os.path.join(SEEN_DIR, ".event_ledger.sqlite3")
+EVENT_LEDGER_PENDING_TTL_SECONDS = 30 * 60
+EVENT_LEDGER_EVENT_WINDOW_HOURS = 72
+LEDGER_SCHEMA_VERSION = 1       # PRAGMA user_version：一次性数据迁移的记账位
+# 推文 → Telegram 消息锚点保留期。X 自回复串多在数小时内接完，30 天足够覆盖
+# 「隔天补一条评论」，又不让表无限长（GC 在每次写锚点时顺带做）。
+TWEET_ANCHOR_TTL_DAYS = 30
+# Safe rollout: observe records would-be duplicate decisions but never suppresses.
+# main may request enforce, but the persisted review gate must pass first.
+_EVENT_DEDUP_MODE = "off"  # main initializes the production default to observe
+_EVENT_DEDUP_EFFECTIVE_MODE = "off"
+EVENT_ENFORCE_MIN_REVIEWED = 20
+EVENT_ENFORCE_MAX_FALSE_POSITIVE_RATE = 0.02
+
+# Additive rollout gate. Production keeps the legacy path until config explicitly
+# enables a curator shadow/gray rollout; the provider still emits bundles so fixtures
+# and shadow tooling can validate them without changing delivery.
+_SEMANTIC_BUNDLE_ENABLED = False
+_SEMANTIC_BUNDLE_SHADOW = False
+_SEMANTIC_CURATOR_ALLOWLIST: set[str] = set()
+SEMANTIC_DECISION_JOURNAL = os.path.join(SEEN_DIR, ".semantic_decisions.jsonl")
+SEMANTIC_JOURNAL_MAX_BYTES = 8 * 1024 * 1024
+SEMANTIC_SHADOW_LEDGER = os.path.join(SEEN_DIR, ".semantic_shadow.jsonl")
 
 # GraphQL data source (free, no API key)
 try:
@@ -96,6 +129,11 @@ try:
     HAS_GRAPHQL = True
 except ImportError:
     HAS_GRAPHQL = False
+
+try:
+    import learning_feed
+except ImportError:
+    learning_feed = None
 
 API_BASE = "https://ai.6551.io"
 API_ENDPOINT = f"{API_BASE}/open/twitter_user_tweets"
@@ -113,6 +151,131 @@ def _atomic_write(path: str, data: str) -> None:
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)
+
+
+def _sent_content_int(value) -> "int | None":
+    """Strict integer coercion for Telegram/X identifiers (bool is not an id)."""
+    if isinstance(value, bool):
+        return None
+    try:
+        result = int(value)
+    except (TypeError, ValueError):
+        return None
+    return result if result > 0 or result < 0 else None
+
+
+def _sent_content_text(value: str) -> str:
+    """Store bounded human-visible content, never a raw API/cookie payload."""
+    text = str(value or "").replace("\x00", "")
+    text = "".join(ch for ch in text if ch in "\n\t" or ord(ch) >= 32).strip()
+    if len(text) <= SENT_CONTENT_MAX_CHARS:
+        return text
+    marker = "\n…[truncated]"
+    return text[:SENT_CONTENT_MAX_CHARS - len(marker)].rstrip() + marker
+
+
+def _record_confirmed_sent_content(
+    send_results,
+    *,
+    chat_id,
+    thread_id,
+    source_kind: str,
+    source_ref: str,
+    source_message_ids,
+    url: str,
+    content: str,
+    content_id: "str | None" = None,
+    path: "str | None" = None,
+) -> int:
+    """Append sent-content.v1 rows for explicit Telegram confirmations only.
+
+    Telegram ambiguous/assumed outcomes deliberately have no provenance row even
+    if a synthetic fixture supplies an id: without a trustworthy Bot API result,
+    guessing would make Hermes' heart lookup point at the wrong content.  Every
+    failure is warning-only because Telegram delivery and seen checkpoints are
+    more important than this preference sidecar.
+    """
+    if not _SENT_CONTENT_LEDGER_ENABLED:
+        return 0
+    try:
+        results = send_results if isinstance(send_results, (list, tuple)) else [send_results]
+        message_ids = []
+        for result in results:
+            if not isinstance(result, dict) or not result.get("ok"):
+                continue
+            if result.get("assumed_delivered"):
+                continue
+            payload = result.get("result")
+            mid = _sent_content_int(payload.get("message_id") if isinstance(payload, dict) else None)
+            if mid is not None and mid > 0 and mid not in message_ids:
+                message_ids.append(mid)
+
+        target_chat_id = _sent_content_int(chat_id)
+        target_thread_id = (_sent_content_int(thread_id) if thread_id is not None else None)
+        source_ids = []
+        for value in source_message_ids or []:
+            source_id = _sent_content_int(value)
+            if source_id is not None and source_id > 0 and source_id not in source_ids:
+                source_ids.append(source_id)
+        stored_content = _sent_content_text(content)
+        # Both refs are constructed X URLs at call sites.  Refuse other schemes
+        # so an accidental API URL containing a credential can never enter the log.
+        refs = (str(source_ref or "").strip(), str(url or "").strip())
+        safe_refs = all(re.match(r"^https://(?:x\.com|twitter\.com)/", ref) for ref in refs)
+        if (target_chat_id is None or not message_ids
+                or (target_thread_id is not None and target_thread_id <= 0)
+                or source_kind not in ("x_tweet", "x_article") or not source_ids
+                or not stored_content or not safe_refs):
+            return 0
+
+        timestamp = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+        digest = hashlib.sha256(stored_content.encode("utf-8")).hexdigest()
+        lines = []
+        for message_id in message_ids:
+            row = {
+                "schema": "sent-content.v1",
+                "chat_id": target_chat_id,
+                "thread_id": target_thread_id,
+                "message_id": message_id,
+                "producer": "x_monitor",
+                "source_kind": source_kind,
+                "source_ref": refs[0],
+                "source_message_ids": source_ids,
+                "url": refs[1],
+                "content": stored_content,
+                "content_hash": digest,
+                "delivery_state": "confirmed",
+                "sent_at": timestamp,
+            }
+            if content_id:
+                row["content_id"] = str(content_id)
+            lines.append(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+        destination = path or SENT_CONTENT_LEDGER_PATH
+        parent = os.path.dirname(destination) or "."
+        os.makedirs(parent, mode=0o700, exist_ok=True)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+        fd = os.open(destination, flags, 0o600)
+        try:
+            os.chmod(destination, 0o600)
+            if fcntl is not None:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            payload = "".join(lines).encode("utf-8")
+            offset = 0
+            while offset < len(payload):
+                offset += os.write(fd, payload[offset:])
+            os.fsync(fd)
+        finally:
+            try:
+                if fcntl is not None:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+        return len(lines)
+    except Exception as e:
+        print(f"  WARNING: sent-content ledger 写入失败（已送达，不影响 seen）: "
+              f"{type(e).__name__}: {e}", file=sys.stderr)
+        return 0
 
 
 # CSI / SGR sequences (e.g. CLI bold/color). Strip before any text reaches TG.
@@ -216,9 +379,12 @@ def save_article(username: str, article_id: str, tweet: dict) -> None:
                 queue = json.load(f)
         except Exception:
             queue = []
-    if any(a.get("article_id") == article_id for a in queue):
+    bundle_key = str(tweet.get("_bundle_key") or "")
+    if any(a.get("article_id") == article_id
+           and str(a.get("bundle_key") or "") == bundle_key for a in queue):
         return
-    if _CROSS_DEDUP_ENABLED and ("a:" + str(article_id)) in load_pushed_index():
+    if (_CROSS_DEDUP_ENABLED and not tweet.get("_preserve_anchor")
+            and ("a:" + str(article_id)) in load_pushed_index()):
         by = (load_pushed_index().get("a:" + str(article_id)) or {}).get("by")
         print(f"    skip cross-dup article: {article_id}（已由 @{by} 推送摘要，不入队）")
         return
@@ -231,11 +397,14 @@ def save_article(username: str, article_id: str, tweet: dict) -> None:
     # 优先级转推 > 引用（与解析器 article 取值一致）。
     rt = tweet.get("retweeted_status") or {}
     quoted = tweet.get("quoted_status") or {}
-    origin = rt or quoted
+    origin = tweet.get("_origin_override") or rt or quoted
     # quote_comment 仅引用（quoted 有、rt 无）时设：博主自己的评论作摘要引子。
-    quote_comment = _quote_comment_text(tweet) if (quoted and not rt) else ""
+    quote_comment = (tweet.get("_quote_comment_override")
+                     if "_quote_comment_override" in tweet
+                     else (_quote_comment_text(tweet) if (quoted and not rt) else ""))
     entry = {
         "article_id": article_id,
+        "bundle_key": bundle_key,
         "tweet_id": origin.get("id") or tweet.get("id"),
         "author": origin.get("screen_name") or username,
         "detected_at": datetime.now(timezone.utc).isoformat(),
@@ -244,12 +413,46 @@ def save_article(username: str, article_id: str, tweet: dict) -> None:
         "article_title": article_data.get("title", ""),
         "article_preview": article_data.get("preview_text", ""),
         "quote_comment": quote_comment,
+        "comment_author": str(tweet.get("_comment_author_override") or username),
         "status": "pending",
         "content": None,
     }
     queue.append(entry)
     _atomic_write(queue_path, json.dumps(queue, ensure_ascii=False, indent=2))
     print(f"    Article detected: {article_id} (queued)")
+
+
+def save_semantic_article(username: str, tweet: dict, article_ref: dict) -> None:
+    """Bridge an owner-scoped bundle article into the existing durable queue."""
+    bundle = _semantic_bundle(tweet)
+    owner_id = str(article_ref.get("owner_tweet_id") or "")
+    nodes = [bundle.get("anchor") or {}] + list(bundle.get("context_nodes") or [])
+    owner = next((n for n in nodes if isinstance(n, dict)
+                  and str(n.get("tweet_id") or "") == owner_id), {})
+    anchor = bundle.get("anchor") or {}
+    synthetic = {
+        "id": anchor.get("tweet_id"),
+        "text": ((anchor.get("note") or {}).get("text") or anchor.get("text") or ""),
+        "entities": anchor.get("entities") or {},
+        "article": {"rest_id": article_ref.get("article_id"),
+                    "title": article_ref.get("title", ""),
+                    "preview_text": article_ref.get("preview_text", "")},
+    }
+    comment = (((anchor.get("note") or {}).get("text") or anchor.get("text") or "")
+               if owner_id != str(anchor.get("tweet_id") or "") else "")
+    # v1 migration: a direct/no-substantive-comment Article is the legacy a:<id>
+    # delivery and remains suppressed by that index. A real quote comment is a
+    # distinct editorial unit and gets ab:<bundle_key>.
+    comment_without_urls = URL_RE.sub("", comment).strip()
+    has_substantive_comment = len(comment_without_urls) >= 4
+    synthetic["_bundle_key"] = (str((bundle.get("identity") or {}).get("bundle_key") or "")
+                                if has_substantive_comment else "")
+    synthetic["_preserve_anchor"] = has_substantive_comment
+    synthetic["_origin_override"] = {"id": owner_id,
+                                     "screen_name": owner.get("author") or anchor.get("author") or username}
+    synthetic["_quote_comment_override"] = comment if has_substantive_comment else ""
+    synthetic["_comment_author_override"] = str(anchor.get("author") or username)
+    save_article(username, str(article_ref.get("article_id") or ""), synthetic)
 
 
 def fetch_article_content(token: str, article_id: str) -> dict | None:
@@ -592,7 +795,9 @@ def format_article_summary_messages(username: str, entry: dict, summary: str) ->
     if comment and chunks:
         # 保留原文分行，@user 独占首行，用 Telegram HTML 原生 <blockquote>；作独立首块，
         # 避免更长的引子拼进 chunks[0] 顶破 4096（HTML 回退单条上限）。
-        lead_in = f"<blockquote>@{html.escape(username)} 引用：\n{html.escape(comment)}</blockquote>"
+        comment_author = entry.get("comment_author") or username
+        lead_in = (f"<blockquote>@{html.escape(comment_author)} 引用：\n"
+                   f"{html.escape(comment)}</blockquote>")
         chunks = [lead_in] + chunks
     return chunks
 
@@ -657,7 +862,8 @@ def format_article_summary_rich(username: str, entry: dict, summary: str,
             ln = re.sub(r"^(\s*\d+)\.", r"\1\\.", ln)
             esc_lines.append(f"> {ln}" if ln.strip() else ">")
         quoted_body = "\n".join(esc_lines)
-        lead_in = f"> @{username} 引用：\n{quoted_body}\n\n"
+        comment_author = entry.get("comment_author") or username
+        lead_in = f"> @{comment_author} 引用：\n{quoted_body}\n\n"
     title_line = (f"## \U0001f4c4 {title}\n"
                   f"**@{author}** · [原文]({link})")
     body = _fold_summary_details(summary.strip())
@@ -694,7 +900,9 @@ def format_article_failure_message(username: str, entry: dict, reason: str) -> t
     comment = (entry.get("quote_comment") or "").strip()
     if comment:
         comment = re.sub(r"\s+", " ", comment)
-        lead_in = f"> @{html.escape(username)} 引用：{html.escape(comment)}\n\n"
+        comment_author = entry.get("comment_author") or username
+        lead_in = (f"> @{html.escape(comment_author)} 引用："
+                   f"{html.escape(comment)}\n\n")
     msg = (
         f"{lead_in}"
         f"⚠️ <b>X Article 处理失败</b>\n\n"
@@ -844,23 +1052,141 @@ MUSING_SYSTEM_PROMPT = """你是推文内容审核员。判断该推文对「AI/
 请只回复 JSON：{"musing": true/false, "reason": "简短理由"}"""
 
 
+GOOGLE_GEMINI_HOST = "generativelanguage.googleapis.com"
+
+
+def is_direct_google_gemini_base(api_base: str) -> bool:
+    """True for Google's official Gemini endpoint (dead / not used)."""
+    return GOOGLE_GEMINI_HOST in (api_base or "").strip().lower()
+
+
+def resolve_gemini_api_base(api_base: str) -> str:
+    """Gemini must use an explicit compatible api_base (e.g. cliproxy). Never Google-direct."""
+    base = (api_base or "").strip().rstrip("/")
+    if not base:
+        raise ValueError(
+            "gemini backend requires api_base (cliproxy/compatible); "
+            "Google-direct generativelanguage.googleapis.com is not supported")
+    if is_direct_google_gemini_base(base):
+        raise ValueError(
+            "direct Google Gemini (generativelanguage.googleapis.com) is not supported; "
+            "set api_base to a compatible proxy")
+    return base
+
+
+def resolve_ai_api_key(backend_cfg: dict) -> str:
+    """Resolve an AI backend key from inline value, file, or env (first non-empty)."""
+    key = str(backend_cfg.get("api_key") or "").strip()
+    if key:
+        return key
+    path = str(backend_cfg.get("api_key_file") or "").strip()
+    if path:
+        try:
+            with open(os.path.expanduser(path)) as f:
+                key = f.read().strip()
+        except OSError:
+            key = ""
+        if key:
+            return key
+    env_name = str(backend_cfg.get("api_key_env") or "").strip()
+    if env_name:
+        return os.environ.get(env_name, "").strip()
+    return ""
+
+
+def _read_http_error_body(error: urllib.error.HTTPError) -> str:
+    try:
+        return error.read().decode("utf-8", "replace")
+    except Exception:
+        return ""
+    finally:
+        try:
+            error.close()
+        except Exception:
+            pass
+
+
+def _short_ai_http_body(body: str, limit: int = 160) -> str:
+    text = strip_ansi(body or "").replace("\n", " ").strip()
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        data = None
+    if isinstance(data, dict):
+        err = data.get("error")
+        if isinstance(err, dict):
+            status = str(err.get("status") or err.get("code") or "").strip()
+            message = str(err.get("message") or "").strip()
+            text = ": ".join(p for p in (status, message) if p)
+        elif isinstance(err, str) and err.strip():
+            text = err.strip()
+    return text[:limit]
+
+
+def format_ai_backend_error(backend_name: str, exc: BaseException) -> str:
+    """Stable last_error token for one backend, including HTTP body when present."""
+    name = backend_name or "ai"
+    if isinstance(exc, urllib.error.HTTPError):
+        body = _short_ai_http_body(_read_http_error_body(exc))
+        suffix = f":{body}" if body else ""
+        return f"{name}:http_{exc.code}{suffix}"
+    msg = strip_ansi(str(exc)).replace("\n", " ").strip()[:160]
+    kind = type(exc).__name__
+    return f"{name}:{kind}:{msg}" if msg else f"{name}:{kind}"
+
+
+def _is_ai_http_error_token(token: str) -> bool:
+    return ":http_" in (token or "")
+
+
+def _is_ai_call_failed(reason: str) -> bool:
+    """True when every backend failed (exhausted token or surfaced HTTP error)."""
+    token = (reason or "").strip()
+    if token in ("all_ai_failed", "all_image_ai_failed"):
+        return True
+    return _is_ai_http_error_token(token)
+
+
+def _is_ai_provider_auth_failure(reason: str) -> bool:
+    """True when every recorded backend failure is HTTP 401/403 (key/project denied)."""
+    parts = [p.strip() for p in (reason or "").split(";") if p.strip()]
+    if not parts:
+        return False
+    auth_codes = (":http_401", ":http_403")
+    return all(any(code in part for code in auth_codes) for part in parts)
+
+
+def _join_ai_failures(errors: list[str], exhausted_token: str) -> str:
+    """Prefer provider HTTP details over a generic exhausted token."""
+    if any(_is_ai_http_error_token(e) for e in errors):
+        return ";".join(errors)
+    return exhausted_token
+
+
 class AIBackend:
     """单个 AI 后端。"""
 
     def __init__(self, name: str, api_base: str, api_key: str, model: str,
                  backend_type: str = "openai", timeout: int = 15):
         self.name = name
-        self.api_base = api_base.rstrip("/")
         self.api_key = api_key
         self.model = model
         self.backend_type = backend_type  # "openai" or "gemini"
         self.timeout = timeout
         self._available = bool(api_key)
+        if backend_type == "gemini":
+            self.api_base = resolve_gemini_api_base(api_base)
+        else:
+            self.api_base = (api_base or "").rstrip("/")
 
     def _openai_chat_url(self) -> str:
         if self.api_base.endswith("/v1"):
             return f"{self.api_base}/chat/completions"
         return f"{self.api_base}/v1/chat/completions"
+
+    def _gemini_generate_url(self) -> str:
+        base = resolve_gemini_api_base(self.api_base)
+        return f"{base}/models/{self.model}:generateContent?key={self.api_key}"
 
     def classify(self, username: str, text: str) -> tuple[bool, str]:
         """返回 (is_promo, reason)。失败抛异常。"""
@@ -914,7 +1240,7 @@ class AIBackend:
                 "maxOutputTokens": 1000,
             },
         }).encode("utf-8")
-        url = f"{self.api_base}/models/{self.model}:generateContent?key={self.api_key}"
+        url = self._gemini_generate_url()
         req = urllib.request.Request(
             url,
             data=body,
@@ -981,7 +1307,7 @@ class AIBackend:
                 "maxOutputTokens": max_tokens,
             },
         }).encode("utf-8")
-        url = f"{self.api_base}/models/{self.model}:generateContent?key={self.api_key}"
+        url = self._gemini_generate_url()
         req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=max(self.timeout, 60)) as r:
             resp = json.loads(r.read().decode("utf-8"))
@@ -1014,7 +1340,7 @@ class AIBackend:
                 "maxOutputTokens": max_tokens,
             },
         }).encode("utf-8")
-        url = f"{self.api_base}/models/{self.model}:generateContent?key={self.api_key}"
+        url = self._gemini_generate_url()
         req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=max(self.timeout, 45)) as r:
             resp = json.loads(r.read().decode("utf-8"))
@@ -1051,14 +1377,23 @@ class AIClassifier:
         # 新格式：{"backends": [...]}
         if "backends" in cfg:
             for b in cfg["backends"]:
-                if not b.get("api_key"):
+                api_key = resolve_ai_api_key(b)
+                if not api_key:
                     continue
+                backend_type = b.get("type", "openai")
+                api_base = b.get("api_base", "")
+                if backend_type == "gemini":
+                    try:
+                        api_base = resolve_gemini_api_base(api_base)
+                    except ValueError as e:
+                        print(f"  跳过 Gemini 后端 {b.get('name', 'gemini')}: {e}")
+                        continue
                 backends.append(AIBackend(
                     name=b.get("name", "unknown"),
-                    api_base=b.get("api_base", ""),
-                    api_key=b["api_key"],
+                    api_base=api_base,
+                    api_key=api_key,
                     model=b.get("model", ""),
-                    backend_type=b.get("type", "openai"),
+                    backend_type=backend_type,
                     timeout=b.get("timeout", 15),
                 ))
         # 旧格式：单个 {"api_base": ..., "api_key": ...}
@@ -1082,34 +1417,43 @@ class AIClassifier:
 
     def confirm_promo(self, username: str, text: str) -> tuple[bool, str]:
         """按顺序尝试各后端，第一个成功的结果返回。全部失败则 (False, all_ai_failed)。"""
+        errors: list[str] = []
         for backend in self._backends:
             try:
                 is_promo, reason = backend.classify(username, text)
                 return is_promo, f"{backend.name}:{reason}"
             except Exception as e:
-                print(f"    AI [{backend.name}] 失败: {e}")
+                err = format_ai_backend_error(backend.name, e)
+                print(f"    AI [{backend.name}] 失败: {err}")
+                errors.append(err)
                 continue
-        return False, "all_ai_failed"
+        return False, _join_ai_failures(errors, "all_ai_failed")
 
     def confirm_musing(self, username: str, text: str) -> tuple[bool, str]:
         """碎碎念 AI 复核。全部失败则 (False, all_ai_failed)；调用方 fail-closed。"""
+        errors: list[str] = []
         for backend in self._backends:
             try:
                 is_musing, reason = backend.classify_musing(username, text)
                 return is_musing, f"{backend.name}:{reason}"
             except Exception as e:
-                print(f"    AI [{backend.name}] 碎碎念识别失败: {e}")
+                err = format_ai_backend_error(backend.name, e)
+                print(f"    AI [{backend.name}] 碎碎念识别失败: {err}")
+                errors.append(err)
                 continue
-        return False, "all_ai_failed"
+        return False, _join_ai_failures(errors, "all_ai_failed")
 
     def complete_with_images(self, prompt: str, images: list[dict], max_tokens: int = 1200, temperature: float = 0.2) -> tuple[str | None, str]:
+        errors: list[str] = []
         for backend in self._backends:
             try:
                 return backend.complete_with_images(prompt, images, max_tokens=max_tokens, temperature=temperature), backend.name
             except Exception as e:
-                print(f"    AI [{backend.name}] 图片理解失败: {e}")
+                err = format_ai_backend_error(backend.name, e)
+                print(f"    AI [{backend.name}] 图片理解失败: {err}")
+                errors.append(err)
                 continue
-        return None, "all_image_ai_failed"
+        return None, _join_ai_failures(errors, "all_image_ai_failed")
 
     def complete(self, prompt: str, max_tokens: int = 1200, temperature: float = 0.2) -> tuple[str | None, str]:
         """按顺序尝试各后端生成文本。
@@ -1118,16 +1462,20 @@ class AIClassifier:
         会把额度全花在隐藏推理上、content 返回空串（不抛异常）。旧逻辑把第一个
         不抛异常的后端结果直接返回，空串也算成功 → 永远轮不到 gemini 兜底。
         """
+        errors: list[str] = []
         for backend in self._backends:
             try:
                 result = backend.complete(prompt, max_tokens=max_tokens, temperature=temperature)
             except Exception as e:
-                print(f"    AI [{backend.name}] 摘要失败: {e}")
+                err = format_ai_backend_error(backend.name, e)
+                print(f"    AI [{backend.name}] 摘要失败: {err}")
+                errors.append(err)
                 continue
             if result and result.strip():
                 return result, backend.name
             print(f"    AI [{backend.name}] 返回空内容，尝试下一后端")
-        return None, "all_ai_failed"
+            errors.append(f"{backend.name}:empty")
+        return None, _join_ai_failures(errors, "all_ai_failed")
 
 
 # ── 账号配置 ───────────────────────────────────────
@@ -1260,6 +1608,15 @@ def classify_official_push(policy: str, tweet: dict) -> tuple[str, str, str | No
     if policy == "claude_entitlement_original":
         if _contains_any(low, _PROMO_CREDIT_TERMS):
             return "filter", "policy:promotional_credits", None
+        # The main Claude account also announces model launches. Classifying an
+        # "Introducing Opus N" post as a generic plan entitlement splits it from
+        # the companion availability post and prevents event-level observation.
+        if _EVENT_MODEL_RE.search(low):
+            if _contains_any(low, ("introducing", "we're launching", "we are launching",
+                                   "we released", "we’re releasing", "we are releasing")):
+                return "pass", "policy:model_launch", "model_launch"
+            if _contains_any(low, ("now available", "available today", "rolling out")):
+                return "pass", "policy:model_access", "model_access"
         event = _entitlement_event(low)
         if not event:
             return "filter", "policy:no_entitlement_change", None
@@ -1465,6 +1822,236 @@ def _tweet_body_text(tweet: dict) -> str:
     return (tweet.get("text") or "").strip()
 
 
+def _semantic_bundle(tweet: dict) -> dict:
+    bundle = tweet.get("semantic_bundle") or {}
+    if not isinstance(bundle, dict) or not isinstance(bundle.get("anchor"), dict):
+        return {}
+    return bundle
+
+
+def _semantic_gray_for(username: str) -> bool:
+    return (_SEMANTIC_BUNDLE_ENABLED
+            and (not _SEMANTIC_CURATOR_ALLOWLIST
+                 or _canonical_username(username) in _SEMANTIC_CURATOR_ALLOWLIST))
+
+
+def _semantic_use(tweet: dict) -> bool:
+    return (_SEMANTIC_BUNDLE_ENABLED and bool(_semantic_bundle(tweet))
+            and (tweet.get("_semantic_active") is True or not _SEMANTIC_CURATOR_ALLOWLIST))
+
+
+def _semantic_anchor_view(tweet: dict) -> dict:
+    """Adapter from a SemanticBundle anchor to existing single-tweet helpers."""
+    bundle = _semantic_bundle(tweet)
+    anchor = bundle.get("anchor") or {}
+    if not anchor:
+        return tweet
+    note = anchor.get("note") or {}
+    article = anchor.get("article") or {}
+    return {
+        "id": anchor.get("tweet_id"),
+        "text": anchor.get("text") or "",
+        "note_tweet": note if note.get("text") else {},
+        "entities": anchor.get("entities") or {},
+        "extended_entities": anchor.get("extended_entities") or {},
+        "media": anchor.get("media") or [],
+        "article": ({"rest_id": article.get("article_id"),
+                     "title": article.get("title", ""),
+                     "preview_text": article.get("preview_text", "")}
+                    if article.get("article_id") else None),
+    }
+
+
+def _semantic_media_view(tweet: dict) -> dict:
+    """Flatten owner-preserving node media for the existing send fallback ladder."""
+    bundle = _semantic_bundle(tweet)
+    if not bundle:
+        return tweet
+    media = []
+    anchor = bundle.get("anchor") or {}
+    media.extend(anchor.get("media") or [])
+    for node in bundle.get("context_nodes") or []:
+        if isinstance(node, dict):
+            media.extend(node.get("media") or [])
+    view = _semantic_anchor_view(tweet)
+    view["media"] = media
+    return view
+
+
+def classify_semantic_bundle(tweet: dict) -> tuple[str, str]:
+    """Classify only after the embedded context graph has been resolved."""
+    bundle = _semantic_bundle(tweet)
+    if not bundle:
+        return classify(tweet)
+    resolution = bundle.get("resolution") or {}
+    status = resolution.get("status")
+    if status == "context_unresolved_transient":
+        return "defer", "context_unresolved_transient"
+    if status == "auth_degraded":
+        return "defer", "auth_degraded"
+    if status == "context_unavailable_terminal":
+        return "suppress_terminal", "context_unavailable_terminal"
+    if status in ("schema_drift", "truncated_budget", "cycle_detected"):
+        return "defer", str(status)
+    anchor_view = _semantic_classification_view(bundle.get("anchor") or {})
+    result, reason = classify(anchor_view)
+    # Classify the complete unit that would be delivered.  An isolated malicious
+    # context can otherwise hit the length guard before formal affiliate/self-
+    # disclosure rules.  Preserve entity/media/article signals and reuse the
+    # production classifier instead of maintaining a semantic-only keyword list.
+    context_views = [_semantic_classification_view(node)
+                     for node in bundle.get("context_nodes") or []
+                     if isinstance(node, dict)]
+    if context_views:
+        views = [anchor_view] + context_views
+        combined = dict(anchor_view)
+        combined["text"] = "\n\n".join(str(view.get("text") or "") for view in views)
+        combined["entities"] = {
+            "urls": [url for view in views
+                     for url in ((view.get("entities") or {}).get("urls") or [])],
+            "hashtags": [tag for view in views
+                         for tag in ((view.get("entities") or {}).get("hashtags") or [])],
+        }
+        combined["media"] = [media for view in views for media in (view.get("media") or [])]
+        combined["article"] = next((view.get("article") for view in views
+                                    if view.get("article")), None)
+        _combined_status, combined_reason = classify(combined)
+        if combined_reason.startswith(("affiliate_link", "skip_tag:", "commercial(",
+                                       "self_disclose:")):
+            return "filter", "semantic_context:" + combined_reason
+    # A short/deictic quote comment can be meaningful only with its quoted text or
+    # media. Do not repeat the original bug by running length gates on that fragment.
+    has_context = bool(bundle.get("context_nodes") or bundle.get("assets")
+                       or bundle.get("article_refs"))
+    if has_context and result == "filter" and reason.startswith(("too_short", "link_only")):
+        context_text = " ".join(str(((node.get("note") or {}).get("text")
+                                      or node.get("text") or ""))
+                                for node in bundle.get("context_nodes") or []
+                                if isinstance(node, dict)).casefold()
+        if not context_text.strip() and not (bundle.get("assets") or bundle.get("article_refs")):
+            return result, reason
+        return "pass", "semantic_context"
+    return result, reason
+
+
+def _journal_semantic_decision(tweet: dict, decision: str, reason: str,
+                               *, matched: str = "", classification: dict | None = None,
+                               send_result: dict | None = None) -> None:
+    """Durably append a terminal semantic decision before source seen advances."""
+    bundle = _semantic_bundle(tweet)
+    if not bundle:
+        return
+    record = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "observation": bundle.get("observation") or {},
+        "identity": bundle.get("identity") or {},
+        "resolution": bundle.get("resolution") or {},
+        "decision": decision,
+        "reason": reason,
+        "matched": matched,
+        "classification": classification or {},
+        "delivery": {"message_id": ((send_result or {}).get("result") or {}).get("message_id")
+                     if isinstance((send_result or {}).get("result"), dict) else None,
+                     "send_method": (send_result or {}).get("send_method")},
+        "content_snapshot": {
+            "anchor": {k: (bundle.get("anchor") or {}).get(k)
+                       for k in ("tweet_id", "author", "text", "source_url")},
+            "contexts": [{k: node.get(k) for k in ("tweet_id", "author", "text", "source_url")}
+                         for node in (bundle.get("context_nodes") or []) if isinstance(node, dict)],
+        },
+        "resolver_version": bundle.get("resolver_version", ""),
+        "render_version": "semantic-v1",
+    }
+    os.makedirs(os.path.dirname(SEMANTIC_DECISION_JOURNAL), exist_ok=True)
+    try:
+        if os.path.getsize(SEMANTIC_DECISION_JOURNAL) >= SEMANTIC_JOURNAL_MAX_BYTES:
+            os.replace(SEMANTIC_DECISION_JOURNAL, SEMANTIC_DECISION_JOURNAL + ".1")
+    except FileNotFoundError:
+        pass
+    fd = os.open(SEMANTIC_DECISION_JOURNAL,
+                 os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+    try:
+        os.write(fd, (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+                 .encode("utf-8"))
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _append_shadow_observation(tweet: dict, legacy_result: tuple[str, str],
+                               semantic_result: tuple[str, str] | None, latency_ms: float,
+                               *, account: str = "", exception: str = "",
+                               pre_ai: tuple[str, str] | None = None,
+                               final_classification: tuple[str, str] | None = None,
+                               disposition: str = "candidate") -> None:
+    bundle = _semantic_bundle(tweet)
+    resolution = bundle.get("resolution") or {}
+    observation = bundle.get("observation") or {
+        "outer_id": str(tweet.get("id") or ""), "observed_via": account}
+    source_mode = str(tweet.get("_fetch_source_mode") or "graphql")
+    fetch_mode = str(observation.get("fetch_mode") or source_mode)
+    monotonic_now = time.monotonic()
+    run_started = float(getattr(twitter_graphql, "_semantic_run_started", monotonic_now))
+    cooldown_until = float(getattr(twitter_graphql, "_semantic_cooldown_until", 0.0))
+    record = {
+        "ts": datetime.now(timezone.utc).isoformat(), "tweet_id": tweet.get("id"),
+        "account": account, "observation": observation,
+        "source_mode": source_mode, "fetch_mode": fetch_mode,
+        "legacy_classification": {"status": legacy_result[0], "reason": legacy_result[1]},
+        "semantic_classification": ({"status": semantic_result[0], "reason": semantic_result[1]}
+                                    if semantic_result else {"status": "unavailable",
+                                                             "reason": exception or "no_bundle"}),
+        "pre_ai_classification": {"status": (pre_ai or legacy_result)[0],
+                                  "reason": (pre_ai or legacy_result)[1]},
+        "final_classification": {
+            "status": (final_classification or pre_ai or legacy_result)[0],
+            "reason": (final_classification or pre_ai or legacy_result)[1]},
+        "disposition": disposition,
+        "exception": exception,
+        "anchor": (bundle.get("anchor") or {}).get("tweet_id"),
+        "contexts": [n.get("tweet_id") for n in bundle.get("context_nodes") or []],
+        "resolution": resolution,
+        "resolver_io": {
+            "requests": int(resolution.get("request_count") or 0),
+            "physical_attempts": int(resolution.get("request_count") or 0),
+            "run_physical_attempts": int(getattr(twitter_graphql,
+                                                 "_semantic_run_requests", 0)),
+            "cache_hits": int(resolution.get("cache_hits") or 0),
+            "per_bundle_limit": getattr(twitter_graphql, "SEMANTIC_DETAIL_PER_BUNDLE", 0),
+            "per_run_limit": getattr(twitter_graphql, "SEMANTIC_DETAIL_PER_RUN", 0),
+            "deadline_seconds": getattr(twitter_graphql,
+                                        "SEMANTIC_RESOLVER_DEADLINE_SECONDS", 0),
+            "deadline_remaining_seconds": max(
+                0.0, float(getattr(twitter_graphql,
+                                   "SEMANTIC_RESOLVER_DEADLINE_SECONDS", 0))
+                - (monotonic_now - run_started)),
+            "cooldown_remaining_seconds": max(0.0, cooldown_until - monotonic_now),
+        },
+        "latency_ms": round(latency_ms, 3),
+    }
+    path = SEMANTIC_SHADOW_LEDGER
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    try:
+        if os.path.getsize(path) >= SEMANTIC_JOURNAL_MAX_BYTES:
+            os.replace(path, path + ".1")
+    except FileNotFoundError:
+        pass
+    fd = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+    try:
+        os.write(fd, (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n").encode())
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _try_append_shadow_observation(*args, **kwargs) -> None:
+    """Shadow telemetry is strictly best-effort and never gates legacy delivery."""
+    try:
+        _append_shadow_observation(*args, **kwargs)
+    except Exception as exc:
+        print(f"    semantic-shadow ledger failure: {type(exc).__name__}")
+
+
 def _has_photo_media(tweet: dict) -> bool:
     for m in tweet.get("media") or []:
         if not isinstance(m, dict):
@@ -1633,7 +2220,12 @@ def fetch_tweets(pool: TokenPool, username: str, limit: int = 20) -> list[dict]:
             with urllib.request.urlopen(req, timeout=20) as r:
                 resp = json.loads(r.read().decode("utf-8"))
             pool.mark_success(label)
-            return resp.get("data") or []
+            rows = resp.get("data") or []
+            for row in rows:
+                if isinstance(row, dict):
+                    row["_fetch_source_mode"] = "6551_degraded_no_reposts"
+            print("  ⚠ provider degraded: 6551 fallback 不返回 repost，选品观察不完整")
+            return rows
         except urllib.error.HTTPError as e:
             code_err = e.code
             try:
@@ -1752,17 +2344,30 @@ def get_push_retry_path(username: str) -> str:
     return os.path.join(SEEN_DIR, f"{username}_retry.json")
 
 
+_PUSH_RETRY_STATE_BY_USER: dict[str, dict] = {}
+
+
 def load_push_retry(username: str) -> set[str]:
     path = get_push_retry_path(username)
     if not os.path.exists(path):
+        _PUSH_RETRY_STATE_BY_USER[username] = {}
         return set()
     try:
         with open(path) as f:
             data = json.load(f)
         if isinstance(data, list):
-            return {str(x) for x in data}
+            ids = {str(x) for x in data}
+            _PUSH_RETRY_STATE_BY_USER[username] = {x: {} for x in ids}
+            return ids
         if isinstance(data, dict):
-            return {str(x) for x in data.get("ids", [])}
+            records = data.get("records") or {}
+            if isinstance(records, dict):
+                _PUSH_RETRY_STATE_BY_USER[username] = {
+                    str(k): v for k, v in records.items() if isinstance(v, dict)}
+                return set(_PUSH_RETRY_STATE_BY_USER[username])
+            ids = {str(x) for x in data.get("ids", [])}
+            _PUSH_RETRY_STATE_BY_USER[username] = {x: {} for x in ids}
+            return ids
     except Exception:
         pass
     return set()
@@ -1771,10 +2376,617 @@ def load_push_retry(username: str) -> set[str]:
 def save_push_retry(username: str, retry: set[str]) -> None:
     path = get_push_retry_path(username)
     if not retry:
+        _PUSH_RETRY_STATE_BY_USER.pop(username, None)
         if os.path.exists(path):
             os.remove(path)
         return
-    _atomic_write(path, json.dumps(sorted(retry), ensure_ascii=False, indent=2))
+    old = _PUSH_RETRY_STATE_BY_USER.setdefault(username, {})
+    now = datetime.now(timezone.utc).isoformat()
+    records = {}
+    for tid in sorted(retry):
+        record = dict(old.get(tid) or {})
+        record.setdefault("first_deferred_at", now)
+        record["attempts"] = max(int(record.get("attempts") or 0), 1)
+        records[tid] = record
+    _PUSH_RETRY_STATE_BY_USER[username] = records
+    _atomic_write(path, json.dumps({"version": 2, "records": records},
+                                  ensure_ascii=False, indent=2))
+
+
+def note_push_retry(username: str, tweet: dict) -> dict:
+    tid = str(tweet.get("id") or "")
+    records = _PUSH_RETRY_STATE_BY_USER.setdefault(username, {})
+    record = dict(records.get(tid) or {})
+    now = datetime.now(timezone.utc).isoformat()
+    record.setdefault("first_deferred_at", now)
+    record.setdefault("outer_created_at", str(tweet.get("created_at") or tweet.get("createdAt") or ""))
+    record["attempts"] = int(record.get("attempts") or 0) + 1
+    records[tid] = record
+    return record
+
+
+def _semantic_retry_expired(record: dict, *, now: datetime | None = None) -> bool:
+    """Bound retries even when the original observation timestamp is unavailable."""
+    if int((record or {}).get("attempts") or 0) >= 6:
+        return True
+    first = str((record or {}).get("first_deferred_at") or "")
+    if not first:
+        return False
+    try:
+        started = datetime.fromisoformat(first.replace("Z", "+00:00"))
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+        return ((now or datetime.now(timezone.utc)) - started).total_seconds() >= 24 * 3600
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+# ── Event-level delivery ledger ─────────────────────────────────────────────
+# SQLite is deliberately separate from per-account seen JSON. BEGIN IMMEDIATE +
+# a UNIQUE delivery_key turns "check then send" into one atomic pre-send claim,
+# including when two cron/manual processes overlap despite the outer flock.
+_EVENT_MODEL_RE = re.compile(
+    r"\b(?:(?:gpt|claude|gemini|llama|mistral|qwen)[- ]?[a-z]*\d[a-z0-9.]*|"
+    r"(?:claude[- ]+)?(?:opus|sonnet|haiku|fable)[- ]?\d[a-z0-9.]*|"
+    r"o[1-9](?:[-.][a-z0-9.]+)?)\b",
+    re.IGNORECASE,
+)
+_EVENT_NUMBER_RE = re.compile(r"\b\d+(?:\.\d+)?(?:%|x|k|m|b|gb|tb|h|hr|hours?|days?)?\b", re.I)
+_EVENT_FACT_TERMS = (
+    "api", "chatgpt", "codex", "claude code", "pro", "max", "team",
+    "enterprise", "free", "plus", "weekly", "5-hour", "rate limit",
+    "context", "pricing", "price", "credits", "windows", "macos", "linux",
+)
+_EVENT_TYPE_FAMILY = {
+    "model_launch": "model_release",
+    "model_access": "model_release",
+    "model_api": "model_release",
+}
+
+
+def _normalize_event_model(value: str) -> str:
+    value = re.sub(r"\s+", "-", value.strip().lower())
+    # "Claude Opus 5" and "Opus 5" name the same model. Keep the vendor for
+    # generic Claude-N numeric names, but remove it for the named families.
+    return re.sub(r"^claude-(?=(?:opus|sonnet|haiku|fable)-?\d)", "", value)
+
+
+def _ordered_event_models(body: str) -> list[str]:
+    models = []
+    for match in _EVENT_MODEL_RE.finditer(body):
+        model = _normalize_event_model(match.group(0))
+        if model not in models:
+            models.append(model)
+    return models
+
+
+def _event_has_term(body: str, term: str) -> bool:
+    # ASCII plan/product names need token boundaries: "pro" must not match
+    # "product", nor "max" match "maximize". Phrases retain flexible spaces.
+    pattern = r"(?<![a-z0-9])" + re.escape(term).replace(r"\ ", r"\s+") + r"(?![a-z0-9])"
+    return re.search(pattern, body, re.IGNORECASE) is not None
+
+
+def _event_body(t: dict) -> str:
+    return ((t.get("note_tweet") or {}).get("text") or t.get("text") or "").strip()
+
+
+def _event_facts(t: dict) -> list[str]:
+    """Extract conservative, auditable facts used to distinguish updates.
+
+    The key intentionally includes every model/version, quantity, plan/product and
+    external URL. An update adding availability, a plan, date, percentage, etc.
+    therefore gets a different key and is delivered. Generic prose is excluded so
+    paraphrases of the same announcement can converge.
+    """
+    body = unicodedata.normalize("NFKC", _event_body(t)).lower()
+    facts = set(_ordered_event_models(body))
+    facts.update(m.group(0) for m in _EVENT_NUMBER_RE.finditer(body))
+    facts.update(term for term in _EVENT_FACT_TERMS if _event_has_term(body, term))
+    for ent in ((t.get("entities") or {}).get("urls") or []):
+        if not isinstance(ent, dict):
+            continue
+        url = str(ent.get("expanded_url") or "")
+        if not url or re.search(r"(?:x|twitter)\.com/.+/status/", url, re.I):
+            continue
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.hostname:
+            facts.add("url:" + parsed.hostname.lower() + parsed.path.rstrip("/").lower())
+    return sorted(facts)
+
+
+def event_identity(t: dict) -> dict:
+    """Return a conservative event identity and confidence for review/enforcement."""
+    event_type = str(t.get("_push_event_type") or "").strip()
+    facts = _event_facts(t)
+    model_facts = _ordered_event_models(
+        unicodedata.normalize("NFKC", _event_body(t)).lower())
+    url_facts = [f for f in facts if f.startswith("url:")]
+    subject_facts = [f for f in facts if f in ("rate limit", "weekly", "credits", "pricing", "price")]
+    # Anchors identify the underlying event; all remaining facts are compared
+    # directionally. A paraphrase omitting known facts is duplicate, while a later
+    # candidate adding facts is an update. Generic product-only announcements are
+    # observe-only because recurring releases could otherwise collide.
+    # The first-mentioned model is the announced subject; later model names are
+    # often comparisons ("same price as Opus 4.8") and remain facts but must not
+    # split companion posts for the same release into separate event keys.
+    anchors = model_facts[:1] or url_facts[:1]
+    if not anchors and event_type in ("quota_reset", "quota_compensation", "quota_policy", "credit_grant"):
+        anchors = subject_facts
+    # Only policy-classified events with distinctive anchors may suppress.
+    # Everything else still receives tweet-id delivery idempotency and observe data.
+    confident = bool(event_type and anchors)
+    event_family = _EVENT_TYPE_FAMILY.get(event_type, event_type)
+    material = json.dumps([event_family, anchors], ensure_ascii=False, separators=(",", ":"))
+    digest = hashlib.sha256(material.encode("utf-8")).hexdigest()
+    return {"event_key": f"v1:{digest}", "event_type": event_type,
+            "event_family": event_family,
+            "facts": facts, "anchors": anchors,
+            "confidence": "high" if confident else "low"}
+
+
+def _event_ledger_connect(path: str | None = None) -> sqlite3.Connection:
+    path = path or EVENT_LEDGER_PATH
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    # SQLite's connection timeout does not reliably cover simultaneous first-use
+    # WAL negotiation. Two claimers opening a brand-new ledger can therefore see
+    # a transient lock before BEGIN IMMEDIATE. Retry only this idempotent setup;
+    # the delivery claim itself remains one explicit atomic transaction below.
+    for attempt in range(20):
+        db = sqlite3.connect(path, timeout=10, isolation_level=None)
+        db.row_factory = sqlite3.Row
+        try:
+            db.execute("PRAGMA busy_timeout=10000")
+            db.execute("PRAGMA journal_mode=WAL")
+            db.execute("PRAGMA synchronous=FULL")
+            db.executescript("""
+                CREATE TABLE IF NOT EXISTS deliveries (
+                    delivery_key TEXT PRIMARY KEY,
+                    target_chat_id TEXT NOT NULL DEFAULT '',
+                    target_thread_id TEXT NOT NULL DEFAULT '',
+                    event_key TEXT NOT NULL,
+                    event_type TEXT NOT NULL DEFAULT '',
+                    facts_json TEXT NOT NULL DEFAULT '[]',
+                    tweet_id TEXT NOT NULL,
+                    username TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK(state IN
+                        ('pending','confirmed','ambiguous','failed_pre_send')),
+                    claim_token TEXT NOT NULL,
+                    claimed_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    message_id TEXT,
+                    send_method TEXT,
+                    detail TEXT
+                );
+                CREATE INDEX IF NOT EXISTS deliveries_event_idx
+                    ON deliveries(event_key, updated_at);
+                CREATE TABLE IF NOT EXISTS event_observations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    observed_at TEXT NOT NULL,
+                    target_chat_id TEXT NOT NULL DEFAULT '',
+                    target_thread_id TEXT NOT NULL DEFAULT '',
+                    event_key TEXT NOT NULL,
+                    prior_delivery_key TEXT,
+                    candidate_tweet_id TEXT NOT NULL,
+                    candidate_username TEXT NOT NULL,
+                    decision TEXT NOT NULL,
+                    reviewed INTEGER NOT NULL DEFAULT 0,
+                    false_positive INTEGER,
+                    note TEXT
+                );
+                -- 推文 → Telegram 消息锚点：自回复串把评论接到父推消息下面时用。
+                -- 与 deliveries 分表是刻意的：deliveries 归 event dedup 状态机所有，
+                -- 只在 event_dedup 开启时写；锚点必须无条件记录，否则关掉去重就断串。
+                CREATE TABLE IF NOT EXISTS tweet_anchors (
+                    target_chat_id TEXT NOT NULL DEFAULT '',
+                    target_thread_id TEXT NOT NULL DEFAULT '',
+                    tweet_id TEXT NOT NULL,
+                    message_id TEXT NOT NULL,
+                    username TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (target_chat_id, target_thread_id, tweet_id)
+                );
+                CREATE INDEX IF NOT EXISTS tweet_anchors_age_idx
+                    ON tweet_anchors(updated_at);
+            """)
+            # Existing production ledgers predate destination-scoped keys. Add the
+            # columns in place; legacy rows remain queryable with an empty target,
+            # while every new claim is scoped to the actual Telegram destination.
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                delivery_columns = {row["name"] for row in db.execute(
+                    "PRAGMA table_info(deliveries)")}
+                if "target_chat_id" not in delivery_columns:
+                    db.execute("ALTER TABLE deliveries ADD COLUMN "
+                               "target_chat_id TEXT NOT NULL DEFAULT ''")
+                if "target_thread_id" not in delivery_columns:
+                    db.execute("ALTER TABLE deliveries ADD COLUMN "
+                               "target_thread_id TEXT NOT NULL DEFAULT ''")
+                observation_columns = {row["name"] for row in db.execute(
+                    "PRAGMA table_info(event_observations)")}
+                if "target_chat_id" not in observation_columns:
+                    db.execute("ALTER TABLE event_observations ADD COLUMN "
+                               "target_chat_id TEXT NOT NULL DEFAULT ''")
+                if "target_thread_id" not in observation_columns:
+                    db.execute("ALTER TABLE event_observations ADD COLUMN "
+                               "target_thread_id TEXT NOT NULL DEFAULT ''")
+                db.execute("COMMIT")
+            except Exception:
+                db.execute("ROLLBACK")
+                raise
+            # v2 observation identity deliberately excludes prior_delivery_key:
+            # a changing "latest prior" must not turn one candidate tweet into
+            # multiple Go/No-Go samples. Migrate old/pre-index ledgers once and
+            # keep a labelled row when consolidating legacy duplicates.
+            index_rows = db.execute(
+                "PRAGMA index_info(event_observations_candidate_idx)").fetchall()
+            index_columns = [row["name"] for row in index_rows]
+            expected_columns = ["target_chat_id", "target_thread_id", "event_key",
+                                "candidate_tweet_id", "decision"]
+            if index_columns != expected_columns:
+                db.execute("BEGIN IMMEDIATE")
+                try:
+                    db.execute("""
+                        DELETE FROM event_observations
+                        WHERE id NOT IN (
+                            SELECT COALESCE(
+                                MIN(CASE WHEN reviewed=1 AND false_positive IN (0,1)
+                                         THEN id END),
+                                MIN(id))
+                            FROM event_observations
+                            GROUP BY target_chat_id,target_thread_id,event_key,
+                                     candidate_tweet_id,decision
+                        )
+                    """)
+                    db.execute("DROP INDEX IF EXISTS event_observations_candidate_idx")
+                    db.execute("""
+                        CREATE UNIQUE INDEX event_observations_candidate_idx
+                        ON event_observations(target_chat_id,target_thread_id,event_key,
+                                              candidate_tweet_id,decision)
+                    """)
+                    db.execute("COMMIT")
+                except Exception:
+                    db.execute("ROLLBACK")
+                    raise
+            # 一次性回填，必须排在上面所有 schema 迁移之后（老库的 deliveries 还
+            # 没有 target_* 列，早跑会 no such column）：已确认送达的投递自带
+            # message_id，导入后自回复线程上线即对历史父推生效，不必空等一个 TTL
+            # 攒锚点。用 user_version 记账而不是「表空则回填」——后者会在 TTL GC
+            # 清空表后反复把过期锚点捞回来。
+            if db.execute("PRAGMA user_version").fetchone()[0] < LEDGER_SCHEMA_VERSION:
+                db.execute("BEGIN IMMEDIATE")
+                try:
+                    db.execute("""INSERT OR IGNORE INTO tweet_anchors
+                        (target_chat_id,target_thread_id,tweet_id,message_id,username,updated_at)
+                        SELECT target_chat_id,target_thread_id,tweet_id,message_id,username,updated_at
+                        FROM deliveries
+                        WHERE state='confirmed' AND tweet_id<>''
+                          AND message_id IS NOT NULL AND message_id<>''""")
+                    db.execute("COMMIT")
+                except Exception:
+                    db.execute("ROLLBACK")
+                    raise
+                db.execute(f"PRAGMA user_version={LEDGER_SCHEMA_VERSION}")
+            return db
+        except sqlite3.OperationalError as e:
+            db.close()
+            if "locked" not in str(e).lower() or attempt == 19:
+                raise
+            time.sleep(min(0.01 * (attempt + 1), 0.1))
+    raise RuntimeError("event ledger initialization exhausted retries")
+
+
+def event_dedup_gate_report(path: str | None = None) -> dict:
+    """Repeatable Go/No-Go report. Enforce needs reviewed candidates, not uptime."""
+    with _event_ledger_connect(path) as db:
+        row = db.execute("""
+            SELECT count(*) AS candidates,
+                   sum(CASE WHEN reviewed=1 AND false_positive IN (0,1)
+                            THEN 1 ELSE 0 END) AS reviewed,
+                   sum(CASE WHEN reviewed=1 AND false_positive=1 THEN 1 ELSE 0 END) AS fp
+            FROM event_observations WHERE decision='would_suppress'
+        """).fetchone()
+    reviewed = int(row["reviewed"] or 0)
+    fp = int(row["fp"] or 0)
+    rate = fp / reviewed if reviewed else None
+    ready = reviewed >= EVENT_ENFORCE_MIN_REVIEWED and rate is not None and rate <= EVENT_ENFORCE_MAX_FALSE_POSITIVE_RATE
+    return {"candidates": int(row["candidates"] or 0), "reviewed": reviewed,
+            "false_positives": fp, "false_positive_rate": rate, "ready": ready,
+            "min_reviewed": EVENT_ENFORCE_MIN_REVIEWED,
+            "max_false_positive_rate": EVENT_ENFORCE_MAX_FALSE_POSITIVE_RATE}
+
+
+def event_review_rows(path: str | None = None, limit: int = 100) -> list[dict]:
+    """Return auditable would-suppress candidates without exposing message text.
+
+    Tweet URLs are enough for a human reviewer to inspect the public source while
+    the ledger retains only stable IDs and labels.
+    """
+    with _event_ledger_connect(path) as db:
+        rows = db.execute("""
+            SELECT o.id,o.observed_at,o.event_key,o.candidate_tweet_id,
+                   o.candidate_username,o.reviewed,o.false_positive,o.note,
+                   d.tweet_id AS prior_tweet_id,d.username AS prior_username
+            FROM event_observations o
+            LEFT JOIN deliveries d ON d.delivery_key=o.prior_delivery_key
+            WHERE o.decision='would_suppress'
+            ORDER BY o.reviewed ASC,o.id ASC LIMIT ?
+        """, (max(1, min(int(limit), 1000)),)).fetchall()
+    result = []
+    for row in rows:
+        item = dict(row)
+        item["candidate_url"] = (
+            f"https://x.com/{item['candidate_username']}/status/{item['candidate_tweet_id']}")
+        if item.get("prior_username") and item.get("prior_tweet_id"):
+            item["prior_url"] = (
+                f"https://x.com/{item['prior_username']}/status/{item['prior_tweet_id']}")
+        else:
+            item["prior_url"] = None
+        result.append(item)
+    return result
+
+
+def review_event_observation(observation_id: int, false_positive: bool,
+                             note: str = "", *, path: str | None = None) -> bool:
+    """Atomically label one suppression candidate for the enforce gate."""
+    with _event_ledger_connect(path) as db:
+        cur = db.execute("""
+            UPDATE event_observations
+            SET reviewed=1,false_positive=?,note=?
+            WHERE id=? AND decision='would_suppress'
+        """, (1 if false_positive else 0, str(note)[:500], int(observation_id)))
+    return cur.rowcount == 1
+
+
+def recover_stale_event_claims(path: str | None = None,
+                               now: datetime | None = None) -> int:
+    """Startup crash recovery, including claims whose tweet was already seen.
+
+    A sender can receive Telegram ok and then crash while finalizing SQLite. The
+    per-account seen checkpoint may keep that tweet out of future claim calls, so
+    recovery cannot rely only on seeing the tweet again.
+    """
+    now = now or datetime.now(timezone.utc)
+    cutoff = (now - timedelta(seconds=EVENT_LEDGER_PENDING_TTL_SECONDS)).isoformat()
+    with _event_ledger_connect(path) as db:
+        cur = db.execute("""UPDATE deliveries SET state='ambiguous',updated_at=?,
+            detail=CASE WHEN detail IS NULL OR detail='' THEN 'startup_stale_pending_recovery'
+                        ELSE detail END
+            WHERE state='pending' AND updated_at<?""", (now.isoformat(), cutoff))
+    return cur.rowcount
+
+
+def _init_event_dedup_mode(requested: str) -> str:
+    global _EVENT_DEDUP_MODE, _EVENT_DEDUP_EFFECTIVE_MODE
+    requested = requested if requested in ("off", "observe", "enforce") else "observe"
+    _EVENT_DEDUP_MODE = requested
+    if requested == "enforce":
+        report = event_dedup_gate_report()
+        if not report["ready"]:
+            print(f"  ⚠ event dedup enforce Go/No-Go=NO-GO {report}; 保持 observe")
+            _EVENT_DEDUP_EFFECTIVE_MODE = "observe"
+        else:
+            _EVENT_DEDUP_EFFECTIVE_MODE = "enforce"
+    else:
+        _EVENT_DEDUP_EFFECTIVE_MODE = requested
+    if requested != "off":
+        recovered = recover_stale_event_claims()
+        if recovered:
+            print(f"  ⚠ event ledger 恢复 {recovered} 条 stale pending → ambiguous（不盲重发）")
+    return _EVENT_DEDUP_EFFECTIVE_MODE
+
+
+def claim_event_delivery(t: dict, username: str, *, target_chat_id: str = "",
+                         target_thread_id: "str | int | None" = None,
+                         path: str | None = None, now: datetime | None = None) -> dict:
+    """Atomically claim before send; returns {claimed, token, duplicate, ...}."""
+    now = now or datetime.now(timezone.utc)
+    now_iso = now.isoformat()
+    ident = event_identity(t)
+    bundle_key = ((_semantic_bundle(t).get("identity") or {}).get("bundle_key")
+                  if _semantic_use(t) else "")
+    tid = str(bundle_key[2:] if isinstance(bundle_key, str) and bundle_key.startswith("t:")
+              else (t.get("id") or ""))
+    target_chat = str(target_chat_id)
+    target_thread = "" if target_thread_id is None else str(target_thread_id)
+    target_digest = hashlib.sha256(json.dumps(
+        [target_chat, target_thread], ensure_ascii=False,
+        separators=(",", ":")).encode()).hexdigest()[:20]
+    event_key = ident["event_key"]
+    enforce_key = (_EVENT_DEDUP_EFFECTIVE_MODE == "enforce" and ident["confidence"] == "high")
+    fact_digest = hashlib.sha256(json.dumps(ident["facts"], ensure_ascii=False,
+                                            separators=(",", ":")).encode()).hexdigest()[:20]
+    delivery_key = (f"target:{target_digest}:event:{event_key}:{fact_digest}"
+                    if enforce_key else f"target:{target_digest}:tweet:{tid}")
+    token = hashlib.sha256(f"{delivery_key}:{os.getpid()}:{time.time_ns()}".encode()).hexdigest()
+    with _event_ledger_connect(path) as db:
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            prior = None
+            if ident["confidence"] == "high":
+                cutoff = (now - timedelta(hours=EVENT_LEDGER_EVENT_WINDOW_HOURS)).isoformat()
+                priors = db.execute("""
+                    SELECT delivery_key,state,tweet_id,username,updated_at,facts_json FROM deliveries
+                    WHERE target_chat_id=? AND target_thread_id=? AND event_key=?
+                      AND state IN ('pending','confirmed','ambiguous')
+                      AND updated_at>=?
+                    ORDER BY updated_at DESC
+                """, (target_chat,target_thread,event_key,cutoff)).fetchall()
+                distinct_priors = [row for row in priors if row["tweet_id"] != tid]
+                if distinct_priors:
+                    prior = distinct_priors[0]
+                    prior_facts = set()
+                    for row in distinct_priors:
+                        try:
+                            facts = json.loads(row["facts_json"])
+                            if isinstance(facts, list):
+                                prior_facts.update(str(fact) for fact in facts)
+                        except Exception:
+                            continue
+                    candidate_facts = set(ident["facts"])
+                    # Compare against the event's complete known fact set, not only
+                    # its latest delivery. This preserves every genuinely new fact
+                    # while preventing an older paraphrase from resurfacing after an
+                    # intervening, incomparable update.
+                    decision = ("would_suppress" if candidate_facts <= prior_facts
+                                else "material_update")
+                    db.execute("""INSERT OR IGNORE INTO event_observations
+                        (observed_at,target_chat_id,target_thread_id,event_key,
+                         prior_delivery_key,candidate_tweet_id,candidate_username,decision)
+                        VALUES (?,?,?,?,?,?,?,?)""",
+                        (now_iso,target_chat,target_thread,event_key,
+                         prior["delivery_key"],tid,username,decision))
+                    if enforce_key and decision == "would_suppress":
+                        db.execute("COMMIT")
+                        return {"claimed": False, "duplicate": True, "state": prior["state"],
+                                "event": ident, "prior_tweet_id": prior["tweet_id"]}
+            existing = db.execute("SELECT * FROM deliveries WHERE delivery_key=?",
+                                  (delivery_key,)).fetchone()
+            if existing and existing["state"] in ("confirmed", "ambiguous"):
+                db.execute("COMMIT")
+                return {"claimed": False, "duplicate": True, "state": existing["state"],
+                        "event": ident, "prior_tweet_id": existing["tweet_id"]}
+            if existing and existing["state"] == "pending":
+                try:
+                    age = (now - datetime.fromisoformat(existing["updated_at"])).total_seconds()
+                except Exception:
+                    age = EVENT_LEDGER_PENDING_TTL_SECONDS + 1
+                if age <= EVENT_LEDGER_PENDING_TTL_SECONDS:
+                    db.execute("COMMIT")
+                    return {"claimed": False, "duplicate": True, "state": "pending",
+                            "event": ident, "prior_tweet_id": existing["tweet_id"]}
+                # A stale pending claim may have crashed after the request left the
+                # host. Promote to ambiguous: audit/manual recovery, never blind resend.
+                db.execute("UPDATE deliveries SET state='ambiguous',updated_at=?,detail=? WHERE delivery_key=?",
+                           (now_iso, "stale_pending_crash_recovery", delivery_key))
+                db.execute("COMMIT")
+                return {"claimed": False, "duplicate": True, "state": "ambiguous",
+                        "event": ident, "prior_tweet_id": existing["tweet_id"]}
+            values = (delivery_key,target_chat,target_thread,event_key,ident["event_type"],json.dumps(ident["facts"], ensure_ascii=False),
+                      tid,username,"pending",token,now_iso,now_iso)
+            if existing:
+                db.execute("""UPDATE deliveries SET target_chat_id=?,target_thread_id=?,event_key=?,event_type=?,facts_json=?,tweet_id=?,
+                    username=?,state=?,claim_token=?,claimed_at=?,updated_at=?,message_id=NULL,
+                    send_method=NULL,detail=NULL WHERE delivery_key=?""", values[1:] + (delivery_key,))
+            else:
+                db.execute("""INSERT INTO deliveries
+                    (delivery_key,target_chat_id,target_thread_id,event_key,event_type,facts_json,
+                     tweet_id,username,state,claim_token,claimed_at,updated_at)
+                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""", values)
+            db.execute("COMMIT")
+        except Exception:
+            db.execute("ROLLBACK")
+            raise
+    return {"claimed": True, "duplicate": False, "state": "pending", "token": token,
+            "delivery_key": delivery_key, "event": ident}
+
+
+def finish_event_delivery(claim: dict, state: str, result: dict | None = None,
+                          detail: str = "", *, path: str | None = None) -> bool:
+    if state not in ("confirmed", "ambiguous", "failed_pre_send"):
+        raise ValueError(f"invalid delivery state: {state}")
+    result = result or {}
+    message_id = telegram_message_id_of(result)
+    method = result.get("send_method") or result.get("method")
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with _event_ledger_connect(path) as db:
+        cur = db.execute("""UPDATE deliveries SET state=?,updated_at=?,message_id=?,send_method=?,detail=?
+            WHERE delivery_key=? AND claim_token=? AND state='pending'""",
+            (state,now_iso,str(message_id) if message_id is not None else None,method,
+             (detail or str(result.get("description") or ""))[:500],
+             claim.get("delivery_key"),claim.get("token")))
+    return cur.rowcount == 1
+
+
+# ── 自回复线程锚点（推文 id → Telegram message_id）─────────────────────
+
+def _anchor_target(target_chat_id: str = "",
+                   target_thread_id: "str | int | None" = None) -> tuple[str, str]:
+    return str(target_chat_id), "" if target_thread_id is None else str(target_thread_id)
+
+
+def telegram_message_id_of(result: dict | None) -> "int | None":
+    """Telegram 响应里的 message_id（sendMessage/sendPhoto/sendRichMessage 同形）。"""
+    if not isinstance(result, dict):
+        return None
+    message = result.get("result") if isinstance(result.get("result"), dict) else result
+    message_id = message.get("message_id") if isinstance(message, dict) else None
+    try:
+        return int(message_id)
+    except (TypeError, ValueError):
+        return None
+
+
+def record_tweet_anchor(tweet_id: str, message_id: "int | None", *, username: str = "",
+                        target_chat_id: str = "",
+                        target_thread_id: "str | int | None" = None,
+                        path: str | None = None, now: datetime | None = None) -> bool:
+    """记下「这条推文落在这条 Telegram 消息上」，供后续自回复接线程。
+
+    旁路设施：调用方必须容忍失败（只打日志），锚点丢了最多退化成不接线程的
+    独立消息，绝不能因此重发或中断投递。
+    """
+    tweet_id = str(tweet_id or "")
+    if not tweet_id or not message_id:
+        return False
+    now = now or datetime.now(timezone.utc)
+    chat, thread = _anchor_target(target_chat_id, target_thread_id)
+    cutoff = (now - timedelta(days=TWEET_ANCHOR_TTL_DAYS)).isoformat()
+    with _event_ledger_connect(path) as db:
+        db.execute("""INSERT INTO tweet_anchors
+            (target_chat_id,target_thread_id,tweet_id,message_id,username,updated_at)
+            VALUES (?,?,?,?,?,?)
+            ON CONFLICT(target_chat_id,target_thread_id,tweet_id) DO UPDATE SET
+                message_id=excluded.message_id,username=excluded.username,
+                updated_at=excluded.updated_at""",
+            (chat, thread, tweet_id, str(int(message_id)), str(username or ""),
+             now.isoformat()))
+        db.execute("DELETE FROM tweet_anchors WHERE updated_at<?", (cutoff,))
+    return True
+
+
+def lookup_tweet_anchor(tweet_id: str, *, target_chat_id: str = "",
+                        target_thread_id: "str | int | None" = None,
+                        path: str | None = None) -> "int | None":
+    """父推在本目标（chat + 话题）里的 message_id；没有记录时 None。
+
+    按目标限定是必须的：话题路由变更后旧锚点属于别的话题，跨话题回复会被
+    Telegram 直接 400 拒掉，查不到反而是正确的降级。
+    """
+    tweet_id = str(tweet_id or "")
+    if not tweet_id:
+        return None
+    chat, thread = _anchor_target(target_chat_id, target_thread_id)
+    with _event_ledger_connect(path) as db:
+        row = db.execute("""SELECT message_id FROM tweet_anchors
+            WHERE target_chat_id=? AND target_thread_id=? AND tweet_id=?""",
+            (chat, thread, tweet_id)).fetchone()
+    if not row:
+        return None
+    try:
+        return int(row["message_id"])
+    except (TypeError, ValueError):
+        return None
+
+
+def self_reply_parent_id(t: dict, username: str) -> str:
+    """本推所接续的「同作者上一条」的推文 id；不是自回复时空串。
+
+    只认同作者：回复别人的推文若接到自己某条消息下面就是张冠李戴。转推壳的
+    正文来自他人，同样排除。screen_name 缺失（改名/不可解析）时回落数字 user_id。
+    """
+    parent = t.get("in_reply_to_status")
+    if not isinstance(parent, dict) or t.get("retweeted_status"):
+        return ""
+    parent_id = str(parent.get("id") or "")
+    if not parent_id.isdigit():
+        return ""
+    parent_name = _canonical_username(str(parent.get("screen_name") or ""))
+    if parent_name:
+        return parent_id if parent_name == _canonical_username(username) else ""
+    parent_user = str(parent.get("user_id") or "")
+    self_user = str((t.get("user") or {}).get("id_str") or "")
+    return parent_id if parent_user and parent_user == self_user else ""
 
 
 # ── 跨账号去重索引（纯转发 + Article；config 键 cross_account_dedup 开关）──
@@ -1818,6 +3030,10 @@ def save_pushed_index() -> None:
 def _canonical_key(t: dict) -> str:
     """推文的跨账号规范 id：纯转发 → 原推 id；原创/引用壳 → 自身 id。
     引用是新内容（带评论），只登记自身、不穿透到被引原推。"""
+    if _semantic_use(t):
+        key = ((_semantic_bundle(t).get("identity") or {}).get("bundle_key") or "")
+        if key:
+            return str(key)
     rt = t.get("retweeted_status") or {}
     if rt.get("id"):
         return "t:" + str(rt["id"])
@@ -1826,6 +3042,9 @@ def _canonical_key(t: dict) -> str:
 
 def _cross_dup_hit(t: dict) -> "dict | None":
     """仅纯转发可被抑制：原推 canonical 已在索引中则返回命中条目，否则 None。"""
+    if _semantic_use(t):
+        # Symmetric anchor dedup: direct B and A-repost-B share t:B in either order.
+        return load_pushed_index().get(_canonical_key(t))
     rt = t.get("retweeted_status") or {}
     if not rt.get("id"):
         return None
@@ -1840,10 +3059,257 @@ def _record_pushed(t: dict, username: str) -> None:
     save_pushed_index()
 
 
-def _record_pushed_article(article_id: str, username: str) -> None:
+def _record_pushed_article(article_id: str, username: str, bundle_key: str = "", *,
+                           message_ids: "list | None" = None, chat_id: str = "",
+                           thread_id: "int | None" = None, quoted: bool = False,
+                           form: str = "summary", cover_url: str = "") -> None:
+    """登记一次 article 摘要投递。
+
+    message_ids/chat_id 是删减功能撤回旧摘要的唯一入口（article 路径不走 event
+    ledger，message_id 此前无处可取）；quoted 区分「带引用评论」与「裸摘要」两种
+    投递，不能用 ab:/a: 键前缀替代——flat 路径的引用文章也走 a:<id> 键。
+    form 区分「完整摘要」与「增量评论卡片」：只有摘要能当卡片的挂载锚点。
+    cover_url 在首条摘要投递时顺手记下（那时 markdown 已在手上）：后续引用者的
+    卡片要配同一张封面，而卡片路径的全部意义就是不再抓 markdown —— 不缓存这个
+    URL 就只能为了一张图重新抓一遍全文，省下的成本全吐回去。
+    响应缺失（assumed_delivered）时 message_ids 为空 = 无法撤回，如实留空。
+    """
     idx = load_pushed_index()
-    idx["a:" + str(article_id)] = {"ts": datetime.now(timezone.utc).isoformat(), "by": username}
+    key = "ab:" + bundle_key if bundle_key else "a:" + str(article_id)
+    idx[key] = {"ts": datetime.now(timezone.utc).isoformat(), "by": username,
+                "article_key": "a:" + str(article_id),
+                "message_ids": [int(m) for m in (message_ids or []) if m],
+                "chat_id": str(chat_id or ""),
+                "thread_id": thread_id,
+                "quoted": bool(quoted),
+                "form": form,
+                "cover_url": str(cover_url or "")}
     save_pushed_index()
+
+
+# ── X Article 删减：同篇文章的引用版送达后，裸摘要（无引用评论）让位 ──
+# 线上实测两周 22 篇文章有 5 篇被推两次，其中 2 次是引用版先到、裸摘要 15~17s
+# 后到（同一轮）。两个方向都要覆盖：引用版后到 → 删已发的裸摘要；引用版先到 →
+# 裸摘要根本不发（省掉抓取 + AI 摘要，也不留删除痕迹）。
+_ARTICLE_SUPERSEDE_ENABLED = False   # main 从 cfg 置位；默认关 = 行为与现状一致
+# 多人引用同一篇文章：首条发完整摘要，后续引用者只发一条增量评论卡片 reply 在它
+# 下面。摘要正文由锚点消息承载 → 后续引用完全跳过抓取和 AI 摘要，N 个引用者的
+# 成本从 N 次抓取 + N 次配图下载 + N 次摘要降到 1 次。
+_ARTICLE_QUOTE_CARD_ENABLED = False
+ARTICLE_CARD_CAPTION_MAX = 1024   # sendPhoto caption 上限（sendMessage 是 4096）
+
+
+def _article_key_of(key: str, rec: dict) -> str:
+    """索引条目所属文章键。article_key 是后加的字段，老条目里只有 a:<id> 能自证
+    归属（ab: 老条目无从还原文章 id → 返回空串，视为不参与删减）。"""
+    return str(rec.get("article_key") or "") or (key if key.startswith("a:") else "")
+
+
+def _is_bare_article_delivery(key: str, rec: dict) -> bool:
+    """裸摘要 = 投递时没有引用评论。老条目无 quoted 字段时回退键前缀判定。"""
+    if rec.get("quoted") is None:
+        return key.startswith("a:")
+    return not rec.get("quoted")
+
+
+def _article_delivery_rows(article_key: str) -> list:
+    """同一篇文章的全部已送达记录，按送达时间升序 [(key, rec), ...]。"""
+    if not article_key:
+        return []
+    rows = [(k, v) for k, v in load_pushed_index().items()
+            if _article_key_of(k, v) == article_key]
+    rows.sort(key=lambda kv: str(kv[1].get("ts") or ""))
+    return rows
+
+
+def _find_retractable_bare_delivery(article_key: str) -> "tuple[str, dict] | None":
+    """该文章可撤回的裸摘要投递：有 message_ids 且未撤回过。
+
+    retracted_at 是幂等闸——否则每轮都会去戳同一条已删消息。
+    """
+    for key, rec in _article_delivery_rows(article_key):
+        if (_is_bare_article_delivery(key, rec) and rec.get("message_ids")
+                and not rec.get("retracted_at")):
+            return key, rec
+    return None
+
+
+def _quoted_article_delivered(article_key: str) -> "dict | None":
+    """该文章是否已有带引用评论的投递（裸摘要应让位于它，不再发）。"""
+    for key, rec in _article_delivery_rows(article_key):
+        if not _is_bare_article_delivery(key, rec):
+            return rec
+    return None
+
+
+def _find_article_summary_anchor(article_key: str) -> "dict | None":
+    """该文章最早一条仍在群里的完整摘要投递 —— 增量评论卡片挂在它下面。
+
+    卡片自身（form=card）不能当锚点，否则第三个引用者会挂到第二个人的卡片下、
+    越挂越深。老条目无 form 字段 → 视为摘要（当时还没有卡片这个形态）。
+    被撤回的摘要不能当锚点：正文已经不在了，此时应退回发完整摘要。
+    """
+    for _key, rec in _article_delivery_rows(article_key):
+        if (str(rec.get("form") or "summary") == "summary"
+                and rec.get("message_ids") and not rec.get("retracted_at")):
+            return rec
+    return None
+
+
+def _quote_tweet_url(entry: dict) -> str:
+    """写下这条评论的引用推 URL。
+
+    bundle_key 是 t:<引用推 id>，comment_author 是它的作者；entry["tweet_id"] 不能
+    用——那是文章所有者的推，不是评论推。flat 路径没有 bundle_key → 返回空串由
+    调用方回落到文章原文页。
+    """
+    bundle_key = str(entry.get("bundle_key") or "")
+    author = str(entry.get("comment_author") or "").lstrip("@")
+    tweet_id = bundle_key[2:] if bundle_key.startswith("t:") else ""
+    if not (author and tweet_id.isdigit()):
+        return ""
+    return f"https://x.com/{author}/status/{tweet_id}"
+
+
+def format_article_quote_card(username: str, entry: dict, *,
+                              comment_limit: int = 900) -> "tuple[str, str]":
+    """增量评论卡片：同篇文章已推过完整摘要时，后续引用者只发这一条短消息。
+
+    按钮指向引用推而非文章原文页：文章链接锚点摘要那条已经给过，卡片承载的是
+    「某人的评论」，指向评论推才有增量（能看到上下文和底下的讨论）。
+    带封面走 sendPhoto 时整条是 caption，上限 1024 UTF-16 单位（远小于 sendMessage
+    的 4096）→ comment_limit 由调用方按目标方法收紧。
+    """
+    title = re.sub(r"\s+", " ", str(entry.get("article_title") or "").strip())
+    comment = str(entry.get("quote_comment") or "").strip()
+    lines = []
+    if title:
+        lines.append(f"\U0001f4c4 {html.escape(_truncate_utf16(title, 140))}")
+    if comment:
+        body = "\n".join(html.escape(ln)
+                         for ln in _truncate_utf16(comment, comment_limit).split("\n"))
+        lines.append(f"<blockquote>{body}</blockquote>")
+    return "\n".join(lines), (_quote_tweet_url(entry) or article_url(entry["article_id"]))
+
+
+def _deliver_article_quote_card(bot_token: str, chat_id: str, username: str, entry: dict,
+                                anchor: dict, *, thread_id: "int | None" = None,
+                                dry_run: bool = False) -> None:
+    """发一条增量评论卡片并就地改写 entry 状态（终态 sent / failed）。
+
+    失败按 failed 记账走既有重试计数，不吞掉——评论卡片也是内容，丢了就没了。
+    """
+    card, link = format_article_quote_card(username, entry)
+    reply_to = int(anchor["message_ids"][0])
+    # 封面复用首条摘要投递时记下的 URL：卡片路径不抓 markdown，取不到就纯文本发。
+    cover = str(anchor.get("cover_url") or "")
+    caption = card
+    if cover and _utf16_len(caption) > ARTICLE_CARD_CAPTION_MAX:
+        caption, _ = format_article_quote_card(username, entry, comment_limit=600)
+    use_photo = bool(cover) and _utf16_len(caption) <= ARTICLE_CARD_CAPTION_MAX
+    # 按钮指向引用推时「打开原文」名不副实；回落到文章页时才用原文案。
+    button = "\U0001f517 查看引用推文" if _quote_tweet_url(entry) else "\U0001f517 打开原文"
+    if dry_run:
+        print(f"    DRY RUN 评论卡片（reply {reply_to}，"
+              f"{'带封面' if use_photo else '纯文本'}）: {card[:100]}")
+        entry["status"] = "summarized"
+        return
+    entry["attempts"] = int(entry.get("attempts", 0)) + 1
+    try:
+        r = {}
+        if use_photo:
+            r = send_telegram_photo(bot_token, chat_id, cover, caption, link,
+                                    thread_id=thread_id, reply_to_message_id=reply_to,
+                                    button_text=button)
+            if not r.get("ok") and r.get("photo_fallback"):
+                # 图被拒（外链失效/格式不支持）不能连评论一起丢：退回纯文本。
+                print(f"    卡片配图被拒（{str(r.get('description', ''))[:60]}），回退纯文本")
+                r = {}
+        if not r:
+            r = send_telegram(bot_token, chat_id, card, link, thread_id=thread_id,
+                              reply_to_message_id=reply_to, button_text=button)
+    except Exception as e:
+        entry["status"] = "failed"
+        entry["failed_stage"] = "quote_card_send"
+        entry["last_error"] = str(e)[:500]
+        print(f"    评论卡片推送异常: {type(e).__name__}: {e}")
+        return
+    if not r.get("ok"):
+        entry["status"] = "failed"
+        entry["failed_stage"] = "quote_card_send"
+        entry["last_error"] = str(r)[:500]
+        print(f"    评论卡片推送 FAIL: {str(r.get('description', ''))[:80]}")
+        return
+    entry["status"] = "sent"
+    entry["delivery_form"] = "quote_card"
+    entry["sent_at"] = datetime.now(timezone.utc).isoformat()
+    print(f"    评论卡片推送 OK（挂在 {reply_to} 下，"
+          f"{'带封面' if r.get('send_method') == 'sendPhoto' else '纯文本'}，"
+          f"跳过抓取与 AI 摘要）")
+    try:
+        _record_pushed_article(
+            entry["article_id"], username, str(entry.get("bundle_key") or ""),
+            message_ids=[(r.get("result") or {}).get("message_id")],
+            chat_id=chat_id, thread_id=thread_id, quoted=True, form="card")
+    except OSError as e:
+        print(f"    pushed_index 落盘失败（忽略）: {e}")
+    source_id = entry.get("tweet_id") or entry.get("article_id")
+    _record_confirmed_sent_content(
+        r, chat_id=chat_id, thread_id=thread_id,
+        source_kind="x_article", source_ref=link,
+        source_message_ids=[source_id], url=link,
+        content=_html_to_plain(card),
+        content_id=f"x-article-quote:{entry.get('article_id')}:{source_id}")
+    time.sleep(1.2)
+
+
+def _tg_message_link(chat_id: str, thread_id: "int | None", message_id: int) -> str:
+    """超级群消息深链。DM / 普通群没有该链接形式 → 返回空串由调用方省略。"""
+    cid = str(chat_id or "")
+    if not cid.startswith("-100") or not message_id:
+        return ""
+    internal = cid[4:]
+    return (f"https://t.me/c/{internal}/{thread_id}/{message_id}" if thread_id
+            else f"https://t.me/c/{internal}/{message_id}")
+
+
+def _retract_article_delivery(bot_token: str, key: str, rec: dict, *,
+                              superseded_by: str = "", replacement_link: str = "") -> bool:
+    """撤回一次裸摘要投递（分块回退路径可能有多条消息，全部处理）。
+
+    deleteMessage 依赖 bot 在超级群的 can_delete_messages（否则只能删 48h 内的
+    消息）。删不掉时退化为 editMessageText 改写成一行指路提示——编辑无时限，
+    保证任何情况下都不会留下与引用版重复的整篇摘要。
+    整段是旁路：失败只打日志，绝不能影响刚刚送达的引用版。
+    """
+    chat_id = str(rec.get("chat_id") or "")
+    mids = [int(m) for m in (rec.get("message_ids") or []) if m]
+    if not (bot_token and chat_id and mids):
+        return False
+    who = html.escape(str(superseded_by or "").lstrip("@") or "策展人")
+    deleted = 0
+    for mid in mids:
+        if _tg_post_quiet(bot_token, {"chat_id": chat_id, "message_id": mid},
+                          "deleteMessage").get("ok"):
+            deleted += 1
+            continue
+        pointer = f"\U0001f5d1 本文章摘要已由 @{who} 的引用版取代"
+        if replacement_link:
+            pointer += (f'\n<a href="{html.escape(replacement_link, quote=True)}">'
+                        f"→ 查看引用版</a>")
+        _tg_post_quiet(bot_token, {"chat_id": chat_id, "message_id": mid,
+                                   "text": pointer, "parse_mode": "HTML",
+                                   "disable_web_page_preview": True},
+                       "editMessageText")
+    rec["retracted_at"] = datetime.now(timezone.utc).isoformat()
+    rec["retracted_by"] = str(superseded_by or "")
+    try:
+        save_pushed_index()
+    except OSError as e:
+        print(f"    pushed_index 落盘失败（忽略）: {e}")
+    print(f"    删减：撤回裸摘要 {key}（deleteMessage {deleted}/{len(mids)}，"
+          f"余者已改写为指路提示）")
+    return True
 
 
 def _alert_seen_save_failure(bot_token: str, chat_id: str, username: str, error: Exception) -> None:
@@ -2343,7 +3809,7 @@ def _rich_media_block(t: dict, embed_video: bool = True) -> str:
     parts = []
     hint = ""
     for m in t.get("media") or []:
-        url = m.get("url")  # photo: media_url_https；video/gif: 封面缩略图
+        url = _safe_x_media_url(m.get("url"))  # trusted X media only
         if not url or not url.startswith("https://") or '"' in url or "<" in url:
             continue
         mp4 = None
@@ -2402,6 +3868,14 @@ def _safe_http_url(value: object) -> str:
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
         return ""
     return value
+
+
+def _safe_x_media_url(value: object) -> str:
+    value = _safe_http_url(value)
+    if not value:
+        return ""
+    host = (urllib.parse.urlsplit(value).hostname or "").casefold()
+    return value if host in {"pbs.twimg.com", "video.twimg.com"} else ""
 
 
 def _entity_destination(entity: dict) -> str:
@@ -2496,7 +3970,7 @@ def _has_renderable_media(t: dict) -> bool:
     for media in t.get("media") or []:
         if not isinstance(media, dict):
             continue
-        url = media.get("url")
+        url = _safe_x_media_url(media.get("url"))
         if isinstance(url, str) and url.startswith("https://") and '"' not in url and "<" not in url:
             return True
     return False
@@ -2513,7 +3987,7 @@ def _fallback_photo_url(t: dict) -> str:
     for media in t.get("media") or []:
         if not isinstance(media, dict):
             continue
-        url = media.get("url")
+        url = _safe_x_media_url(media.get("url"))
         if (isinstance(url, str) and url.startswith("https://")
                 and '"' not in url and "<" not in url):
             return url
@@ -2601,6 +4075,106 @@ def _tweet_source_url(username: str, t: dict) -> str:
             f"{urllib.parse.quote(str(source_id), safe='')}")
 
 
+def _semantic_node_view(node: dict) -> dict:
+    article = node.get("article") or {}
+    note = node.get("note") or {}
+    return {
+        "id": node.get("tweet_id"), "text": node.get("text") or "",
+        "note_tweet": note if note.get("text") else {},
+        "entities": node.get("entities") or {},
+        "extended_entities": node.get("extended_entities") or {},
+        "media": node.get("media") or [],
+        "article": ({"rest_id": article.get("article_id"),
+                     "title": article.get("title", ""),
+                     "preview_text": article.get("preview_text", "")}
+                    if article.get("article_id") else None),
+    }
+
+
+def _semantic_classification_view(node: dict) -> dict:
+    """Validated formal-classifier view: NoteTweet wins and t.co is expanded."""
+    view = _semantic_node_view(node)
+    body = ((view.get("note_tweet") or {}).get("text") or view.get("text") or "")
+    view["text"] = _expand_tco(str(body), view)
+    return view
+
+
+def _semantic_node_body(node: dict) -> tuple[str, dict]:
+    view = _semantic_node_view(node)
+    body = ((view.get("note_tweet") or {}).get("text") or view.get("text") or "").strip()
+    if not body and view.get("article"):
+        body = article_preview_text(view)
+    if body and view.get("media"):
+        body = _strip_media_tco(body, view)
+    return body, view
+
+
+def format_semantic_message(username: str, t: dict, *, embed_video: bool = True
+                            ) -> tuple[str, str, str]:
+    """Project anchor + quote context while keeping repost lineage lightweight."""
+    bundle = _semantic_bundle(t)
+    anchor = bundle.get("anchor") or {}
+    author = anchor.get("author") or username
+    link = _safe_http_url(anchor.get("source_url"))
+    hidden = f'<a href="{html.escape(link, quote=True)}">\u200b</a>' if link else ""
+    observer = str((bundle.get("observation") or {}).get("observed_via") or "")
+    repost_path = bundle.get("repost_path") or []
+    via = (f"经 @{observer} 转发发现" if repost_path and observer
+           and observer.casefold() != str(author).casefold() else "")
+
+    anchor_body, anchor_view = _semantic_node_body(anchor)
+    plain_parts = [f"📢 @{html.escape(str(author))}{hidden}"]
+    rich_parts = [f"📢 @{html.escape(str(author))}"]
+    if via:
+        plain_parts.append(html.escape(via))
+        rich_parts.append(html.escape(via))
+    if (bundle.get("resolution") or {}).get("status") in ("degraded_optional", "auth_degraded"):
+        hint = "⚠ 引用上下文未完整取得"
+        plain_parts.append(hint)
+        rich_parts.append(hint)
+    if anchor_body:
+        plain_parts.append(_render_tweet_urls(_truncate_utf16(anchor_body, 1100), anchor_view,
+                                              rich=False))
+        rich_anchor = _render_tweet_urls(_truncate_utf16(anchor_body, 5000), anchor_view,
+                                         rich=True)
+        rich_parts.append(rich_anchor + _rich_media_block(anchor_view, embed_video))
+    elif anchor_view.get("media"):
+        # 无正文的纯媒体推：媒体块自带前导 <br><br>，而 rich_parts 之间已用 <br><br>
+        # 连接，去掉这一层。必须按前缀删（str.lstrip 是字符集删除，会连 <img 的
+        # "<" 一起吃掉，把图片降级成裸文本 `img src="…"/>`）。
+        rich_parts.append(
+            _rich_media_block(anchor_view, embed_video).removeprefix("<br><br>"))
+
+    for node in bundle.get("context_nodes") or []:
+        if not isinstance(node, dict):
+            continue
+        context_author = str(node.get("author") or "未知作者")
+        context_link = _safe_http_url(node.get("source_url"))
+        context_hidden = (f'<a href="{html.escape(context_link, quote=True)}">\u200b</a>'
+                          if context_link else "")
+        heading = f"↳ 引用 @{html.escape(context_author)}{context_hidden}"
+        body, view = _semantic_node_body(node)
+        plain_block = heading
+        rich_block = heading
+        if body:
+            plain_block += "\n" + _render_tweet_urls(_truncate_utf16(body, 500), view, rich=False)
+            rich_block += "<br>" + _render_tweet_urls(_truncate_utf16(body, 4000), view,
+                                                       rich=True)
+        rich_block += _rich_media_block(view, embed_video)
+        plain_parts.append(plain_block)
+        rich_parts.append(rich_block)
+
+    plain = "\n\n".join(plain_parts)
+    rich = "<br><br>".join(rich_parts)
+    # Inputs are truncated before escaping, preserving valid HTML tags. These are
+    # final guards for Telegram's UTF-16 accounting and Rich endpoint envelope.
+    if _utf16_len(plain) > 3900:
+        plain = html.escape(_truncate_utf16(_html_to_plain(plain), 3900))
+    if _utf16_len(rich) > 29000:
+        rich = html.escape(_truncate_utf16(_html_to_plain(rich), 29000))
+    return plain, rich, link
+
+
 def format_message(
     username: str, t: dict, ai: "AIClassifier | None" = None,
     *, embed_video: bool = True,
@@ -2613,6 +4187,8 @@ def format_message(
     rich_html targets sendRichMessage's html field (RICH_MESSAGE_MAX_CHARS budget)
     and folds the full note text with a much larger cap so long tweets show in full.
     """
+    if _semantic_use(t):
+        return format_semantic_message(username, t, embed_video=embed_video)
     link = _tweet_source_url(username, t)
     hidden = f'<a href="{link}">​</a>' if link else ""
     note = t.get("note_tweet") or {}
@@ -2678,12 +4254,9 @@ class TgAmbiguousDelivery(OSError):
     """
 
 
-# 连续歧义熔断：单条慢响应（本次事故形态）按已送达防重复；但连续多条 60s 读超时
-# 的先验解释是「Telegram 没在处理」（边缘 LB 活着、后端挂死的大面积故障形态），
-# 继续按已送达会把整轮推文批量标 seen 静默丢弃。故本进程内第 2 条起改按失败处理
-# （进 push_retry，恢复后重发；最坏重复 1 条 << 批量永久丢失）。只有确由 Bot API
-# 后端产生的响应（可解析的 2xx 回执、4xx 含 429）才清零计数；5xx/垃圾 2xx 可能
-# 是边缘 nginx 在后端挂死时生成的，不清零。
+# 连续歧义计数只用于诊断。Telegram 没有幂等键，次数再多也不能证明请求未被
+# 接收，因此不能把 unknown outcome 改判成可安全重试。只有确由 Bot API 后端
+# 产生的响应（可解析的 2xx 回执、4xx 含 429）才清零计数；5xx/垃圾 2xx 不清零。
 _AMBIGUOUS_STREAK = 0
 
 
@@ -2693,10 +4266,14 @@ def _note_definite_response() -> None:
 
 
 def _register_ambiguous_send() -> bool:
-    """记一次歧义发送；返回 True=按已送达处理，False=连续歧义应按失败处理。"""
+    """记一次歧义发送；仅作进程内诊断，不把未知结果改判为可重试失败。
+
+    Telegram 没有幂等键。连续歧义说明服务可能整体异常，但也不能证明任一
+    请求未被接收；因此调用方必须始终按 ambiguous/assumed-delivered 收口。
+    """
     global _AMBIGUOUS_STREAK
     _AMBIGUOUS_STREAK += 1
-    return _AMBIGUOUS_STREAK < 2
+    return True
 
 
 def _record_assumed_delivery(method: str, link: str) -> None:
@@ -2729,8 +4306,8 @@ def _flush_assumed_delivery_notice(bot_token: str, chat_id: str) -> None:
     """上轮有歧义按已送达的发送时，发汇总 DM 供人工核对，送达确认后清痕迹。
 
     直发 _tg_post 而不走 send_telegram：通知自身再遇歧义时绝不能写回它正在
-    汇报的账本（自指条目会挤掉真实痕迹），也不占用本进程"首条歧义按已送达"
-    的熔断额度（否则内容通道阈值实际从 2 降到 1）。失败/歧义都只保留文件，
+    汇报的账本（自指条目会挤掉真实痕迹），也不占用内容通道的歧义诊断计数。
+    失败/歧义都只保留文件，
     下轮重试——告警自身绝不静默丢失。
     """
     entries = None
@@ -2786,17 +4363,15 @@ def _tg_post(token: str, payload: dict, method: str = "sendMessage") -> dict:
     try:
         resp = urllib.request.urlopen(req, timeout=60)
     except urllib.error.HTTPError as e:
-        if e.code == 504:
-            # 网关超时：上游已收到请求但未及时响应——与读超时同构的歧义
-            # （请求可能已被处理），归入 TgAmbiguousDelivery，绝不能走
-            # 5xx 盲重试路径重发。502/503 表示未到达后端，保留重试。
+        if e.code >= 500:
+            # Telegram/Bot API 没有幂等键。任何网关/服务端 5xx 都不能证明
+            # 请求未被后端接收：504 与读超时同构，502/503 也可能出现在
+            # 后端已处理但代理拿不到有效回执的路径。统一记为 ambiguous，
+            # 禁止 rich→photo→text 降级或同方法盲重试。
             e.close()
-            raise TgAmbiguousDelivery(f"HTTP 504: {e.reason}") from e
-        # 4xx（含 429）由 Bot API 后端产生，证明链路在处理请求 → 清零熔断计数；
-        # 其余 5xx 多为边缘 nginx 在后端不可达时直接生成，不证明任何事，不清零——
-        # 否则「一半 502 一半挂死」的大面积故障会让熔断永不触发、批量丢推。
-        if e.code < 500:
-            _note_definite_response()
+            raise TgAmbiguousDelivery(f"HTTP {e.code}: {e.reason}") from e
+        # 4xx（含 429）由 Bot API 后端产生，证明链路在处理请求 → 清零熔断计数。
+        _note_definite_response()
         raise
     except urllib.error.URLError:
         raise  # 发出前失败（连接/TLS/发送阶段），可安全重试
@@ -2853,7 +4428,8 @@ def _html_to_plain(text: str) -> str:
 
 
 def send_telegram_rich(token: str, chat_id: str, markdown: str = "", link: str = "",
-                       *, html: str = "", thread_id: "str | int | None" = None) -> dict:
+                       *, html: str = "", thread_id: "str | int | None" = None,
+                       reply_to_message_id: "int | None" = None) -> dict:
     """sendRichMessage（Bot API Rich Message，上限 32768 字符）。
 
     传 markdown 走 Rich Markdown 字段；传 html=… 走 Rich HTML 字段（恰传其一）。
@@ -2874,6 +4450,12 @@ def send_telegram_rich(token: str, chat_id: str, markdown: str = "", link: str =
     payload: dict = {"chat_id": chat_id, "rich_message": rich}
     if thread_id is not None:
         payload["message_thread_id"] = thread_id
+    if reply_to_message_id:
+        # 同 send_telegram：锚点消息可能已被删，缺目标时降级为普通消息而不是
+        # 400 把这条推丢掉。（sendRichMessage 虽是扩展方法，reply_parameters
+        # 与标准 sendMessage 同样受理，响应里带回 reply_to_message。）
+        payload["reply_parameters"] = {"message_id": int(reply_to_message_id),
+                                       "allow_sending_without_reply": True}
     if link:
         payload["reply_markup"] = {
             "inline_keyboard": [[{"text": "\U0001f517 打开原文", "url": link}]]
@@ -2889,18 +4471,18 @@ def send_telegram_rich(token: str, chat_id: str, markdown: str = "", link: str =
             raise last_err or RuntimeError(
                 "send_telegram_rich: 剩余预算不足以发起尝试，本轮放弃（进 push_retry）")
         try:
-            return _tg_post(token, payload, method="sendRichMessage")
+            result = _tg_post(token, payload, method="sendRichMessage")
+            result.setdefault("send_method", "sendRichMessage")
+            return result
         except TgAmbiguousDelivery as e:
             # 请求已送出、响应缺失：大概率已入群，重发必产生重复消息（Bot API
             # 无幂等 token）。按已送达返回成功，调用方正常标 seen / 标 sent，
-            # 宁可极小概率漏推也不重复推。连续歧义则熔断改按失败（防大面积故障
-            # 时批量静默丢推），痕迹落盘供下轮汇总核对。
-            if not _register_ambiguous_send():
-                print(f"  ⚠ sendRichMessage 连续歧义（疑似 Telegram 故障），按失败进重试: {e}")
-                raise
+            # 宁可极小概率漏推也不重复推；痕迹落盘供下轮汇总核对。
             _record_assumed_delivery("sendRichMessage", link)
+            _register_ambiguous_send()
             print(f"  ⚠ sendRichMessage 响应缺失，按已送达处理（防重复）: {e}")
-            return {"ok": True, "assumed_delivered": True}
+            return {"ok": True, "assumed_delivered": True,
+                    "send_method": "sendRichMessage"}
         except urllib.error.HTTPError as e:
             last_err = e
             body = _consume_http_error_body(e)
@@ -2928,7 +4510,8 @@ def send_telegram_rich(token: str, chat_id: str, markdown: str = "", link: str =
                         payload = fixed  # 话题失效：换回退话题占用一次重试，400 即时无预算压力
                         continue
                 return {"ok": False, "rich_fallback": True,
-                        "error_code": e.code, "description": desc}
+                        "error_code": e.code, "description": desc,
+                        "send_method": "sendRichMessage"}
             raise
         except (urllib.error.URLError, TimeoutError, OSError) as e:
             # 只有发出前的失败会走到这（_tg_post 已把发出后的失败归为
@@ -2942,7 +4525,9 @@ def send_telegram_rich(token: str, chat_id: str, markdown: str = "", link: str =
 
 
 def send_telegram_photo(token: str, chat_id: str, photo: str, caption: str = "", link: str = "",
-                        *, thread_id: "str | int | None" = None) -> dict:
+                        *, thread_id: "str | int | None" = None,
+                        reply_to_message_id: "int | None" = None,
+                        button_text: str = "\U0001f517 打开原文") -> dict:
     """Send one native representative image when Rich Message media is rejected.
 
     A native photo supports both an HTML caption and reply markup, so this keeps
@@ -2958,9 +4543,13 @@ def send_telegram_photo(token: str, chat_id: str, photo: str, caption: str = "",
     }
     if thread_id is not None:
         payload["message_thread_id"] = thread_id
+    if reply_to_message_id:
+        # 同 send_telegram：锚点可能已被删，缺目标时降级而不是 400 丢掉这条评论。
+        payload["reply_parameters"] = {"message_id": int(reply_to_message_id),
+                                       "allow_sending_without_reply": True}
     if link:
         payload["reply_markup"] = {
-            "inline_keyboard": [[{"text": "\U0001f517 打开原文", "url": link}]]
+            "inline_keyboard": [[{"text": button_text, "url": link}]]
         }
 
     last_err = None
@@ -2969,14 +4558,15 @@ def send_telegram_photo(token: str, chat_id: str, photo: str, caption: str = "",
             raise last_err or RuntimeError(
                 "send_telegram_photo: 剩余预算不足以发起尝试，本轮放弃（进 push_retry）")
         try:
-            return _tg_post(token, payload, method="sendPhoto")
+            result = _tg_post(token, payload, method="sendPhoto")
+            result.setdefault("send_method", "sendPhoto")
+            return result
         except TgAmbiguousDelivery as e:
-            if not _register_ambiguous_send():
-                print(f"  ⚠ sendPhoto 连续歧义（疑似 Telegram 故障），按失败进重试: {e}")
-                raise
             _record_assumed_delivery("sendPhoto", link)
+            _register_ambiguous_send()
             print(f"  ⚠ sendPhoto 响应缺失，按已送达处理（防重复）: {e}")
-            return {"ok": True, "assumed_delivered": True}
+            return {"ok": True, "assumed_delivered": True,
+                    "send_method": "sendPhoto"}
         except urllib.error.HTTPError as e:
             last_err = e
             body = _consume_http_error_body(e)
@@ -3012,7 +4602,8 @@ def send_telegram_photo(token: str, chat_id: str, photo: str, caption: str = "",
                     continue
             if e.code in (400, 404):
                 return {"ok": False, "photo_fallback": True,
-                        "error_code": e.code, "description": desc}
+                        "error_code": e.code, "description": desc,
+                        "send_method": "sendPhoto"}
             raise
         except (urllib.error.URLError, TimeoutError, OSError) as e:
             last_err = e
@@ -3024,7 +4615,9 @@ def send_telegram_photo(token: str, chat_id: str, photo: str, caption: str = "",
 
 
 def send_telegram(token: str, chat_id: str, text: str, link: str = "",
-                  *, preview_url: str = "", thread_id: "str | int | None" = None) -> dict:
+                  *, preview_url: str = "", thread_id: "str | int | None" = None,
+                  reply_to_message_id: "int | None" = None,
+                  button_text: str = "\U0001f517 打开原文") -> dict:
     payload: dict = {
         "chat_id": chat_id,
         "text": text,
@@ -3032,6 +4625,11 @@ def send_telegram(token: str, chat_id: str, text: str, link: str = "",
     }
     if thread_id is not None:
         payload["message_thread_id"] = thread_id
+    if reply_to_message_id:
+        # allow_sending_without_reply：锚点消息可能已被删（删减功能/人工清理），
+        # 缺目标时降级为话题内普通消息而不是 400 把这条评论丢掉。
+        payload["reply_parameters"] = {"message_id": int(reply_to_message_id),
+                                       "allow_sending_without_reply": True}
     preview_target = preview_url or link
     if preview_target:
         payload["link_preview_options"] = {
@@ -3043,7 +4641,7 @@ def send_telegram(token: str, chat_id: str, text: str, link: str = "",
         payload["link_preview_options"] = {"is_disabled": True}
     if link:
         payload["reply_markup"] = {
-            "inline_keyboard": [[{"text": "\U0001f517 打开原文", "url": link}]]
+            "inline_keyboard": [[{"text": button_text, "url": link}]]
         }
 
     # Resilient send (REL-1/FMT-1): retry 429 honoring retry_after and 5xx with bounded
@@ -3056,16 +4654,17 @@ def send_telegram(token: str, chat_id: str, text: str, link: str = "",
             raise last_err or RuntimeError(
                 "send_telegram: 剩余预算不足以发起尝试，本轮放弃（进 push_retry）")
         try:
-            return _tg_post(token, payload)
+            result = _tg_post(token, payload)
+            result.setdefault("send_method", "sendMessage")
+            return result
         except TgAmbiguousDelivery as e:
             # 同 send_telegram_rich：请求已送出、响应缺失，重发必重复，按已送达处理；
-            # 连续歧义熔断按失败，痕迹落盘供下轮汇总核对。
-            if not _register_ambiguous_send():
-                print(f"  ⚠ sendMessage 连续歧义（疑似 Telegram 故障），按失败进重试: {e}")
-                raise
+            # 痕迹落盘供下轮汇总核对。
             _record_assumed_delivery("sendMessage", link)
+            _register_ambiguous_send()
             print(f"  ⚠ sendMessage 响应缺失，按已送达处理（防重复）: {e}")
-            return {"ok": True, "assumed_delivered": True}
+            return {"ok": True, "assumed_delivered": True,
+                    "send_method": "sendMessage"}
         except urllib.error.HTTPError as e:
             last_err = e
             body = _consume_http_error_body(e)
@@ -3109,7 +4708,7 @@ def send_telegram(token: str, chat_id: str, text: str, link: str = "",
 
 def send_tweet(
     token: str, chat_id: str, username: str, t: dict, ai: "AIClassifier | None" = None,
-    *, thread_id: "str | int | None" = None,
+    *, thread_id: "str | int | None" = None, reply_to_message_id: "int | None" = None,
 ) -> dict:
     """统一推文推送入口：rich-first → native-photo → HTML fallback。
 
@@ -3119,17 +4718,25 @@ def send_tweet(
       的 html 字段；成功直接返回；非 rich_fallback 的失败（如 429 已重试穷尽）原样返回。
     - rich 被拒（rich_fallback）或超长：有原媒体时先用 sendPhoto 保住代表性
       原图/视频封面、正文外链与「打开原文」按钮；photo 也被拒才回退 HTML。
+    reply_to_message_id：自回复串的父推消息锚点，各降级档都要带上，
+    否则 rich 被拒后评论会脱离线程变成孤立消息。
     """
     html_text, rich_html, link = format_message(username, t, ai)
-    preview_url = _primary_external_url(t)
+    media_view = (_semantic_media_view(t)
+                  if _semantic_use(t) else t)
+    anchor_view = (_semantic_anchor_view(t)
+                   if _semantic_use(t) else t)
+    preview_url = _primary_external_url(anchor_view)
     # Rich Messages preserve original X media, but their API has no link-preview
     # field. For text-only posts, take the standard-message path so Telegram can
     # render one external website card while the inline button still opens X.
-    if preview_url and not _has_renderable_media(t):
+    if preview_url and not _has_renderable_media(media_view):
         return send_telegram(token, chat_id, html_text, link,
-                             preview_url=preview_url, thread_id=thread_id)
+                             preview_url=preview_url, thread_id=thread_id,
+                             reply_to_message_id=reply_to_message_id)
     if len(rich_html) <= RICH_MESSAGE_MAX_CHARS:
-        r = send_telegram_rich(token, chat_id, link=link, html=rich_html, thread_id=thread_id)
+        r = send_telegram_rich(token, chat_id, link=link, html=rich_html, thread_id=thread_id,
+                               reply_to_message_id=reply_to_message_id)
         if r.get("ok"):
             return r
         if not r.get("rich_fallback"):
@@ -3143,23 +4750,25 @@ def send_tweet(
             if rich_nv != rich_html and len(rich_nv) <= RICH_MESSAGE_MAX_CHARS:
                 print("    rich 含视频被拒，剥 video 换封面重试")
                 r = send_telegram_rich(token, chat_id, link=link, html=rich_nv,
-                                       thread_id=thread_id)
+                                       thread_id=thread_id,
+                                       reply_to_message_id=reply_to_message_id)
                 if r.get("ok"):
                     return r
                 if not r.get("rich_fallback"):
                     return r
     # Rich 的 400/404 明确表示它未送达；用原帖首张图（或视频/GIF 封面）走
     # sendPhoto。这样不会出现此前「rich 带图被拒 → 纯文字」的用户可见降级。
-    photo_url = _fallback_photo_url(t)
+    photo_url = _fallback_photo_url(media_view)
     if photo_url:
         print("    rich 不可用，保留原媒体走 sendPhoto 降级")
         photo_result = send_telegram_photo(
-            token, chat_id, photo_url, _tweet_photo_caption(html_text, t), link,
-            thread_id=thread_id)
+            token, chat_id, photo_url, _tweet_photo_caption(html_text, anchor_view), link,
+            thread_id=thread_id, reply_to_message_id=reply_to_message_id)
         if photo_result.get("ok") or not photo_result.get("photo_fallback"):
             return photo_result
         print(f"    sendPhoto 被拒({str(photo_result.get('description', ''))[:60]})，回退 HTML")
-    return send_telegram(token, chat_id, html_text, link, thread_id=thread_id)
+    return send_telegram(token, chat_id, html_text, link, thread_id=thread_id,
+                         reply_to_message_id=reply_to_message_id)
 
 
 # ── 单用户处理 ──────────────────────────────────────
@@ -3188,6 +4797,19 @@ def process_user(
     account = _ACCOUNT_CONFIG_BY_USERNAME.get(_canonical_username(username), {})
     _verify_configured_account_identity(username, account)
     tweets = fetch_tweets(pool, username, limit=args.limit)
+    seen, last_post_iso = load_seen(username)
+    push_retry = load_push_retry(username)
+    if _semantic_gray_for(username) and push_retry and HAS_GRAPHQL:
+        present = {str(t.get("id") or "") for t in tweets}
+        for retry_id in sorted(push_retry - present)[:twitter_graphql.SEMANTIC_DETAIL_PER_BUNDLE]:
+            recovered = twitter_graphql.fetch_semantic_tweet(retry_id, username)
+            if recovered:
+                retry_record = (_PUSH_RETRY_STATE_BY_USER.get(username) or {}).get(retry_id) or {}
+                recovered["created_at"] = (recovered.get("created_at")
+                                            or retry_record.get("outer_created_at") or "")
+                recovered["_retry_state"] = retry_record
+                recovered["_semantic_active"] = True
+                tweets.append(recovered)
     if not tweets:
         # Every data source returned an empty timeline — anomalous (auth break,
         # query-id drift, or account issue). Emit a greppable WARN marker so this
@@ -3195,8 +4817,6 @@ def process_user(
         print(f"  ⚠️ WARN: @{username} 拉到 0 条推文（疑似数据源异常/认证失效）")
         return 0, 0, 0, 0
 
-    seen, last_post_iso = load_seen(username)
-    push_retry = load_push_retry(username)
     stale_retry = push_retry & seen
     if stale_retry:
         # 送达 checkpoint（先 seen 后 retry）中间被杀的孤儿：已送达已 seen，
@@ -3213,6 +4833,7 @@ def process_user(
     new_ids: set[str] = set()
     to_push: list[tuple[dict, str]] = []
     filtered: list[tuple[dict, str]] = []
+    resolution_deferred: set[str] = set()
     ai_overridden = 0
     ai_all_failed_alerted = False
 
@@ -3223,12 +4844,88 @@ def process_user(
     if auto_seed:
         print("  seen 为空，自动 seed（只记录，不推送）")
 
+    policy = account.get("push_policy")
     for t in tweets:
         tid = str(t.get("id") or "")
         if not tid:
+            if _SEMANTIC_BUNDLE_SHADOW:
+                legacy_invalid = classify(t)
+                _try_append_shadow_observation(
+                    t, legacy_invalid, None, 0.0, account=username,
+                    exception="invalid_input:missing_id", pre_ai=legacy_invalid,
+                    final_classification=("invalid", "missing_id"),
+                    disposition="invalid_input")
             continue
 
-        policy = account.get("push_policy")
+        wants_semantic = _semantic_gray_for(username) or _SEMANTIC_BUNDLE_SHADOW
+        raw_semantic = t.pop("_semantic_raw", None)
+        resolve_latency_ms = 0.0
+        shadow_exception = str(t.get("semantic_bundle_error") or "")
+        # Seen observations remain in the shadow denominator, but are strictly
+        # embedded-only: no detail budget, AI call, duplicate fsync, or delivery
+        # state mutation. One provider row produces exactly one ledger row.
+        if tid in seen and not args.test:
+            if _SEMANTIC_BUNDLE_SHADOW:
+                legacy_seen = classify(t)
+                semantic_seen = None
+                if _semantic_bundle(t):
+                    try:
+                        semantic_seen = classify_semantic_bundle(t)
+                    except Exception as exc:
+                        shadow_exception = (shadow_exception
+                                            or f"classifier:{type(exc).__name__}")
+                if policy:
+                    seen_status, seen_reason, _event = classify_official_push(policy, t)
+                    legacy_seen = (seen_status, seen_reason)
+                _try_append_shadow_observation(
+                    t, legacy_seen, semantic_seen, 0.0, account=username,
+                    exception=shadow_exception, pre_ai=legacy_seen,
+                    final_classification=("duplicate", "already_seen"),
+                    disposition="duplicate_seen_embedded_only")
+            continue
+        if wants_semantic and raw_semantic and HAS_GRAPHQL:
+            started = time.perf_counter()
+            try:
+                t["semantic_bundle"] = twitter_graphql.resolve_semantic_bundle(
+                    raw_semantic, username,
+                    fetch_mode=str(((_semantic_bundle(t).get("observation") or {}).get("fetch_mode")
+                                    or "graphql")))
+            except Exception as exc:
+                shadow_exception = f"resolver:{type(exc).__name__}"
+                # Resolver/shadow is an enhancement. Preserve flat provider fields
+                # and continue through the exact legacy delivery path.
+                t.pop("semantic_bundle", None)
+                print(f"    semantic resolver fail-open: {tid} {type(exc).__name__}")
+            finally:
+                resolve_latency_ms = (time.perf_counter() - started) * 1000
+        semantic_active = _semantic_gray_for(username) and bool(_semantic_bundle(t))
+        fetch_mode = str(((_semantic_bundle(t).get("observation") or {}).get("fetch_mode") or ""))
+        resolution = (_semantic_bundle(t).get("resolution") or {})
+        resolution_modes = [str(mode) for mode in resolution.get("fetch_modes") or []]
+        if semantic_active and ("guest" in fetch_mode
+                                or any("guest" in mode for mode in resolution_modes)
+                                or resolution.get("status") == "auth_degraded"
+                                or t.get("_fetch_source_mode")):
+            # Gray delivery requires authenticated GraphQL equivalence. Fallback and
+            # guest observations remain visible to legacy processing but never use
+            # semantic delivery decisions.
+            semantic_active = False
+        if semantic_active:
+            t["_semantic_active"] = True
+        elif _SEMANTIC_BUNDLE_SHADOW and _semantic_bundle(t):
+            resolution = (_semantic_bundle(t).get("resolution") or {})
+            print(f"    semantic-shadow: {tid} status={resolution.get('status')} "
+                  f"anchor={((_semantic_bundle(t).get('anchor') or {}).get('tweet_id'))}")
+
+        legacy_result = classify(t)
+        semantic_result = None
+        if _semantic_bundle(t):
+            try:
+                semantic_result = classify_semantic_bundle(t)
+            except Exception as exc:
+                shadow_exception = shadow_exception or f"classifier:{type(exc).__name__}"
+                semantic_active = False
+                t.pop("_semantic_active", None)
         if policy:
             status, reason, event_type = classify_official_push(policy, t)
             if event_type:
@@ -3236,7 +4933,9 @@ def process_user(
                 # per-event freshness window; provider payload/state stays unchanged.
                 t["_push_event_type"] = event_type
         else:
-            status, reason = classify(t)
+            status, reason = (semantic_result if semantic_active and semantic_result
+                              else legacy_result)
+        pre_ai_result = (status, reason)
         text = (t.get("text") or "").strip()
         is_musing_suspect = (
             (not policy)
@@ -3254,7 +4953,7 @@ def process_user(
                     status = "filter"
                     reason = f"{reason}|ai:{ai_reason}"
                     print(f"    AI 确认碎碎念 [{reason}] {text[:50]}")
-                elif ai_reason == "all_ai_failed":
+                elif _is_ai_call_failed(ai_reason):
                     status = "filter"
                     reason = f"{reason}|ai:{ai_reason}"
                     print(f"    AI 全部失败，碎碎念可疑推文降级为 filter: {text[:50]}")
@@ -3263,8 +4962,10 @@ def process_user(
                         _alert_ai_all_failed(bot_token, chat_id, username)
                 else:
                     status = "pass"
+                    prior_reason = reason
+                    reason = f"{reason}|ai:{ai_reason}"
                     ai_overridden += 1
-                    print(f"    AI 否决碎碎念 [{reason} -> {ai_reason}] {text[:50]}")
+                    print(f"    AI 否决碎碎念 [{prior_reason} -> {ai_reason}] {text[:50]}")
             else:
                 status = "filter"
                 reason = f"{reason}|no_ai"
@@ -3275,7 +4976,7 @@ def process_user(
                 status = "filter"
                 reason = f"{reason}|ai:{ai_reason}"
                 print(f"    AI 确认推广 [{reason}] {text[:50]}")
-            elif ai_reason == "all_ai_failed":
+            elif _is_ai_call_failed(ai_reason):
                 # P0-4：AI 全部失败时 fail-closed，按 filter 处理
                 status = "filter"
                 reason = f"{reason}|ai:{ai_reason}"
@@ -3285,8 +4986,23 @@ def process_user(
                     _alert_ai_all_failed(bot_token, chat_id, username)
             else:
                 status = "pass"
+                prior_reason = reason
+                reason = f"{reason}|ai:{ai_reason}"
                 ai_overridden += 1
-                print(f"    AI 否决 [{reason} -> {ai_reason}] {text[:50]}")
+                print(f"    AI 否决 [{prior_reason} -> {ai_reason}] {text[:50]}")
+        elif not policy and status == "suspicious" and not ai.is_available():
+            # The established promo policy is fail-open when no AI is available,
+            # but normalize that decision before any Article side effect.  Queue
+            # admission therefore has one invariant: final status is exactly pass.
+            status = "pass"
+            print(f"    无 AI，suspicious 放行 [{reason}]")
+
+        if _SEMANTIC_BUNDLE_SHADOW:
+            _try_append_shadow_observation(
+                t, pre_ai_result if policy else legacy_result,
+                semantic_result, resolve_latency_ms, account=username,
+                exception=shadow_exception, pre_ai=pre_ai_result,
+                final_classification=(status, reason), disposition="candidate")
 
         if args.test:
             if status == "pass":
@@ -3296,19 +5012,66 @@ def process_user(
             else:
                 filtered.append((t, reason))
         else:
-            if tid in seen:
-                continue
             new_ids.add(tid)
             if auto_seed or args.seed:
+                if (_semantic_use(t)
+                        and not args.dry_run):
+                    try:
+                        _journal_semantic_decision(t, "seed_terminal", "explicit_seed"
+                                                   if args.seed else "auto_seed")
+                    except OSError as e:
+                        print(f"    semantic seed journal 失败，保持 unseen: {e}")
+                        resolution_deferred.add(tid)
                 continue
+            if status == "defer":
+                retry_state = note_push_retry(username, t)
+                # Retry is bounded by the observation freshness horizon. Once an
+                # unresolved required context expires, terminal suppression must be
+                # journaled before source seen advances.
+                if (_semantic_retry_expired(retry_state)
+                        or not is_within_push_window(t, max(push_age_minutes, 24 * 60))):
+                    if not args.dry_run:
+                        try:
+                            _journal_semantic_decision(
+                                t, "context_unresolved_expired", reason,
+                                classification={"status": status, "reason": reason})
+                        except OSError as e:
+                            print(f"    expired semantic journal 失败，defer: {e}")
+                            resolution_deferred.add(tid)
+                            continue
+                    filtered.append((t, "context_unresolved_expired"))
+                    continue
+                # Required context is unresolved. No send was attempted and the
+                # outer observation must remain unseen; push_retry bypasses age next run.
+                resolution_deferred.add(tid)
+                print(f"    defer semantic resolution: {tid} [{reason}]")
+                continue
+            if status == "suppress_terminal":
+                if not args.dry_run:
+                    try:
+                        _journal_semantic_decision(
+                            t, "suppressed_terminal", reason,
+                            classification={"status": status, "reason": reason})
+                    except OSError as e:
+                        print(f"    terminal semantic journal 失败，defer: {e}")
+                        resolution_deferred.add(tid)
+                        continue
+                filtered.append((t, reason))
+                continue
+            if _semantic_use(t) and status == "pass":
+                article_refs = _semantic_bundle(t).get("article_refs") or []
+                if article_refs:
+                    save_semantic_article(username, t, article_refs[0])
+                    continue
+            article_status_pass = status == "pass"
             # Article detection（零 API 成本）。只对「新且非 seed」的推文入队：
             # 放在 seen 判断之前会让 seed/新账号首轮灌入历史文章，且已 seen 推文
             # 会把被 7 天清理删掉的 sent 条目重新入队造成重复推送。
-            article_id = detect_article(t)
+            article_id = detect_article(t) if article_status_pass else None
             if not article_id:
                 # 节点兜底：引用文章的壳推 entities.urls 为空，detect_article 必漏，
                 # 但归一化后挂了 article 节点 → 用其 rest_id 入队，避免裸推漏掉。
-                art = t.get("article") or {}
+                art = (t.get("article") or {}) if article_status_pass else {}
                 if art.get("rest_id"):
                     article_id = art["rest_id"]
             if article_id:
@@ -3325,6 +5088,17 @@ def process_user(
                     # 判断之前——上轮失败进 retry 的 RT 若期间已由他号送达，本轮
                     # 应抑制而非重发；tid 在 new_ids → 轮末进 seen，其 retry 孤儿
                     # 由下轮 push_retry∩seen 清理兜走，零新增状态机。
+                    if (_semantic_use(t)
+                            and not args.dry_run):
+                        try:
+                            _journal_semantic_decision(
+                                t, "duplicate_terminal", "anchor_already_delivered",
+                                matched=_canonical_key(t),
+                                classification={"status": status, "reason": reason})
+                        except OSError as e:
+                            print(f"    cross-dup journal 失败，defer: {e}")
+                            resolution_deferred.add(tid)
+                            continue
                     print(f"    skip cross-dup: {tid} ← 原推已由 @{hit.get('by')} 推送")
                     continue
             if tid in push_retry:
@@ -3332,11 +5106,29 @@ def process_user(
                 to_push.append((t, "push_retry"))
                 continue
             if not is_within_push_window(t, effective_push_window_minutes(t, push_age_minutes)):
+                if (_semantic_use(t)
+                        and not args.dry_run):
+                    try:
+                        _journal_semantic_decision(t, "stale_terminal", "outside_push_window")
+                    except OSError as e:
+                        print(f"    semantic stale journal 失败，defer: {e}")
+                        resolution_deferred.add(tid)
+                        continue
                 print(f"    skip stale: {tid}")
                 continue
             if status == "pass":
                 to_push.append((t, reason))
             elif status == "filter":
+                if (_semantic_use(t)
+                        and not args.dry_run):
+                    try:
+                        _journal_semantic_decision(t, "filtered_terminal", reason)
+                    except OSError as e:
+                        # Journal-before-seen is mandatory for semantic terminal
+                        # suppression. Treat persistence failure as transient defer.
+                        print(f"    semantic journal 失败，defer: {e}")
+                        resolution_deferred.add(tid)
+                        continue
                 filtered.append((t, reason))
             else:
                 # 残留 suspicious：仅 promo 路径在无 AI 时走到这里 → 放行
@@ -3360,8 +5152,15 @@ def process_user(
         print("    seed 模式：跳过推送")
         to_push = []
 
-    push_failed: set[str] = set()
+    # 时间线是倒序的，按推文 id（雪花号单调递增）升序发送。既让同轮多推在群里
+    # 保持阅读顺序，也是自回复接线程的前提——父推必须先落地才有 message_id 可锚。
+    # 放在 --test 截断之后，保持「测试取最新 N 条」的既有语义。
+    to_push.sort(key=lambda item: int(str(item[0].get("id") or "0") or "0")
+                 if str(item[0].get("id") or "").isdigit() else 0)
+
+    push_failed: set[str] = set(resolution_deferred)
     push_deferred = False
+    delivered_count = 0
     for t, _reason in to_push:
         tid = str(t.get("id") or "")
         if args.dry_run:
@@ -3384,15 +5183,90 @@ def process_user(
                           f"本轮停止推送，余量进 push_retry 下轮继续")
                 push_failed.add(tid)
                 continue
+            claim = None
+            target_chat = content_chat_id or chat_id
+            target_thread = content_thread_id if content_chat_id else None
             try:
-                r = send_tweet(bot_token, content_chat_id or chat_id, username, t, ai,
-                               thread_id=content_thread_id if content_chat_id else None)
+                if _EVENT_DEDUP_EFFECTIVE_MODE != "off" and not args.test:
+                    claim = claim_event_delivery(
+                        t, username, target_chat_id=target_chat,
+                        target_thread_id=target_thread)
+                    if not claim.get("claimed"):
+                        print(f"    event-ledger skip: {tid} state={claim.get('state')} "
+                              f"prior={claim.get('prior_tweet_id')}")
+                        state = str(claim.get("state") or "")
+                        if state == "pending":
+                            # Another sender owns an in-flight claim. This is not a
+                            # terminal delivery and must remain unseen/retryable.
+                            push_failed.add(tid)
+                            continue
+                        if _semantic_use(t):
+                            try:
+                                _journal_semantic_decision(
+                                    t, "duplicate_terminal", "ledger_" + state,
+                                    matched=str(claim.get("prior_tweet_id") or ""))
+                            except OSError as e:
+                                print(f"    ledger duplicate journal 失败，defer: {e}")
+                                push_failed.add(tid)
+                                continue
+                        if not args.test:
+                            seen.add(tid)
+                            try:
+                                save_seen(username, seen, last_post_iso)
+                            except OSError as e:
+                                print(f"    ledger-skip seen checkpoint 失败（末尾重试）: {e}")
+                        continue
+                # 自回复接线程：父推若已在同一目标推送过，就把这条评论挂到那条
+                # Telegram 消息下面（原生 reply 会带出父推的引用条）。查不到锚点
+                # （父推被过滤 / 超出保留期 / 话题改路由）时按独立消息发，不阻断。
+                reply_anchor = None
+                parent_id = "" if args.test else self_reply_parent_id(t, username)
+                if parent_id:
+                    try:
+                        reply_anchor = lookup_tweet_anchor(
+                            parent_id, target_chat_id=target_chat,
+                            target_thread_id=target_thread)
+                    except Exception as anchor_error:
+                        print(f"    线程锚点查询失败（按独立消息发）: {anchor_error}")
+                    print(f"    自回复 ← {parent_id}："
+                          + (f"接 msg {reply_anchor}" if reply_anchor else "无 TG 锚点，独立发送"))
+                r = send_tweet(bot_token, target_chat, username, t, ai,
+                               thread_id=target_thread,
+                               reply_to_message_id=reply_anchor)
                 ok = r.get("ok", False)
                 print(f"    推送 {'OK' if ok else 'FAIL'}: {t.get('id')}")
                 if not ok:
                     print(f"        resp: {r}")
+                    if claim:
+                        try:
+                            finish_event_delivery(claim, "failed_pre_send", r,
+                                                  detail="definite Telegram rejection")
+                        except Exception as ledger_error:
+                            print(f"    event-ledger finalize 失败（发送确定失败）: {ledger_error}")
                     push_failed.add(tid)
-                elif not args.test:
+                else:
+                    delivered_count += 1
+                if ok and not args.test:
+                    if claim:
+                        ledger_state = "ambiguous" if r.get("assumed_delivered") else "confirmed"
+                        try:
+                            finish_event_delivery(claim, ledger_state, r)
+                        except Exception as ledger_error:
+                            # Telegram already returned ok (or an explicit ambiguous
+                            # outcome). Never turn a local checkpoint failure into
+                            # failed_pre_send/push_retry: stale pending recovery will
+                            # conservatively promote it to ambiguous.
+                            print(f"    event-ledger finalize 失败（消息已送达，不重发）: {ledger_error}")
+                    if _semantic_use(t):
+                        try:
+                            _journal_semantic_decision(
+                                t, "ambiguous" if r.get("assumed_delivered") else "confirmed",
+                                str(r.get("send_method") or r.get("method") or "telegram"),
+                                classification={"reason": _reason}, send_result=r)
+                        except OSError as journal_error:
+                            # Delivery already happened; reporting failure must never
+                            # create a blind resend.
+                            print(f"    semantic delivery journal 失败（已送达，不重发）: {journal_error}")
                     # 送达即刻 checkpoint（先 seen 后 push_retry，顺序不可换：
                     # 中间被杀留下的孤儿 retry 条目会被 seen 短路，不产生重复；
                     # 反序被杀则推文既不 seen 也不 retry → 下轮当新推文重发）。
@@ -3412,13 +5286,79 @@ def process_user(
                             _record_pushed(t, username)
                         except OSError as e:
                             print(f"    pushed_index 落盘失败（忽略）: {e}")
+                    try:
+                        # 供后续自回复接线程。歧义送达（无 message_id）自然跳过，
+                        # 那条串会退化成独立消息，不会误接到别人的消息上。
+                        record_tweet_anchor(
+                            tid, telegram_message_id_of(r), username=username,
+                            target_chat_id=target_chat, target_thread_id=target_thread)
+                    except Exception as anchor_error:
+                        print(f"    线程锚点落盘失败（忽略）: {anchor_error}")
+                    # Preference provenance is strictly a post-confirmation
+                    # sidecar.  The helper rejects assumed/ambiguous results and
+                    # swallows local I/O failures so send/seen semantics stay intact.
+                    source_url = _tweet_source_url(username, t)
+                    source_tweet = t.get("retweeted_status") or t
+                    source_id = (source_tweet.get("id") if isinstance(source_tweet, dict)
+                                 else None) or tid
+                    try:
+                        delivered_html, _rich_html, _link = format_message(username, t, ai)
+                        delivered_content = _html_to_plain(delivered_html)
+                    except Exception:
+                        # Rendering already succeeded inside send_tweet; this
+                        # fallback keeps the sidecar best-effort without exposing
+                        # any raw response/config data.
+                        delivered_content = str(t.get("text") or "")
+                    _record_confirmed_sent_content(
+                        r, chat_id=target_chat, thread_id=target_thread,
+                        source_kind="x_tweet", source_ref=source_url,
+                        source_message_ids=[source_id], url=source_url,
+                        content=delivered_content,
+                        content_id=f"x-tweet:{source_id}")
                 time.sleep(1.2)
+            except TgAmbiguousDelivery as e:
+                # Any surfaced ambiguity is an unknown outcome for this claim.
+                # Persist it and suppress blind retry; recovery is by ledger audit.
+                if claim:
+                    try:
+                        finish_event_delivery(claim, "ambiguous", detail=str(e))
+                    except Exception as ledger_error:
+                        print(f"    event-ledger ambiguous finalize 失败（保留 pending）: {ledger_error}")
+                print(f"    推送结果歧义，已入 ledger 待审计（不盲重发）: {e}")
+                if _semantic_use(t):
+                    try:
+                        _journal_semantic_decision(t, "ambiguous", str(e))
+                    except OSError as journal_error:
+                        print(f"    semantic ambiguous journal 失败（不盲重发）: {journal_error}")
+                delivered_count += 1
+                if not args.test:
+                    seen.add(tid)
+                    try:
+                        # The request already left the host, so checkpoint this
+                        # unknown outcome immediately. A crash before the loop-tail
+                        # save must not turn it into a blind resend.
+                        save_seen(username, seen, last_post_iso)
+                        if tid in push_retry:
+                            push_retry.discard(tid)
+                            save_push_retry(username, push_retry)
+                    except OSError as checkpoint_error:
+                        print(f"    歧义送达 checkpoint 落盘失败（末尾重试）: {checkpoint_error}")
+                # A direct sender may surface ambiguity instead of returning
+                # assumed_delivered. Stop this round; untouched tweets were never
+                # sent and are therefore safe to retry later.
+                push_deferred = True
             except Exception as e:
+                if claim:
+                    try:
+                        finish_event_delivery(claim, "failed_pre_send", detail=str(e))
+                    except Exception as ledger_error:
+                        print(f"    event-ledger failure finalize 失败: {ledger_error}")
                 print(f"    推送异常: {e}")
                 push_failed.add(tid)
 
     if args.seed:
-        seen |= {str(t.get("id")) for t in tweets if t.get("id")}
+        seen |= ({str(t.get("id")) for t in tweets if t.get("id")}
+                 - resolution_deferred)
     else:
         # REL-1/FMT-1: only mark a tweet seen if its push did NOT fail. Failed sends
         # stay in push_retry and bypass push-age on the next run instead of being
@@ -3442,15 +5382,16 @@ def process_user(
             if not latest_ts or iso > latest_ts:
                 latest_ts = iso
 
-    try:
-        save_seen(username, seen, latest_ts)
-    except OSError as e:
-        _alert_seen_save_failure(bot_token, chat_id, username, e)
-        raise
+    if not args.dry_run:
+        try:
+            save_seen(username, seen, latest_ts)
+        except OSError as e:
+            _alert_seen_save_failure(bot_token, chat_id, username, e)
+            raise
     print(f"  已记录 seen_ids 共 {len(seen)} 条")
 
     # 推送计数 = 实际送达（尝试数会让失败重试双重计入、故障期看板虚高）
-    return len(new_ids), len(to_push) - len(push_failed), len(filtered), ai_overridden
+    return len(new_ids), delivered_count if not args.dry_run else len(to_push), len(filtered), ai_overridden
 
 
 # ── 主流程 ──────────────────────────────────────────
@@ -3567,16 +5508,45 @@ def process_article_queue(ai: AIClassifier, bot_token: str, chat_id: str, dry_ru
                 break
 
             aid = entry["article_id"]
-            if _CROSS_DEDUP_ENABLED and ("a:" + str(aid)) in load_pushed_index():
+            bundle_key = str(entry.get("bundle_key") or "")
+            delivery_key = "ab:" + bundle_key if bundle_key else "a:" + str(aid)
+            if _CROSS_DEDUP_ENABLED and delivery_key in load_pushed_index():
                 # 二闸：同轮两账号已各自入队（入队闸只能挡后来者）——他号先送达
                 # 后本队列同 article 直接终态 skipped，纳入 7 天清理。
-                by = (load_pushed_index().get("a:" + str(aid)) or {}).get("by")
+                by = (load_pushed_index().get(delivery_key) or {}).get("by")
                 entry["status"] = "skipped"
                 entry["skip_reason"] = "cross_dup"
                 entry["updated_at"] = datetime.now(timezone.utc).isoformat()
                 changed = True
                 _save_article_queue(queue_path, queue, dry_run)
                 print(f"  @{username}: article {aid} 跨账号去重（已由 @{by} 推送），跳过")
+                continue
+            entry_quoted = bool((entry.get("quote_comment") or "").strip())
+            if _ARTICLE_SUPERSEDE_ENABLED and not entry_quoted:
+                prior_quoted = _quoted_article_delivered("a:" + str(aid))
+                if prior_quoted:
+                    # 引用版先送达：裸摘要是它的真子集，直接终态 skipped。放在抓取
+                    # 之前 = 省掉一次 Markdown 抓取 + AI 摘要，也不用先发再删。
+                    entry["status"] = "skipped"
+                    entry["skip_reason"] = "superseded_by_quote"
+                    entry["updated_at"] = datetime.now(timezone.utc).isoformat()
+                    changed = True
+                    _save_article_queue(queue_path, queue, dry_run)
+                    print(f"  @{username}: article {aid} 已有 @{prior_quoted.get('by')} "
+                          f"的引用版，裸摘要不再推送")
+                    continue
+            card_anchor = (_find_article_summary_anchor("a:" + str(aid))
+                           if (_ARTICLE_QUOTE_CARD_ENABLED and entry_quoted) else None)
+            if card_anchor:
+                # 摘要正文已由锚点消息承载：本条只补这个人的评论，整篇不重复。
+                _deliver_article_quote_card(bot_token, chat_id, username, entry,
+                                            card_anchor, thread_id=file_thread,
+                                            dry_run=dry_run)
+                entry["updated_at"] = datetime.now(timezone.utc).isoformat()
+                if entry["status"] in ("sent", "summarized"):
+                    processed += 1
+                changed = True
+                _save_article_queue(queue_path, queue, dry_run)
                 continue
             entry["status"] = "processing"
             entry["attempts"] = int(entry.get("attempts", 0)) + 1
@@ -3614,14 +5584,20 @@ def process_article_queue(ai: AIClassifier, bot_token: str, chat_id: str, dry_ru
             summary, backend = summarize_article(ai, username, entry, markdown)
             if not summary:
                 err = backend
+                auth_outage = _is_ai_provider_auth_failure(err)
+                if auth_outage:
+                    # Provider-wide 401/403 is not an article problem; keep retry budget.
+                    entry["attempts"] = max(int(entry.get("attempts", 1)) - 1, 0)
                 entry["status"] = "failed"
                 entry["failed_stage"] = "ai_summary"
                 entry["last_error"] = err
                 entry["updated_at"] = datetime.now(timezone.utc).isoformat()
                 msg, link = format_article_failure_message(username, entry, err)
+                # Repeat auth outages: keep the first Telegram notice, don't spam.
+                should_notify = not (auth_outage and entry.get("failure_msg_id"))
                 if dry_run:
                     print(f"    DRY RUN summary failure notice: {err}")
-                else:
+                elif should_notify:
                     try:
                         r = send_telegram(bot_token, chat_id, msg, link, thread_id=file_thread)
                         print(f"    Failure notice push {'OK' if r.get('ok') else 'FAIL'}")
@@ -3631,6 +5607,8 @@ def process_article_queue(ai: AIClassifier, bot_token: str, chat_id: str, dry_ru
                         time.sleep(1.2)
                     except Exception as e:
                         print(f"    failure notice push error: {e}")
+                else:
+                    print(f"    Skip repeat auth-failure notice: {err}")
                 _save_article_queue(queue_path, queue, dry_run)
                 continue
 
@@ -3653,6 +5631,7 @@ def process_article_queue(ai: AIClassifier, bot_token: str, chat_id: str, dry_ru
                 try:
                     ok = False
                     last_resp = {}
+                    sent_mids: list = []   # 删减功能撤回本条投递的唯一入口
                     article_link = article_url(entry["article_id"])
                     # 优先 sendRichMessage（单条 32k、原生渲染 Markdown）；
                     # 被拒/未开放/超长时回退旧的 HTML 分块多条路径。
@@ -3671,6 +5650,18 @@ def process_article_queue(ai: AIClassifier, bot_token: str, chat_id: str, dry_ru
                             ok = r.get("ok", False)
                         if ok:
                             print("    Article summary rich push OK")
+                            _rmid = (r.get("result") or {}).get("message_id")
+                            if _rmid:
+                                sent_mids = [_rmid]
+                                article_content = (
+                                    f"{entry.get('article_title') or 'X Article'}\n"
+                                    f"@{entry.get('author') or username}\n\n{summary}")
+                                _record_confirmed_sent_content(
+                                    r, chat_id=chat_id, thread_id=file_thread,
+                                    source_kind="x_article", source_ref=article_link,
+                                    source_message_ids=[aid], url=article_link,
+                                    content=article_content,
+                                    content_id=f"x-article:{aid}")
                             time.sleep(1.2)
                         else:
                             print(f"    rich 推送被拒({str(r.get('description', ''))[:80]})，回退分块 HTML")
@@ -3685,6 +5676,15 @@ def process_article_queue(ai: AIClassifier, bot_token: str, chat_id: str, dry_ru
                             last_resp = r
                             part_ok = r.get("ok", False)
                             print(f"    Article summary part {idx}/{len(messages)} push {'OK' if part_ok else 'FAIL'}")
+                            _pmid = (r.get("result") or {}).get("message_id")
+                            if _pmid:
+                                sent_mids.append(_pmid)
+                                _record_confirmed_sent_content(
+                                    r, chat_id=chat_id, thread_id=file_thread,
+                                    source_kind="x_article", source_ref=article_link,
+                                    source_message_ids=[aid], url=article_link,
+                                    content=_html_to_plain(part),
+                                    content_id=f"x-article:{aid}:part:{idx}")
                             ok = ok and part_ok
                             time.sleep(1.2)
                             if not part_ok:
@@ -3701,11 +5701,46 @@ def process_article_queue(ai: AIClassifier, bot_token: str, chat_id: str, dry_ru
                             _save_article_queue(queue_path, queue, dry_run)
                         except OSError as e:
                             print(f"    sent 状态即刻落盘失败（忽略，末尾统一落盘）: {e}")
-                        if _CROSS_DEDUP_ENABLED and not dry_run:
+                        # 删减先于登记：flat 路径的引用文章也用 a:<id> 键，登记会
+                        # 覆盖同键的裸摘要记录，先撤回才不会丢掉待删的 message_ids。
+                        if _ARTICLE_SUPERSEDE_ENABLED and not dry_run and entry_quoted:
+                            target = _find_retractable_bare_delivery("a:" + str(aid))
+                            if target:
+                                try:
+                                    _retract_article_delivery(
+                                        bot_token, target[0], target[1],
+                                        superseded_by=entry.get("comment_author") or username,
+                                        replacement_link=_tg_message_link(
+                                            chat_id, file_thread,
+                                            sent_mids[0] if sent_mids else 0))
+                                except Exception as e:
+                                    print(f"    删减失败（忽略）: {type(e).__name__}: {e}")
+                        if (_CROSS_DEDUP_ENABLED or _ARTICLE_SUPERSEDE_ENABLED) and not dry_run:
                             try:
-                                _record_pushed_article(aid, username)
+                                _record_pushed_article(
+                                    aid, username, bundle_key, message_ids=sent_mids,
+                                    chat_id=chat_id, thread_id=file_thread,
+                                    quoted=entry_quoted, cover_url=cover or "")
                             except OSError as e:
                                 print(f"    pushed_index 落盘失败（忽略）: {e}")
+                        if learning_feed is not None:
+                            try:
+                                learning_result = learning_feed.publish_article(username, entry, markdown)
+                                if learning_result.get("published"):
+                                    print(
+                                        f"    Learning feed published: {aid} "
+                                        f"({learning_result.get('word_count')} words, "
+                                        f"score {learning_result.get('score')})"
+                                    )
+                                else:
+                                    print(
+                                        f"    Learning feed skipped: {aid} "
+                                        f"({learning_result.get('reason')})"
+                                    )
+                            except Exception as e:
+                                # Learning export is strictly a sidecar: it must never
+                                # turn a delivered Telegram article into a failed job.
+                                print(f"    Learning feed error (ignored): {type(e).__name__}: {e}")
                         delete_article_cache(entry)
                         _fmid = entry.pop("failure_msg_id", None)
                         if _fmid:
@@ -3738,6 +5773,8 @@ def process_article_queue(ai: AIClassifier, bot_token: str, chat_id: str, dry_ru
 
 
 def main() -> int:
+    global _SEMANTIC_BUNDLE_ENABLED, _SEMANTIC_BUNDLE_SHADOW, _SEMANTIC_CURATOR_ALLOWLIST
+    global _SENT_CONTENT_LEDGER_ENABLED
     ap = argparse.ArgumentParser(description="Twitter 多账号监控 → Telegram 推送")
     ap.add_argument("--test", action="store_true", help="测试模式")
     ap.add_argument("--seed", action="store_true", help="只记录已见，不推送")
@@ -3750,6 +5787,13 @@ def main() -> int:
     ap.add_argument("--user", default=None)
     ap.add_argument("--fetch-articles", action="store_true", help="Process article queue now (auto runs after polling too)")
     args = ap.parse_args()
+    # Restore module state on return so embedded callers/test suites do not inherit
+    # a previous invocation's rollout mode. A real cron process exits immediately.
+    previous_event_modes = (_EVENT_DEDUP_MODE, _EVENT_DEDUP_EFFECTIVE_MODE)
+    previous_semantic_mode = _SEMANTIC_BUNDLE_ENABLED
+    previous_semantic_shadow = _SEMANTIC_BUNDLE_SHADOW
+    previous_semantic_allowlist = set(_SEMANTIC_CURATOR_ALLOWLIST)
+    previous_sent_content_ledger_enabled = _SENT_CONTENT_LEDGER_ENABLED
 
     # LOCK-1: prevent an overrunning run from overlapping the next cron tick (which
     # causes double-sends + last-writer-wins state clobber). Non-blocking; skip if held.
@@ -3783,11 +5827,18 @@ def main() -> int:
         signal.alarm(25 * 60)
 
     try:
+        # Debug/test/seed invocations must never create preference provenance. A
+        # normal --user production send remains eligible because it really delivers.
+        # This lives inside the try so even embedded callers restore module state.
+        _SENT_CONTENT_LEDGER_ENABLED = not (args.dry_run or args.test or args.seed)
         # 每轮起止时间戳：日志此前无任何时间标记，无法事后审计运行时长/定位轮次
         run_started = time.monotonic()
         global _ARTICLE_QUEUE_RUN_START, _THREAD_FALLBACK_ID, _CROSS_DEDUP_ENABLED
-        global _ACCOUNT_CONFIG_BY_USERNAME
+        global _ACCOUNT_CONFIG_BY_USERNAME, _ARTICLE_SUPERSEDE_ENABLED
+        global _ARTICLE_QUOTE_CARD_ENABLED
         _ARTICLE_QUEUE_RUN_START = run_started
+        if HAS_GRAPHQL:
+            twitter_graphql.reset_semantic_resolver_run()
         print(f"\n==== monitor run {datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S %z')} ====")
 
         with open(CONFIG_PATH) as f:
@@ -3810,6 +5861,28 @@ def main() -> int:
         _CROSS_DEDUP_ENABLED = bool(cfg.get("cross_account_dedup"))
         if _CROSS_DEDUP_ENABLED:
             print("  跨账号去重已启用（纯转发 + Article）")
+        # X Article 删减：引用版取代裸摘要。默认关 = 行为与现状一致
+        _ARTICLE_SUPERSEDE_ENABLED = bool(cfg.get("article_supersede_enabled"))
+        if _ARTICLE_SUPERSEDE_ENABLED:
+            print("  X Article 删减已启用（引用版取代裸摘要）")
+        # 多人引用同一篇文章：后续引用者只发增量评论卡片。默认关
+        _ARTICLE_QUOTE_CARD_ENABLED = bool(cfg.get("article_quote_card_enabled"))
+        if _ARTICLE_QUOTE_CARD_ENABLED:
+            print("  X Article 增量评论卡片已启用（后续引用不重发摘要）")
+        _SEMANTIC_BUNDLE_SHADOW = bool(cfg.get("semantic_bundle_shadow"))
+        allow = cfg.get("semantic_bundle_curators") or []
+        _SEMANTIC_CURATOR_ALLOWLIST = {
+            _canonical_username(str(value)) for value in allow if str(value).strip()}
+        _SEMANTIC_BUNDLE_ENABLED = bool(cfg.get("semantic_bundle_enabled")) and bool(
+            _SEMANTIC_CURATOR_ALLOWLIST)
+        if _SEMANTIC_BUNDLE_ENABLED:
+            print(f"  semantic bundle 灰度已启用（curators={sorted(_SEMANTIC_CURATOR_ALLOWLIST)}）")
+        elif _SEMANTIC_BUNDLE_SHADOW:
+            print("  semantic bundle shadow 已启用（observe-only）")
+        event_mode = _init_event_dedup_mode(str(cfg.get("event_dedup_mode") or "observe"))
+        print(f"  event ledger 已启用（requested={_EVENT_DEDUP_MODE}, effective={event_mode}）")
+        if event_mode == "observe":
+            print(f"  event dedup observe Go/No-Go: {event_dedup_gate_report()}")
         # rich 可播视频内嵌：config 键开关，默认关 = 封面缩略图行为
         global _RICH_VIDEO_ENABLED
         _RICH_VIDEO_ENABLED = bool(cfg.get("rich_video_embed"))
@@ -3932,6 +6005,11 @@ def main() -> int:
         print(f"  耗时 {time.monotonic() - run_started:.1f}s")
         return 0
     finally:
+        globals()["_EVENT_DEDUP_MODE"], globals()["_EVENT_DEDUP_EFFECTIVE_MODE"] = previous_event_modes
+        globals()["_SEMANTIC_BUNDLE_ENABLED"] = previous_semantic_mode
+        globals()["_SEMANTIC_BUNDLE_SHADOW"] = previous_semantic_shadow
+        globals()["_SEMANTIC_CURATOR_ALLOWLIST"] = previous_semantic_allowlist
+        globals()["_SENT_CONTENT_LEDGER_ENABLED"] = previous_sent_content_ledger_enabled
         # P0-1: always cancel the global timeout and release the flock lock so a
         # hung/hard-killed predecessor cannot starve subsequent cron ticks.
         if hasattr(signal, "SIGALRM"):

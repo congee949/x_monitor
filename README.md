@@ -28,6 +28,7 @@ X/Twitter 多账号监控 → Telegram 推送。定时拉取关注账号的新�
 **AI**
 - 推荐使用多模态模型
 - 关键词初筛 + AI 复核的两级推广过滤，降低 AI 调用量
+- `type: gemini` 必须配置兼容的 `api_base`（如 cliproxy）；不支持直连 `generativelanguage.googleapis.com`
 
 ---
 
@@ -93,7 +94,7 @@ flowchart TD
 ```json
 {
   "backends": [
-    { "name": "gemini", "type": "gemini", "api_base": "https://generativelanguage.googleapis.com/v1beta", "api_key": "<key>", "model": "gemini-3.5-flash", "timeout": 15 }
+    { "name": "gemini", "type": "gemini", "api_base": "http://<cliproxy-host>:8317/v1beta", "api_key_file": "<cliproxy device key path>", "model": "gemini-3.7-flash-high", "timeout": 45 }
   ],
   "article_markdown_cmd": "/usr/local/bin/x-article-to-markdown"
 }
