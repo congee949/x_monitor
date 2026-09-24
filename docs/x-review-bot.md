@@ -1,16 +1,16 @@
 # Telegram 人工复核与普通消息转交
 
-x_review_bot.py 是 bot 的唯一 getUpdates 消费者。它接收 callback_query 和 message，先把整批更新保存到 state/x-review.sqlite3，再处理复核和确认 offset。
+r4s 上的 CC98 poller 是共享 bot 的唯一 getUpdates 消费者。它将 owner 私聊和 X 复核 callback 整批写入 outbox；BWG 上的 x_review_relay.py 通过 SSH 读取 outbox，保存到 state/x-review.sqlite3 后处理复核。
 
 ## 消费者交接
 
-启动 BWG 服务前，先把 Mac growth 采集切换到 relay，停止它对该 bot 的 getUpdates 调用。不要使用负 offset 或清空待处理队列。HTTP 409 会使服务以状态 75 退出，模板禁止自动重启此状态，避免与其他消费者争抢。服务不删除 webhook。
+启动 BWG 服务前，先确认 r4s CC98 bridge 已启用，并把 Mac growth 采集切换到 relay。BWG 服务使用 x_review_relay.py，不调用 Telegram getUpdates；不要使用负 offset 或清空待处理队列。服务不删除 webhook。
 
 ## 运行文件
 
 凭据和 owner 只从现有 config.json 的 telegram_bot_token、telegram_chat_id 读取。state/x-event-review-20.json、state/telegram-review-receipt.json 和 state/x-review.sqlite3 都是运行数据，不入仓库。部署模板是 [x-review-bot.service](../deploy/x-review-bot.service)。
 
-    python3 x_review_bot.py --state /root/x_monitor/state/x-review.sqlite3 run --packet /root/x_monitor/state/x-event-review-20.json --receipt /root/x_monitor/state/telegram-review-receipt.json
+    python3 x_review_relay.py --state /root/x_monitor/state/x-review.sqlite3 --packet /root/x_monitor/state/x-event-review-20.json --receipt /root/x_monitor/state/telegram-review-receipt.json
 
 ## 复核规则
 
