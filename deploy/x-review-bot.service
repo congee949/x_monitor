@@ -1,0 +1,22 @@
+[Unit]
+Description=X Monitor human review callbacks and Telegram DM relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/x_monitor
+ExecStart=/usr/bin/python3 /root/x_monitor/x_review_bot.py --state /root/x_monitor/state/x-review.sqlite3 run --config /root/x_monitor/config.json --packet /root/x_monitor/state/x-event-review-20.json --receipt /root/x_monitor/state/telegram-review-receipt.json --ledger /root/x_monitor/twitter_seen/.event_ledger.sqlite3
+Restart=on-failure
+RestartSec=5
+RestartPreventExitStatus=75
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/root/x_monitor/state /root/x_monitor/twitter_seen
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
