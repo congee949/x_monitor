@@ -96,7 +96,8 @@ class ReviewCardsTests(unittest.TestCase):
             import sqlite3, hashlib
             db = sqlite3.connect(state)
             db.executescript("""CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
-                CREATE TABLE callbacks(seq INTEGER PRIMARY KEY,case_id TEXT,verdict TEXT,accepted INTEGER);""")
+                CREATE TABLE callbacks(seq INTEGER PRIMARY KEY,case_id TEXT,verdict TEXT,accepted INTEGER);
+                CREATE TABLE updates(update_id INTEGER PRIMARY KEY,kind TEXT,processed INTEGER);""")
             mapping = cards.bindings(packet, receipt, 42)
             digest = hashlib.sha256(cards.json_text([packet, mapping]).encode()).hexdigest()
             db.executemany("INSERT INTO meta VALUES (?,?)",
@@ -106,6 +107,11 @@ class ReviewCardsTests(unittest.TestCase):
             before = state.stat().st_mtime_ns
             self.assertEqual(cards.read_selections(state, packet, mapping, 42), {"R01": "keep"})
             self.assertEqual(state.stat().st_mtime_ns, before)
+            db = sqlite3.connect(state)
+            db.execute("INSERT INTO updates VALUES (10,'callback_query',0)")
+            db.commit(); db.close()
+            with self.assertRaisesRegex(ValueError, "pending callback"):
+                cards.read_selections(state, packet, mapping, 42, require_drained=True)
 
     def test_quote_media_and_long_text_are_preserved(self):
         packet, _ = fixture()

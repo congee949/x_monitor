@@ -41,10 +41,12 @@ def bindings(packet: dict, receipt: dict, owner: int) -> dict:
     return mapping
 
 
-def read_selections(state: Path, packet: dict, mapping: dict, owner: int) -> dict:
+def read_selections(state: Path, packet: dict, mapping: dict, owner: int, *, require_drained=False) -> dict:
     """Read the existing review sidecar without migrating or writing it."""
     uri = "file:" + urllib.parse.quote(str(Path(state).resolve())) + "?mode=ro"
     with sqlite3.connect(uri, uri=True) as db:
+        if require_drained and db.execute("SELECT count(*) FROM updates WHERE kind='callback_query' AND processed=0").fetchone()[0]:
+            raise ValueError("pending callback edits; drain the processor before converting cards")
         meta = dict(db.execute("SELECT key,value FROM meta"))
         fingerprint = hashlib.sha256(json_text([packet, mapping]).encode()).hexdigest()
         if meta.get("owner") != str(owner) or meta.get("packet_fingerprint") != fingerprint:
