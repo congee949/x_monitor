@@ -160,3 +160,7 @@ python3 test_twitter_monitor.py    # 纯 mock，零网络
 - **依赖**：Python 3.9+，纯标准库（`urllib`/`json`/`subprocess`/`fcntl` 等），无 `pip` 依赖。
 - **数据源**：Twitter GraphQL 为主；早期的付费 6551.io 兜底已弃用（相关代码保留为 inert）。
 - **安全**：所有密钥与登录态文件均被 `.gitignore` 排除，git 历史经扫描确认不含任何密钥。
+
+## 去重发布集成
+
+本仓库的生产发布集成记录见 [implementation-notes-dedup-2026-09-24.md](implementation-notes-dedup-2026-09-24.md)。去重功能按阶段开启：先只开启 `translation_reply_enabled`，通过 dry-run 核对后再观察并开启官方 Quote 折叠和文本 thread 合并。真实配置、账号订阅、cookie、token 和运行状态不提交到仓库。

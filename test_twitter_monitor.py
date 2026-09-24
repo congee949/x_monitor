@@ -1,8 +1,13 @@
 import argparse
+import concurrent.futures
+import io
 import json
+import os
+import sqlite3
 import sys
 import tempfile
 import unittest
+import urllib.error
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -10,11 +15,639 @@ from unittest.mock import patch
 import twitter_monitor
 
 
+_TEST_STATE_TMP = None
+_TEST_STATE_PATCHERS = []
+
+
+def setUpModule():
+    """Keep every default runtime-state path inside a disposable test sandbox."""
+    global _TEST_STATE_TMP, _TEST_STATE_PATCHERS
+    import macrumors_daily
+
+    _TEST_STATE_TMP = tempfile.TemporaryDirectory()
+    root = Path(_TEST_STATE_TMP.name)
+    paths = {
+        "SEEN_DIR": root / "twitter_seen",
+        "SEEN_RECOVERY_DIR": root / "twitter_seen" / ".seen_recovery",
+        "PUSHED_INDEX_PATH": root / "twitter_seen" / ".pushed_index.json",
+        "ASSUMED_DELIVERY_PATH": root / "twitter_seen" / ".assumed_delivered.json",
+        "EVENT_LEDGER_PATH": root / "twitter_seen" / ".event_ledger.sqlite3",
+        "SENT_CONTENT_LEDGER_PATH": root / "state" / "x_monitor_sent_content_ledger.jsonl",
+        "ARTICLE_QUEUE_DIR": root / "twitter_articles",
+        "ARTICLE_CACHE_DIR": root / "twitter_articles" / "cache",
+        "FAILURES_PATH": root / ".account_failures.json",
+        "DASHBOARD_PATH": root / ".dashboard.json",
+        "COOKIE_HEALTH_PATH": root / ".cookie_health.json",
+    }
+    _TEST_STATE_PATCHERS = [
+        patch.object(twitter_monitor, name, str(path)) for name, path in paths.items()
+    ]
+    _TEST_STATE_PATCHERS.append(
+        patch.object(macrumors_daily, "SEEN_PATH", str(root / ".macrumors_seen.json"))
+    )
+    _TEST_STATE_PATCHERS.append(
+        patch.object(twitter_monitor, "_EVENT_DEDUP_EFFECTIVE_MODE", "off")
+    )
+    for patcher in _TEST_STATE_PATCHERS:
+        patcher.start()
+
+
+def tearDownModule():
+    global _TEST_STATE_TMP, _TEST_STATE_PATCHERS
+    for patcher in reversed(_TEST_STATE_PATCHERS):
+        patcher.stop()
+    _TEST_STATE_PATCHERS = []
+    if _TEST_STATE_TMP is not None:
+        _TEST_STATE_TMP.cleanup()
+        _TEST_STATE_TMP = None
+
+
 class FixedDatetime(datetime):
     @classmethod
     def now(cls, tz=None):
         current = cls(2026, 5, 12, 0, 30, 0, tzinfo=timezone.utc)
         return current if tz else current.replace(tzinfo=None)
+
+
+class SentContentLedgerTest(unittest.TestCase):
+    def test_exact_schema_one_row_per_confirmed_message_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "ledger.jsonl"
+            written = twitter_monitor._record_confirmed_sent_content(
+                [
+                    {"ok": True, "result": {"message_id": 901}},
+                    {"ok": True, "result": {"message_id": "902"}},
+                ],
+                chat_id="-1004424841223", thread_id="19",
+                source_kind="x_tweet",
+                source_ref="https://x.com/openai/status/12345",
+                source_message_ids=["12345"],
+                url="https://x.com/openai/status/12345",
+                content="给 Hermes 理解偏好的公开推文内容。",
+                content_id="x-tweet:12345", path=str(path))
+
+            self.assertEqual(written, 2)
+            rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual([row["message_id"] for row in rows], [901, 902])
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            for row in rows:
+                self.assertEqual(set(row), {
+                    "schema", "chat_id", "thread_id", "message_id", "producer",
+                    "source_kind", "source_ref", "source_message_ids", "url",
+                    "content", "content_hash", "delivery_state", "sent_at", "content_id",
+                    "links",
+                })
+                self.assertEqual(row["links"], [])
+                self.assertEqual(row["schema"], "sent-content.v1")
+                self.assertEqual(row["producer"], "x_monitor")
+                self.assertEqual(row["delivery_state"], "confirmed")
+                self.assertEqual(row["chat_id"], -1004424841223)
+                self.assertEqual(row["thread_id"], 19)
+                self.assertEqual(row["source_message_ids"], [12345])
+                self.assertEqual(
+                    row["content_hash"],
+                    twitter_monitor.hashlib.sha256(row["content"].encode("utf-8")).hexdigest())
+                self.assertNotIn("cookie", row)
+                self.assertNotIn("api_response", row)
+
+    def test_assumed_missing_id_disabled_and_non_x_ref_never_write(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "ledger.jsonl"
+            common = dict(
+                chat_id=-1001, thread_id=None, source_kind="x_tweet",
+                source_ref="https://x.com/u/status/10", source_message_ids=[10],
+                url="https://x.com/u/status/10", content="public content",
+                content_id="x-tweet:10", path=str(path))
+            self.assertEqual(twitter_monitor._record_confirmed_sent_content(
+                {"ok": True, "assumed_delivered": True,
+                 "result": {"message_id": 7}}, **common), 0)
+            self.assertEqual(twitter_monitor._record_confirmed_sent_content(
+                {"ok": True}, **common), 0)
+            self.assertEqual(twitter_monitor._record_confirmed_sent_content(
+                {"ok": True, "result": {"message_id": -7}}, **common), 0)
+            with patch.object(twitter_monitor, "_SENT_CONTENT_LEDGER_ENABLED", False):
+                self.assertEqual(twitter_monitor._record_confirmed_sent_content(
+                    {"ok": True, "result": {"message_id": 7}}, **common), 0)
+            unsafe = dict(common)
+            unsafe["source_ref"] = "https://api.example.invalid/token/secret"
+            self.assertEqual(twitter_monitor._record_confirmed_sent_content(
+                {"ok": True, "result": {"message_id": 7}}, **unsafe), 0)
+            self.assertFalse(path.exists())
+
+    def test_content_is_bounded_and_write_failure_is_fail_open(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "ledger.jsonl"
+            common = dict(
+                chat_id=-1001, thread_id=None, source_kind="x_article",
+                source_ref="https://x.com/i/article/11", source_message_ids=[11],
+                url="https://x.com/i/article/11", content="长" * 20000,
+                content_id="x-article:11")
+            self.assertEqual(twitter_monitor._record_confirmed_sent_content(
+                {"ok": True, "result": {"message_id": 8}}, path=str(path), **common), 1)
+            row = json.loads(path.read_text(encoding="utf-8"))
+            self.assertLessEqual(len(row["content"]), twitter_monitor.SENT_CONTENT_MAX_CHARS)
+            self.assertTrue(row["content"].endswith("…[truncated]"))
+
+            blocker = Path(tmp) / "not-a-directory"
+            blocker.write_text("block", encoding="utf-8")
+            # No exception may escape after Telegram has already confirmed send.
+            self.assertEqual(twitter_monitor._record_confirmed_sent_content(
+                {"ok": True, "result": {"message_id": 9}},
+                path=str(blocker / "ledger.jsonl"), **common), 0)
+
+    def test_links_sorted_unique_capped_and_omitted_is_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "ledger.jsonl"
+            common = dict(
+                chat_id=-1001, thread_id=None, source_kind="x_tweet",
+                source_ref="https://x.com/u/status/10", source_message_ids=[10],
+                url="https://x.com/u/status/10", content="public content",
+                content_id="x-tweet:10", path=str(path))
+            extras = ["https://n.example/%02d" % i for i in range(18)]
+            written = twitter_monitor._record_confirmed_sent_content(
+                {"ok": True, "result": {"message_id": 1}},
+                links=["https://b.example/z", "https://a.example/y",
+                       "https://b.example/z"] + extras,
+                **common)
+            self.assertEqual(written, 1)
+            row = json.loads(path.read_text(encoding="utf-8"))
+            expected = sorted(set(
+                ["https://a.example/y", "https://b.example/z"] + extras))[:20]
+            self.assertEqual(row["links"], expected)
+            self.assertEqual(len(row["links"]), 20)
+            self.assertEqual(row["links"], sorted(set(row["links"])))
+
+            empty_path = Path(tmp) / "empty.jsonl"
+            common["path"] = str(empty_path)
+            written = twitter_monitor._record_confirmed_sent_content(
+                {"ok": True, "result": {"message_id": 2}}, **common)
+            self.assertEqual(written, 1)
+            row = json.loads(empty_path.read_text(encoding="utf-8"))
+            self.assertEqual(row["links"], [])
+
+
+class CanonicalLinkTest(unittest.TestCase):
+    def test_outbound_links_include_quoted_status_key_and_entities(self):
+        tweet = {
+            "id": "1", "text": "看这个 https://t.co/abc",
+            "entities": {"urls": [{
+                "url": "https://t.co/abc",
+                "expanded_url": "https://z.ai/blog/glm-built-its-inference-infrastructure/?utm_source=x",
+            }]},
+            "quoted_status": {"id": "2100494599475155288", "screen_name": "dotey"},
+        }
+        self.assertEqual(
+            twitter_monitor._tweet_outbound_links(tweet),
+            ["https://z.ai/blog/glm-built-its-inference-infrastructure",
+             "x.com/status/2100494599475155288"])
+        self.assertEqual(twitter_monitor._tweet_outbound_links({"id": "1", "text": "no links"}), [])
+        self.assertEqual(twitter_monitor._tweet_outbound_links({"quoted_status": {"id": "abc"}}), [])
+
+    def test_tracker_host_slash_and_fragment(self):
+        self.assertEqual(
+            twitter_monitor._canonical_link(
+                "https://www.Z.ai/blog/glm-built-its-inference-infrastructure/"
+                "?utm_source=x#top"),
+            "https://z.ai/blog/glm-built-its-inference-infrastructure")
+
+    def test_x_status_shapes(self):
+        expected = "x.com/status/123"
+        for url in (
+            "https://x.com/dotey/status/123",
+            "https://twitter.com/dotey/status/123",
+            "https://x.com/i/web/status/123",
+            "https://twitter.com/dotey/status/123?s=20&t=abc",
+            "https://mobile.twitter.com/dotey/statuses/123",
+        ):
+            self.assertEqual(twitter_monitor._canonical_link(url), expected, url)
+
+    def test_x_article(self):
+        self.assertEqual(
+            twitter_monitor._canonical_link("https://x.com/i/article/99"),
+            "x.com/i/article/99")
+
+    def test_rejected_hosts_and_schemes(self):
+        self.assertEqual(twitter_monitor._canonical_link("https://t.co/abc"), "")
+        self.assertEqual(
+            twitter_monitor._canonical_link("https://pbs.twimg.com/media/x.jpg"), "")
+        self.assertEqual(twitter_monitor._canonical_link("javascript:alert(1)"), "")
+        self.assertEqual(twitter_monitor._canonical_link("ftp://example.com/a"), "")
+        self.assertEqual(twitter_monitor._canonical_link(""), "")
+
+
+class EventDeliveryLedgerTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = str(Path(self.tmp.name) / "ledger.sqlite3")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    @staticmethod
+    def event(tid, text, event_type="model_launch"):
+        return {"id": tid, "text": text, "_push_event_type": event_type}
+
+    def test_different_tweet_ids_same_event_observed_but_not_suppressed(self):
+        first = self.event("101", "Introducing GPT-5.6, now in ChatGPT, Codex and the API.")
+        paraphrase = self.event("102", "GPT 5.6 is now available in ChatGPT, Codex, and API.")
+        with patch.object(twitter_monitor, "_EVENT_DEDUP_EFFECTIVE_MODE", "observe"):
+            c1 = twitter_monitor.claim_event_delivery(first, "OpenAI", path=self.db)
+            self.assertTrue(c1["claimed"])
+            twitter_monitor.finish_event_delivery(c1, "confirmed", {"result": {"message_id": 77}}, path=self.db)
+            c2 = twitter_monitor.claim_event_delivery(paraphrase, "OpenAIDevs", path=self.db)
+        self.assertTrue(c2["claimed"])
+        with twitter_monitor._event_ledger_connect(self.db) as db:
+            obs = db.execute("SELECT decision FROM event_observations").fetchall()
+        self.assertEqual([r["decision"] for r in obs], ["would_suppress"])
+
+    def test_claim_is_scoped_to_actual_chat_and_thread(self):
+        tweet = self.event("103", "GPT-5.6 is now available in the API.")
+        with patch.object(twitter_monitor, "_EVENT_DEDUP_EFFECTIVE_MODE", "observe"):
+            group_x = twitter_monitor.claim_event_delivery(
+                tweet, "OpenAI", target_chat_id="group", target_thread_id=10,
+                path=self.db)
+            self.assertTrue(group_x["claimed"])
+            twitter_monitor.finish_event_delivery(group_x, "confirmed", path=self.db)
+            group_other_topic = twitter_monitor.claim_event_delivery(
+                tweet, "OpenAI", target_chat_id="group", target_thread_id=11,
+                path=self.db)
+            direct = twitter_monitor.claim_event_delivery(
+                tweet, "OpenAI", target_chat_id="direct", path=self.db)
+            duplicate_x = twitter_monitor.claim_event_delivery(
+                tweet, "OpenAI", target_chat_id="group", target_thread_id=10,
+                path=self.db)
+        self.assertTrue(group_other_topic["claimed"])
+        self.assertTrue(direct["claimed"])
+        self.assertFalse(duplicate_x["claimed"])
+        with twitter_monitor._event_ledger_connect(self.db) as db:
+            targets = db.execute("""SELECT target_chat_id,target_thread_id
+                FROM deliveries ORDER BY target_chat_id,target_thread_id""").fetchall()
+        self.assertEqual([tuple(row) for row in targets],
+                         [("direct", ""), ("group", "10"), ("group", "11")])
+
+    def test_added_fact_is_a_distinct_update(self):
+        first = self.event("201", "GPT-5.6 is now in ChatGPT and API.")
+        update = self.event("202", "GPT-5.6 is now in ChatGPT and API, with 50% more weekly credits for Team.")
+        self.assertEqual(twitter_monitor.event_identity(first)["event_key"],
+                         twitter_monitor.event_identity(update)["event_key"])
+        with patch.object(twitter_monitor, "_EVENT_DEDUP_EFFECTIVE_MODE", "enforce"):
+            c1 = twitter_monitor.claim_event_delivery(first, "OpenAI", path=self.db)
+            twitter_monitor.finish_event_delivery(c1, "confirmed", path=self.db)
+            c2 = twitter_monitor.claim_event_delivery(update, "OpenAI", path=self.db)
+        self.assertTrue(c2["claimed"])
+        with twitter_monitor._event_ledger_connect(self.db) as db:
+            self.assertEqual(db.execute("SELECT decision FROM event_observations").fetchone()[0],
+                             "material_update")
+
+    def test_real_anthropic_model_release_companion_posts_share_primary_anchor(self):
+        launch = self.event(
+            "205", "Introducing Claude Opus 5. It approaches Fable 5 at half the price.",
+            "model_launch")
+        access = self.event(
+            "206", "Opus 5 is available today on Pro, Max and the API at the Opus 4.8 price.",
+            "model_access")
+        launch_id = twitter_monitor.event_identity(launch)
+        access_id = twitter_monitor.event_identity(access)
+        self.assertEqual(launch_id["anchors"], ["opus-5"])
+        self.assertEqual(access_id["anchors"], ["opus-5"])
+        self.assertEqual(launch_id["event_family"], "model_release")
+        self.assertEqual(launch_id["event_key"], access_id["event_key"])
+        self.assertIn("fable-5", launch_id["facts"])
+        self.assertIn("opus-4.8", access_id["facts"])
+
+    def test_companion_release_with_new_availability_facts_is_preserved(self):
+        launch = self.event("207", "Introducing Claude Opus 5 at half the price.",
+                            "model_launch")
+        access = self.event("208", "Opus 5 is now available on Pro, Max and API.",
+                            "model_access")
+        with patch.object(twitter_monitor, "_EVENT_DEDUP_EFFECTIVE_MODE", "enforce"):
+            c1 = twitter_monitor.claim_event_delivery(launch, "claudeai", path=self.db)
+            twitter_monitor.finish_event_delivery(c1, "confirmed", path=self.db)
+            c2 = twitter_monitor.claim_event_delivery(access, "claudeai", path=self.db)
+        self.assertTrue(c2["claimed"])
+        with twitter_monitor._event_ledger_connect(self.db) as db:
+            self.assertEqual(db.execute(
+                "SELECT decision FROM event_observations").fetchone()[0], "material_update")
+
+    def test_paraphrase_with_fewer_known_facts_is_duplicate_in_enforce(self):
+        first = self.event("211", "GPT-5.6 is now in ChatGPT, Codex and API for Team.")
+        shorter = self.event("212", "GPT-5.6 is now available in the API.")
+        with patch.object(twitter_monitor, "_EVENT_DEDUP_EFFECTIVE_MODE", "enforce"):
+            c1 = twitter_monitor.claim_event_delivery(first, "OpenAI", path=self.db)
+            twitter_monitor.finish_event_delivery(c1, "confirmed", path=self.db)
+            c2 = twitter_monitor.claim_event_delivery(shorter, "OpenAIDevs", path=self.db)
+        self.assertFalse(c2["claimed"])
+        self.assertTrue(c2["duplicate"])
+
+    def test_short_ascii_fact_terms_use_token_boundaries(self):
+        facts = twitter_monitor._event_facts(self.event(
+            "220", "We maximize product quality for the API without changing plans."))
+        self.assertNotIn("max", facts)
+        self.assertNotIn("pro", facts)
+        self.assertIn("api", facts)
+
+    def test_atomic_concurrent_claim_has_one_winner(self):
+        tweet = self.event("301", "Claude-5.1 is now in Claude Code and API.")
+        def claim(_):
+            return twitter_monitor.claim_event_delivery(tweet, "claudeai", path=self.db)
+        with patch.object(twitter_monitor, "_EVENT_DEDUP_EFFECTIVE_MODE", "enforce"):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+                results = list(pool.map(claim, range(8)))
+        self.assertEqual(sum(bool(r["claimed"]) for r in results), 1)
+        self.assertEqual(sum(bool(r["duplicate"]) for r in results), 7)
+
+    def test_crash_recovery_promotes_stale_pending_to_ambiguous(self):
+        tweet = self.event("401", "Gemini-4.2 is now available in API.")
+        old = datetime(2026, 5, 11, 23, 0, tzinfo=timezone.utc)
+        later = old + timedelta(seconds=twitter_monitor.EVENT_LEDGER_PENDING_TTL_SECONDS + 1)
+        with patch.object(twitter_monitor, "_EVENT_DEDUP_EFFECTIVE_MODE", "observe"):
+            c1 = twitter_monitor.claim_event_delivery(tweet, "u", path=self.db, now=old)
+            self.assertTrue(c1["claimed"])
+            c2 = twitter_monitor.claim_event_delivery(tweet, "u", path=self.db, now=later)
+        self.assertFalse(c2["claimed"])
+        self.assertEqual(c2["state"], "ambiguous")
+
+    def test_startup_recovers_stale_pending_even_if_tweet_is_never_seen_again(self):
+        tweet = self.event("405", "Gemini-4.2 is now available in API.")
+        old = datetime(2026, 5, 11, 23, 0, tzinfo=timezone.utc)
+        later = old + timedelta(seconds=twitter_monitor.EVENT_LEDGER_PENDING_TTL_SECONDS + 1)
+        with patch.object(twitter_monitor, "_EVENT_DEDUP_EFFECTIVE_MODE", "observe"):
+            twitter_monitor.claim_event_delivery(tweet, "u", path=self.db, now=old)
+        self.assertEqual(twitter_monitor.recover_stale_event_claims(self.db, now=later), 1)
+        with twitter_monitor._event_ledger_connect(self.db) as db:
+            row = db.execute("SELECT state,detail FROM deliveries WHERE tweet_id='405'").fetchone()
+        self.assertEqual(row["state"], "ambiguous")
+        self.assertEqual(row["detail"], "startup_stale_pending_recovery")
+
+    def test_all_required_state_transitions_and_message_id(self):
+        with patch.object(twitter_monitor, "_EVENT_DEDUP_EFFECTIVE_MODE", "observe"):
+            confirmed = twitter_monitor.claim_event_delivery(self.event("501", "GPT-5.7 API"), "u", path=self.db)
+            self.assertTrue(twitter_monitor.finish_event_delivery(
+                confirmed, "confirmed", {"result": {"message_id": 9001}}, path=self.db))
+            ambiguous = twitter_monitor.claim_event_delivery(self.event("502", "Claude-5.2 API"), "u", path=self.db)
+            self.assertTrue(twitter_monitor.finish_event_delivery(ambiguous, "ambiguous", detail="HTTP 504", path=self.db))
+            failed = twitter_monitor.claim_event_delivery(self.event("503", "Gemini-4.3 API"), "u", path=self.db)
+            self.assertTrue(twitter_monitor.finish_event_delivery(failed, "failed_pre_send", detail="DNS", path=self.db))
+            retry = twitter_monitor.claim_event_delivery(self.event("503", "Gemini-4.3 API"), "u", path=self.db)
+        self.assertTrue(retry["claimed"])
+        with twitter_monitor._event_ledger_connect(self.db) as db:
+            rows = {r["tweet_id"]: (r["state"], r["message_id"]) for r in db.execute(
+                "SELECT tweet_id,state,message_id FROM deliveries")}
+        self.assertEqual(rows["501"], ("confirmed", "9001"))
+        self.assertEqual(rows["502"][0], "ambiguous")
+        self.assertEqual(rows["503"][0], "pending")
+
+    def test_enforce_gate_requires_reviewed_low_false_positive_samples(self):
+        twitter_monitor._event_ledger_connect(self.db).close()
+        now = datetime.now(timezone.utc).isoformat()
+        with twitter_monitor._event_ledger_connect(self.db) as db:
+            db.executemany("""INSERT INTO event_observations
+                (observed_at,event_key,candidate_tweet_id,candidate_username,decision,reviewed,false_positive)
+                VALUES (?,?,?,?,?,?,?)""", [
+                (now, f"e{i}", f"t{i}", "u", "would_suppress", 1, 0)
+                for i in range(twitter_monitor.EVENT_ENFORCE_MIN_REVIEWED)
+            ])
+        self.assertTrue(twitter_monitor.event_dedup_gate_report(self.db)["ready"])
+
+    def test_enforce_gate_rejects_reviewed_but_unlabelled_samples(self):
+        twitter_monitor._event_ledger_connect(self.db).close()
+        now = datetime.now(timezone.utc).isoformat()
+        with twitter_monitor._event_ledger_connect(self.db) as db:
+            db.executemany("""INSERT INTO event_observations
+                (observed_at,event_key,candidate_tweet_id,candidate_username,decision,reviewed)
+                VALUES (?,?,?,?,?,?)""", [
+                (now, f"e{i}", f"t{i}", "u", "would_suppress", 1)
+                for i in range(twitter_monitor.EVENT_ENFORCE_MIN_REVIEWED)
+            ])
+        report = twitter_monitor.event_dedup_gate_report(self.db)
+        self.assertEqual(report["reviewed"], 0)
+        self.assertFalse(report["ready"])
+
+    def test_repeated_candidate_does_not_inflate_observation_count(self):
+        first = self.event("241", "GPT-5.6 is now in ChatGPT, Codex and API.")
+        repeat = self.event("242", "GPT-5.6 is now available in the API.")
+        with patch.object(twitter_monitor, "_EVENT_DEDUP_EFFECTIVE_MODE", "observe"):
+            c1 = twitter_monitor.claim_event_delivery(first, "OpenAI", path=self.db)
+            twitter_monitor.finish_event_delivery(c1, "confirmed", path=self.db)
+            c2 = twitter_monitor.claim_event_delivery(repeat, "OpenAIDevs", path=self.db)
+            twitter_monitor.finish_event_delivery(c2, "confirmed", path=self.db)
+            c3 = twitter_monitor.claim_event_delivery(repeat, "OpenAIDevs", path=self.db)
+        self.assertFalse(c3["claimed"])
+        with twitter_monitor._event_ledger_connect(self.db) as db:
+            self.assertEqual(db.execute(
+                "SELECT count(*) FROM event_observations").fetchone()[0], 1)
+
+    def test_changed_prior_does_not_duplicate_same_candidate_sample(self):
+        first = self.event("243", "GPT-5.6 is now in ChatGPT, Codex and API.")
+        repeat = self.event("244", "GPT-5.6 is now available in the API.")
+        update = self.event(
+            "245", "GPT-5.6 is now in ChatGPT, Codex and API with weekly Team credits.")
+        with patch.object(twitter_monitor, "_EVENT_DEDUP_EFFECTIVE_MODE", "observe"):
+            c1 = twitter_monitor.claim_event_delivery(first, "OpenAI", path=self.db)
+            twitter_monitor.finish_event_delivery(c1, "confirmed", path=self.db)
+            c2 = twitter_monitor.claim_event_delivery(repeat, "OpenAIDevs", path=self.db)
+            twitter_monitor.finish_event_delivery(c2, "confirmed", path=self.db)
+            c3 = twitter_monitor.claim_event_delivery(update, "OpenAI", path=self.db)
+            twitter_monitor.finish_event_delivery(c3, "confirmed", path=self.db)
+            self.assertFalse(twitter_monitor.claim_event_delivery(
+                repeat, "OpenAIDevs", path=self.db)["claimed"])
+        with twitter_monitor._event_ledger_connect(self.db) as db:
+            rows = db.execute("""SELECT candidate_tweet_id,decision
+                FROM event_observations WHERE candidate_tweet_id='244'""").fetchall()
+        self.assertEqual([tuple(row) for row in rows], [("244", "would_suppress")])
+
+    def test_legacy_duplicate_observations_migrate_preserving_label(self):
+        # Simulate a database created before the candidate-unique index existed.
+        with twitter_monitor._event_ledger_connect(self.db) as db:
+            db.execute("DROP INDEX event_observations_candidate_idx")
+            db.executemany("""INSERT INTO event_observations
+                (observed_at,event_key,prior_delivery_key,candidate_tweet_id,
+                 candidate_username,decision,reviewed,false_positive,note)
+                VALUES (?,?,?,?,?,?,?,?,?)""", [
+                ("2026-08-09T00:00:00+00:00", "e", "p1", "c", "u",
+                 "would_suppress", 0, None, None),
+                ("2026-08-09T00:01:00+00:00", "e", "p2", "c", "u",
+                 "would_suppress", 1, 1, "reviewed false positive"),
+            ])
+        with twitter_monitor._event_ledger_connect(self.db) as db:
+            rows = db.execute("""SELECT reviewed,false_positive,note
+                FROM event_observations""").fetchall()
+            columns = [row["name"] for row in db.execute(
+                "PRAGMA index_info(event_observations_candidate_idx)")]
+        self.assertEqual([tuple(row) for row in rows],
+                         [(1, 1, "reviewed false positive")])
+        self.assertEqual(columns, ["target_chat_id", "target_thread_id", "event_key",
+                                   "candidate_tweet_id", "decision"])
+
+    def test_review_api_lists_urls_labels_candidate_and_updates_gate(self):
+        first = self.event("251", "GPT-5.6 is now in ChatGPT, Codex and API.")
+        repeat = self.event("252", "GPT-5.6 is now available in the API.")
+        with patch.object(twitter_monitor, "_EVENT_DEDUP_EFFECTIVE_MODE", "observe"):
+            c1 = twitter_monitor.claim_event_delivery(first, "OpenAI", path=self.db)
+            twitter_monitor.finish_event_delivery(c1, "confirmed", path=self.db)
+            c2 = twitter_monitor.claim_event_delivery(repeat, "OpenAIDevs", path=self.db)
+        rows = twitter_monitor.event_review_rows(self.db)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["prior_url"], "https://x.com/OpenAI/status/251")
+        self.assertEqual(rows[0]["candidate_url"],
+                         "https://x.com/OpenAIDevs/status/252")
+        self.assertTrue(twitter_monitor.review_event_observation(
+            rows[0]["id"], False, "same announcement", path=self.db))
+        reviewed = twitter_monitor.event_review_rows(self.db)[0]
+        self.assertEqual((reviewed["reviewed"], reviewed["false_positive"], reviewed["note"]),
+                         (1, 0, "same announcement"))
+        report = twitter_monitor.event_dedup_gate_report(self.db)
+        self.assertEqual((report["candidates"], report["reviewed"], report["false_positives"]),
+                         (1, 1, 0))
+
+    def test_enforce_compares_candidate_with_all_known_event_facts(self):
+        first = self.event("231", "GPT-5.6 is now in ChatGPT and API.")
+        incomparable = self.event("232", "GPT-5.6 is now in Codex for Team.")
+        older_repeat = self.event("233", "GPT-5.6 is available in the API.")
+        with patch.object(twitter_monitor, "_EVENT_DEDUP_EFFECTIVE_MODE", "enforce"):
+            c1 = twitter_monitor.claim_event_delivery(first, "OpenAI", path=self.db)
+            twitter_monitor.finish_event_delivery(c1, "confirmed", path=self.db)
+            c2 = twitter_monitor.claim_event_delivery(incomparable, "OpenAIDevs", path=self.db)
+            self.assertTrue(c2["claimed"])
+            twitter_monitor.finish_event_delivery(c2, "confirmed", path=self.db)
+            c3 = twitter_monitor.claim_event_delivery(older_repeat, "OpenAI", path=self.db)
+        self.assertFalse(c3["claimed"])
+        self.assertTrue(c3["duplicate"])
+
+    def test_send_ok_then_ledger_finalize_crash_never_enters_retry(self):
+        tweet = {"id": "601", "text": "A sufficiently long substantive API release update.",
+                 "createdAt": "Tue May 12 00:20:00 +0000 2026"}
+        args = argparse.Namespace(test=False, seed=False, dry_run=False, limit=20,
+                                  max_push_age_minutes=45)
+        saved_retries = []
+        with patch.object(twitter_monitor, "_EVENT_DEDUP_EFFECTIVE_MODE", "observe"), \
+             patch.object(twitter_monitor, "EVENT_LEDGER_PATH", self.db), \
+             patch.object(twitter_monitor, "datetime", FixedDatetime), \
+             patch.object(twitter_monitor, "fetch_tweets", return_value=[tweet]), \
+             patch.object(twitter_monitor, "load_seen", return_value=({"old"}, None)), \
+             patch.object(twitter_monitor, "save_seen", return_value=None), \
+             patch.object(twitter_monitor, "save_push_retry",
+                          side_effect=lambda _u, ids: saved_retries.append(set(ids))), \
+             patch.object(twitter_monitor, "send_tweet",
+                          return_value={"ok": True, "result": {"message_id": 42}}), \
+             patch.object(twitter_monitor, "finish_event_delivery",
+                          side_effect=sqlite3.OperationalError("disk I/O")), \
+             patch.object(twitter_monitor.time, "sleep", return_value=None):
+            result = twitter_monitor.process_user(None, FakeAI(False), "u", "b", "c", args)
+        self.assertEqual(result[1], 1)
+        self.assertEqual(saved_retries[-1], set())
+        with twitter_monitor._event_ledger_connect(self.db) as db:
+            self.assertEqual(db.execute("SELECT state FROM deliveries WHERE tweet_id='601'").fetchone()[0],
+                             "pending")
+
+
+class MacRumorsMergeJsonTests(unittest.TestCase):
+    """AI 聚类 JSON 是非可信输入；混合类型必须降级而不是终止日报。"""
+
+    def test_mixed_root_array_skips_scalars_and_preserves_full_coverage(self):
+        import macrumors_daily as md
+        quality = {}
+        text = json.dumps([
+            {"indices": [0, 2], "zh_title": "同一事件", "zh_summary": "摘要"},
+            7, None, "noise", [1],
+            {"indices": [1], "zh_title": "另一事件", "zh_summary": "摘要"},
+        ])
+
+        groups = md.parse_merge_json(text, 4, quality)
+
+        self.assertEqual([g["indices"] for g in groups], [[0, 2], [1], [3]])
+        self.assertEqual(quality["status"], "degraded")
+        self.assertEqual(quality["invalid_elements"], 4)
+        self.assertEqual(quality["missing_indices"], 1)
+
+    def test_bad_indices_are_counted_without_bool_or_float_truncation(self):
+        import macrumors_daily as md
+        quality = {}
+        text = json.dumps([
+            {"indices": [0, True, 1.5, "2", -1, 5, 0],
+             "zh_title": "标题", "zh_summary": "摘要"},
+            {"indices": [1]},
+        ])
+
+        groups = md.parse_merge_json(text, 3, quality)
+
+        self.assertEqual([g["indices"] for g in groups], [[0], [1], [2]])
+        self.assertEqual(quality["invalid_indices"], 5)
+        self.assertEqual(quality["duplicate_indices"], 1)
+        self.assertEqual(quality["missing_indices"], 1)
+        self.assertEqual(quality["status"], "degraded")
+
+    def test_cross_group_duplicate_is_removed_from_later_group(self):
+        import macrumors_daily as md
+        quality = {}
+        text = json.dumps([
+            {"indices": [0, 1], "zh_title": "首组"},
+            {"indices": [1, 2], "zh_title": "后组"},
+        ])
+
+        groups = md.parse_merge_json(text, 3, quality)
+
+        self.assertEqual([g["indices"] for g in groups], [[0, 1], [2]])
+        self.assertEqual(quality["duplicate_indices"], 1)
+        self.assertEqual(quality["missing_indices"], 0)
+        self.assertEqual(quality["status"], "degraded")
+
+    def test_unbounded_json_integer_is_rejected_without_overflow(self):
+        import macrumors_daily as md
+        quality = {}
+        huge = int("9" * 400)
+
+        groups = md.parse_merge_json(json.dumps([
+            {"indices": [huge]}, {"indices": [0]},
+        ]), 1, quality)
+
+        self.assertEqual([g["indices"] for g in groups], [[0]])
+        self.assertEqual(quality["invalid_indices"], 1)
+        self.assertEqual(quality["status"], "degraded")
+
+    def test_all_invalid_elements_returns_none_with_auditable_quality(self):
+        import macrumors_daily as md
+        quality = {}
+
+        self.assertIsNone(md.parse_merge_json("[1, null, \"x\"]", 2, quality))
+        self.assertEqual(quality["status"], "no_valid_groups")
+        self.assertEqual(quality["invalid_elements"], 3)
+        self.assertEqual(quality["missing_indices"], 2)
+
+    def test_valid_payload_reports_ok(self):
+        import macrumors_daily as md
+        quality = {}
+        groups = md.parse_merge_json(
+            '[{"indices":[0]},{"indices":[1]}]', 2, quality)
+        self.assertEqual(len(groups), 2)
+        self.assertEqual(quality["status"], "ok")
+
+    def test_merge_similar_logs_degradation_and_keeps_every_item(self):
+        import contextlib
+        import io
+        import macrumors_daily as md
+
+        class MixedResponseAI:
+            @staticmethod
+            def complete(_prompt, max_tokens=4000):
+                return json.dumps([
+                    {"indices": [0]}, 7, {"indices": [1]},
+                    {"indices": [2]}, {"indices": [3]},
+                ]), "fake"
+
+        items = [{"zh_title": f"title-{i}"} for i in range(4)]
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            result = md.merge_similar(MixedResponseAI(), items)
+
+        self.assertEqual(result, items)
+        line = stderr.getvalue().strip()
+        self.assertTrue(line.startswith("MACRUMORS_QUALITY merge_parse "))
+        metric = json.loads(line.split(" ", 2)[2])
+        self.assertEqual(metric["status"], "degraded")
+        self.assertEqual(metric["invalid_elements"], 1)
+        self.assertEqual(metric["missing_indices"], 0)
+        self.assertEqual(metric["attempt"], 1)
 
 
 class FakeAI:
@@ -38,6 +671,288 @@ class FakeAI:
 
     def confirm_musing(self, username, text):
         return self.musing, f"fake:{self.musing_reason}"
+
+
+class SentContentFlowTest(unittest.TestCase):
+    TWEET = {
+        "id": "2091427402140557652",
+        "text": "A substantive public release update with enough detail for the monitored feed.",
+        "createdAt": "Tue May 12 00:20:00 +0000 2026",
+    }
+
+    @staticmethod
+    def _args(**overrides):
+        values = dict(test=False, seed=False, dry_run=False, test_count=3,
+                      limit=20, max_push_age_minutes=45)
+        values.update(overrides)
+        return argparse.Namespace(**values)
+
+    def _process_tweet(self, ledger_path, result, **mode):
+        with patch.object(twitter_monitor, "datetime", FixedDatetime), \
+             patch.object(twitter_monitor, "SENT_CONTENT_LEDGER_PATH", str(ledger_path)), \
+             patch.object(twitter_monitor, "_EVENT_DEDUP_EFFECTIVE_MODE", "off"), \
+             patch.object(twitter_monitor, "fetch_tweets", return_value=[dict(self.TWEET)]), \
+             patch.object(twitter_monitor, "load_seen", return_value=({"old"}, None)), \
+             patch.object(twitter_monitor, "load_push_retry", return_value=set()), \
+             patch.object(twitter_monitor, "save_seen", return_value=None), \
+             patch.object(twitter_monitor, "save_push_retry", return_value=None), \
+             patch.object(twitter_monitor, "send_tweet", return_value=result), \
+             patch.object(twitter_monitor.time, "sleep", return_value=None):
+            return twitter_monitor.process_user(
+                pool=None, ai=FakeAI(False), username="u",
+                bot_token="b", chat_id="-1001", args=self._args(**mode),
+                content_chat_id="-1002", content_thread_id=19)
+
+    def test_process_user_records_confirmed_result_but_not_assumed_or_test(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            confirmed = root / "confirmed.jsonl"
+            result = self._process_tweet(
+                confirmed, {"ok": True, "result": {"message_id": 42},
+                            "send_method": "sendMessage"})
+            self.assertEqual(result[1], 1)
+            row = json.loads(confirmed.read_text(encoding="utf-8"))
+            self.assertEqual((row["chat_id"], row["thread_id"], row["message_id"]),
+                             (-1002, 19, 42))
+            self.assertEqual(row["source_kind"], "x_tweet")
+
+            assumed = root / "assumed.jsonl"
+            result = self._process_tweet(
+                assumed, {"ok": True, "assumed_delivered": True,
+                          "send_method": "sendRichMessage"})
+            self.assertEqual(result[1], 1)
+            self.assertFalse(assumed.exists())
+
+            test_mode = root / "test.jsonl"
+            result = self._process_tweet(
+                test_mode, {"ok": True, "result": {"message_id": 43}}, test=True)
+            self.assertEqual(result[1], 1)
+            self.assertFalse(test_mode.exists())
+
+    def test_article_rich_confirmation_records_x_article(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            queue_path = root / "u_queue.json"
+            ledger_path = root / "sent.jsonl"
+            entry = {
+                "article_id": "777", "tweet_id": "778", "author": "u",
+                "article_title": "A public article", "status": "pending", "attempts": 0,
+                "content": None, "detected_at": datetime.now(timezone.utc).isoformat(),
+            }
+            queue_path.write_text(json.dumps([entry]), encoding="utf-8")
+            with patch.object(twitter_monitor, "ARTICLE_QUEUE_DIR", str(root)), \
+                 patch.object(twitter_monitor, "ARTICLE_CACHE_DIR", str(root / "cache")), \
+                 patch.object(twitter_monitor, "SENT_CONTENT_LEDGER_PATH", str(ledger_path)), \
+                 patch.object(twitter_monitor, "_CROSS_DEDUP_ENABLED", False), \
+                 patch.object(twitter_monitor, "_ARTICLE_SUPERSEDE_ENABLED", False), \
+                 patch.object(twitter_monitor, "learning_feed", None), \
+                 patch.object(twitter_monitor, "fetch_article_markdown",
+                              return_value=("# Article\n\nPublic body", None)), \
+                 patch.object(twitter_monitor, "summarize_article",
+                              return_value=("Public summary", "fake")), \
+                 patch.object(twitter_monitor, "send_telegram_rich",
+                              return_value={"ok": True, "result": {"message_id": 88}}), \
+                 patch.object(twitter_monitor, "delete_article_cache"), \
+                 patch.object(twitter_monitor.time, "sleep", return_value=None):
+                processed = twitter_monitor.process_article_queue(
+                    FakeAI(True), "bot", "-1002", thread_id=19)
+            self.assertEqual(processed, 1)
+            row = json.loads(ledger_path.read_text(encoding="utf-8"))
+            self.assertEqual((row["source_kind"], row["message_id"], row["source_message_ids"]),
+                             ("x_article", 88, [777]))
+            self.assertEqual(row["content_id"], "x-article:777")
+
+    def test_outbound_links_land_in_ledger_and_pushed_index(self):
+        tweet = dict(self.TWEET)
+        tweet["entities"] = {
+            "urls": [
+                {
+                    "url": "https://t.co/glm",
+                    "expanded_url": (
+                        "https://z.ai/blog/glm-built-its-inference-infrastructure"
+                        "?utm_source=x"),
+                },
+                {"url": "https://t.co/abc", "expanded_url": "https://t.co/abc"},
+            ],
+        }
+        expected_links = [
+            "https://z.ai/blog/glm-built-its-inference-infrastructure",
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ledger = root / "confirmed.jsonl"
+            pushed = root / "pushed.json"
+            with patch.object(twitter_monitor, "datetime", FixedDatetime), \
+                 patch.object(twitter_monitor, "SENT_CONTENT_LEDGER_PATH", str(ledger)), \
+                 patch.object(twitter_monitor, "PUSHED_INDEX_PATH", str(pushed)), \
+                 patch.object(twitter_monitor, "_PUSHED_INDEX_CACHE", None), \
+                 patch.object(twitter_monitor, "_EVENT_DEDUP_EFFECTIVE_MODE", "off"), \
+                 patch.object(twitter_monitor, "_CROSS_DEDUP_ENABLED", True), \
+                 patch.object(twitter_monitor, "fetch_tweets", return_value=[tweet]), \
+                 patch.object(twitter_monitor, "load_seen", return_value=({"old"}, None)), \
+                 patch.object(twitter_monitor, "load_push_retry", return_value=set()), \
+                 patch.object(twitter_monitor, "save_seen", return_value=None), \
+                 patch.object(twitter_monitor, "save_push_retry", return_value=None), \
+                 patch.object(twitter_monitor, "send_tweet",
+                              return_value={"ok": True, "result": {"message_id": 42},
+                                            "send_method": "sendMessage"}), \
+                 patch.object(twitter_monitor.time, "sleep", return_value=None):
+                result = twitter_monitor.process_user(
+                    pool=None, ai=FakeAI(False), username="u",
+                    bot_token="b", chat_id="-1001", args=self._args(),
+                    content_chat_id="-1002", content_thread_id=19)
+            self.assertEqual(result[1], 1)
+            row = json.loads(ledger.read_text(encoding="utf-8"))
+            self.assertEqual(row["links"], expected_links)
+            idx = json.loads(pushed.read_text(encoding="utf-8"))
+            entry = idx["entries"]["t:" + tweet["id"]]
+            self.assertEqual(entry["links"], expected_links)
+
+
+class OfficialPushPolicyTest(unittest.TestCase):
+    def classify(self, policy, text, **extra):
+        tweet = {"id": "1", "text": text}
+        tweet.update(extra)
+        return twitter_monitor.classify_official_push(policy, tweet)
+
+    def test_all_official_policies_reject_retweets(self):
+        for policy in twitter_monitor.OFFICIAL_PUSH_POLICIES:
+            with self.subTest(policy=policy):
+                status, reason, event = self.classify(
+                    policy,
+                    "We've reset weekly usage limits for all paid users.",
+                    retweeted_status={"id": "99", "screen_name": "source"},
+                )
+                self.assertEqual((status, event), ("filter", None))
+                self.assertIn("originality", reason)
+
+    def test_claude_dev_reset_and_developer_release_pass(self):
+        self.assertEqual(
+            self.classify(
+                "claude_dev_original",
+                "We've reset 5-hour and weekly rate limits for all users.",
+            )[2],
+            "quota_reset",
+        )
+        self.assertEqual(
+            self.classify(
+                "claude_dev_original",
+                "Claude Code can now run code review with new effort levels.",
+            )[2],
+            "dev_release",
+        )
+
+    def test_claude_dev_quota_policy_announcement_passes(self):
+        # 2026-07-18 实测漏推样本：额度政策公告发在 ClaudeDevs 而非 claudeai
+        status, reason, event = self.classify(
+            "claude_dev_original",
+            "We're also keeping Claude Code weekly limits 50% higher, now through "
+            "August 19, for all Pro, Max, Team, and seat-based Enterprise users.",
+        )
+        self.assertEqual((status, event), ("pass", "quota_policy"))
+
+    def test_claude_dev_promotional_credits_still_filtered(self):
+        self.assertEqual(
+            self.classify(
+                "claude_dev_original",
+                "Compete for weekly API credit prizes in our Claude Code hackathon.",
+            )[0],
+            "filter",
+        )
+
+    def test_claude_dev_non_quota_entitlement_still_filtered(self):
+        # model_access / plan_entitlement 类权益仍归 claudeai，不从 dev 号放行
+        self.assertEqual(
+            self.classify(
+                "claude_dev_original",
+                "Claude Fable is now included in the Max plan.",
+            )[0],
+            "filter",
+        )
+
+    def test_openai_devs_filters_events_but_keeps_codex_features(self):
+        self.assertEqual(
+            self.classify(
+                "openai_dev_original",
+                "Join us for Codex Office Hours and a community showcase.",
+            )[0],
+            "filter",
+        )
+        self.assertEqual(
+            self.classify(
+                "openai_dev_original",
+                "Review pull requests in Codex. Inline code editing lets you update the patch.",
+            )[2],
+            "dev_release",
+        )
+
+    def test_claude_entitlement_does_not_confuse_hackathon_credits(self):
+        self.assertEqual(
+            self.classify(
+                "claude_entitlement_original",
+                "Win $100k API credits in our developer hackathon.",
+            )[0],
+            "filter",
+        )
+        self.assertEqual(
+            self.classify(
+                "claude_entitlement_original",
+                "Starting July 20, Max and Team plans include weekly usage credits.",
+            )[2],
+            "quota_policy",
+        )
+
+    def test_claude_main_model_launch_is_not_misclassified_as_plan_entitlement(self):
+        status, reason, event = self.classify(
+            "claude_entitlement_original",
+            "Introducing Claude Opus 5. It approaches Fable 5 at half the price.",
+        )
+        self.assertEqual((status, reason, event),
+                         ("pass", "policy:model_launch", "model_launch"))
+
+    def test_openai_major_filters_research_and_keeps_model_launch(self):
+        self.assertEqual(
+            self.classify(
+                "openai_major_original",
+                "Our research paper explores new approaches to interpretability.",
+            )[0],
+            "filter",
+        )
+        self.assertEqual(
+            self.classify(
+                "openai_major_original",
+                "Introducing GPT-5.6, now available in ChatGPT, Codex, and the API.",
+            )[2],
+            "model_launch",
+        )
+
+    def test_tibo_completed_resets_pass_and_jokes_fail(self):
+        good = (
+            "We've reset usage limits for all paid users, including Codex and ChatGPT Work."
+        )
+        self.assertEqual(self.classify("codex_quota_original", good)[2], "quota_reset")
+        self.assertEqual(
+            self.classify("codex_quota_original", "Should we reset Codex limits for all paid users?")[0],
+            "filter",
+        )
+        self.assertEqual(
+            self.classify(
+                "codex_quota_original",
+                "Thinking I am about to announce a Codex reset for everyone. But no.",
+            )[0],
+            "filter",
+        )
+        self.assertEqual(
+            self.classify(
+                "codex_quota_original",
+                "If this gets blocked, I owe all Codex users a reset.",
+            )[0],
+            "filter",
+        )
+
+    def test_unknown_policy_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "unknown push_policy"):
+            self.classify("typo_policy", "anything")
 
 
 class BacklogGuardTest(unittest.TestCase):
@@ -68,15 +983,16 @@ class BacklogGuardTest(unittest.TestCase):
             saved["seen"] = seen
             saved["last_post_ts"] = last_post_ts
 
-        def fake_send_telegram(token, chat_id, text, link="", thread_id=None):
-            sent.append(link)
+        def fake_send_tweet(token, chat_id, username, tweet, ai=None, thread_id=None,
+                            reply_to_message_id=None):
+            sent.append(f"https://x.com/{username}/status/{tweet['id']}")
             return {"ok": True}
 
         with patch.object(twitter_monitor, "datetime", FixedDatetime):
             with patch.object(twitter_monitor, "fetch_tweets", return_value=tweets):
                 with patch.object(twitter_monitor, "load_seen", return_value=({"already-seen"}, "2026-05-11T15:00:00+00:00")):
                     with patch.object(twitter_monitor, "save_seen", side_effect=fake_save_seen):
-                        with patch.object(twitter_monitor, "send_telegram", side_effect=fake_send_telegram):
+                        with patch.object(twitter_monitor, "send_tweet", side_effect=fake_send_tweet):
                             with patch.object(twitter_monitor.time, "sleep", return_value=None):
                                 new_count, push_count, filter_count, ai_overridden = twitter_monitor.process_user(
                                     pool=None,
@@ -93,6 +1009,133 @@ class BacklogGuardTest(unittest.TestCase):
         self.assertEqual(ai_overridden, 0)
         self.assertEqual(sent, ["https://x.com/vista8/status/recent-tweet"])
         self.assertEqual(saved["seen"], {"already-seen", "old-tweet", "recent-tweet"})
+
+
+class EventPushWindowTest(unittest.TestCase):
+    """官方号高价值事件按 _push_event_type 覆盖统一 45 分钟新鲜度窗口。"""
+
+    RELEASE_CLASS = (
+        "quota_reset", "quota_compensation", "credit_grant",
+        "dev_release", "model_api", "model_launch", "major_product_launch",
+    )
+    ENTITLEMENT_CLASS = (
+        "quota_policy", "plan_entitlement", "model_access", "permanent_plan_change",
+    )
+
+    def test_no_annotation_keeps_base_window(self):
+        self.assertEqual(twitter_monitor.effective_push_window_minutes({}, 45), 45)
+
+    def test_unknown_event_type_falls_back_to_base(self):
+        t = {"_push_event_type": "mystery_event"}
+        self.assertEqual(twitter_monitor.effective_push_window_minutes(t, 45), 45)
+
+    def test_release_class_events_extend_to_360(self):
+        for event in self.RELEASE_CLASS:
+            with self.subTest(event=event):
+                t = {"_push_event_type": event}
+                self.assertEqual(twitter_monitor.effective_push_window_minutes(t, 45), 360)
+
+    def test_entitlement_class_events_extend_to_1440(self):
+        for event in self.ENTITLEMENT_CLASS:
+            with self.subTest(event=event):
+                t = {"_push_event_type": event}
+                self.assertEqual(twitter_monitor.effective_push_window_minutes(t, 45), 1440)
+
+    def test_event_window_never_shrinks_relaxed_base(self):
+        # seen 损坏安全模式放宽到 1440，事件窗口 360 不得反向缩小
+        t = {"_push_event_type": "quota_reset"}
+        self.assertEqual(twitter_monitor.effective_push_window_minutes(t, 1440), 1440)
+
+    def test_disabled_window_stays_disabled(self):
+        # base <= 0 表示不限龄，事件窗口不得重新收紧
+        t = {"_push_event_type": "quota_policy"}
+        self.assertEqual(twitter_monitor.effective_push_window_minutes(t, 0), 0)
+
+    def test_official_events_survive_beyond_default_window(self):
+        """20h 前的 quota_policy 与 5h 前的 quota_reset 补推；8h 前的 reset 超窗只记 seen。"""
+        # FixedDatetime now = 2026-05-12 00:30 UTC
+        tweets = [
+            {   # quota_policy → 1440min 窗口，20h 前应补推
+                "id": "policy-20h",
+                "text": "Weekly usage limits will be 50% higher for all paid users through August 19.",
+                "createdAt": "Mon May 11 04:30:00 +0000 2026",
+            },
+            {   # quota_reset → 360min 窗口，5h 前应补推
+                "id": "reset-5h",
+                "text": "We've reset 5-hour and weekly rate limits for all users.",
+                "createdAt": "Mon May 11 19:30:00 +0000 2026",
+            },
+            {   # quota_reset 8h 前，超 360min 窗口 → skip stale，只记 seen
+                "id": "reset-8h",
+                "text": "We've reset the weekly rate limits for Pro users after the incident.",
+                "createdAt": "Mon May 11 16:30:00 +0000 2026",
+            },
+        ]
+        args = argparse.Namespace(test=False, seed=False, dry_run=False,
+                                  limit=20, max_push_age_minutes=45)
+        pushed_ids = []
+        saved = {}
+
+        def fake_send_tweet(token, chat_id, username, t, ai=None, thread_id=None,
+                            reply_to_message_id=None):
+            pushed_ids.append(t["id"])
+            return {"ok": True}
+
+        def fake_save_seen(username, seen, last_post_ts=None):
+            saved["seen"] = set(seen)
+
+        with patch.object(twitter_monitor, "datetime", FixedDatetime), \
+             patch.object(twitter_monitor, "_ACCOUNT_CONFIG_BY_USERNAME",
+                          {"officialu": {"push_policy": "claude_dev_original"}}), \
+             patch.object(twitter_monitor, "fetch_tweets", return_value=tweets), \
+             patch.object(twitter_monitor, "load_seen",
+                          return_value=({"already-seen"}, "2026-05-11T00:00:00+00:00")), \
+             patch.object(twitter_monitor, "save_seen", side_effect=fake_save_seen), \
+             patch.object(twitter_monitor, "load_push_retry", return_value=set()), \
+             patch.object(twitter_monitor, "save_push_retry", return_value=None), \
+             patch.object(twitter_monitor, "send_tweet", side_effect=fake_send_tweet), \
+             patch.object(twitter_monitor.time, "sleep", return_value=None):
+            new, pushed, filt, ov = twitter_monitor.process_user(
+                pool=None, ai=FakeAI(False), username="officialu",
+                bot_token="b", chat_id="c", args=args)
+        self.assertEqual(new, 3)
+        self.assertEqual(pushed, 2)
+        self.assertEqual(pushed_ids, ["policy-20h", "reset-5h"])
+        # 超窗的 reset-8h 仍进 seen，不进 push_retry
+        self.assertIn("reset-8h", saved["seen"])
+
+    def test_normal_account_not_extended_by_event_windows(self):
+        """无 push_policy 的普通账号不带事件注解，46 分钟前的推文仍判 stale。"""
+        tweets = [{
+            "id": "plain-46m",
+            "text": "This ordinary tweet is long enough to pass the classifier filters easily.",
+            "createdAt": "Mon May 11 23:44:00 +0000 2026",
+        }]
+        args = argparse.Namespace(test=False, seed=False, dry_run=False,
+                                  limit=20, max_push_age_minutes=45)
+        pushed_ids = []
+
+        def fake_send_tweet(token, chat_id, username, t, ai=None, thread_id=None,
+                            reply_to_message_id=None):
+            pushed_ids.append(t["id"])
+            return {"ok": True}
+
+        with patch.object(twitter_monitor, "datetime", FixedDatetime), \
+             patch.object(twitter_monitor, "_ACCOUNT_CONFIG_BY_USERNAME", {}), \
+             patch.object(twitter_monitor, "fetch_tweets", return_value=tweets), \
+             patch.object(twitter_monitor, "load_seen",
+                          return_value=({"already-seen"}, "2026-05-11T00:00:00+00:00")), \
+             patch.object(twitter_monitor, "save_seen", return_value=None), \
+             patch.object(twitter_monitor, "load_push_retry", return_value=set()), \
+             patch.object(twitter_monitor, "save_push_retry", return_value=None), \
+             patch.object(twitter_monitor, "send_tweet", side_effect=fake_send_tweet), \
+             patch.object(twitter_monitor.time, "sleep", return_value=None):
+            new, pushed, filt, ov = twitter_monitor.process_user(
+                pool=None, ai=FakeAI(False), username="plainu",
+                bot_token="b", chat_id="c", args=args)
+        self.assertEqual(new, 1)
+        self.assertEqual(pushed, 0)
+        self.assertEqual(pushed_ids, [])
 
 
 class AccountIsolationTest(unittest.TestCase):
@@ -385,7 +1428,8 @@ class RichVideoEmbedTest(unittest.TestCase):
         t = self._video_tweet([{"url": "https://video.twimg.com/hi.mp4", "bitrate": 1000}])
         rich_calls, legacy_calls = [], []
 
-        def fake_rich(token, chat_id, markdown="", link="", *, html="", thread_id=None):
+        def fake_rich(token, chat_id, markdown="", link="", *, html="", thread_id=None,
+                      reply_to_message_id=None):
             rich_calls.append(html)
             if "<video" in html:
                 return {"ok": False, "rich_fallback": True, "description": "WEBPAGE_MEDIA_EMPTY"}
@@ -403,26 +1447,32 @@ class RichVideoEmbedTest(unittest.TestCase):
         self.assertIn("<img", rich_calls[1])
         self.assertEqual(legacy_calls, [])          # 不落 HTML
 
-    def test_send_tweet_video_then_second_reject_falls_to_html(self):
+    def test_send_tweet_video_then_second_reject_keeps_poster_photo(self):
         t = self._video_tweet([{"url": "https://video.twimg.com/hi.mp4", "bitrate": 1000}])
-        legacy_calls = []
+        photo_calls, legacy_calls = [], []
 
-        def fake_rich(token, chat_id, markdown="", link="", *, html="", thread_id=None):
+        def fake_rich(token, chat_id, markdown="", link="", *, html="", thread_id=None,
+                      reply_to_message_id=None):
             return {"ok": False, "rich_fallback": True, "description": "nope"}
 
         with patch.object(twitter_monitor, "_head_content_length", return_value=1000), \
              patch.object(twitter_monitor, "send_telegram_rich", side_effect=fake_rich), \
+             patch.object(twitter_monitor, "send_telegram_photo",
+                          side_effect=lambda *a, **k: photo_calls.append((a, k)) or {"ok": True}), \
              patch.object(twitter_monitor, "send_telegram",
                           side_effect=lambda *a, **k: legacy_calls.append(a) or {"ok": True}):
             r = twitter_monitor.send_tweet("b", "c", "u", t, None)
         self.assertTrue(r.get("ok"))
-        self.assertEqual(len(legacy_calls), 1)      # 两级 rich 均拒 → HTML 兜底
+        self.assertEqual(len(photo_calls), 1)       # 两级 rich 均拒 → 保留视频封面
+        self.assertEqual(photo_calls[0][0][2], "https://pbs.twimg.com/thumb/img/abc")
+        self.assertEqual(legacy_calls, [])
 
     def test_send_tweet_ambiguous_video_never_retries(self):
         t = self._video_tweet([{"url": "https://video.twimg.com/hi.mp4", "bitrate": 1000}])
         rich_calls = []
 
-        def fake_rich(token, chat_id, markdown="", link="", *, html="", thread_id=None):
+        def fake_rich(token, chat_id, markdown="", link="", *, html="", thread_id=None,
+                      reply_to_message_id=None):
             rich_calls.append(html)
             return {"ok": True, "assumed_delivered": True}
 
@@ -439,6 +1489,72 @@ class RichVideoEmbedTest(unittest.TestCase):
             _msg, rich, _ = twitter_monitor.format_message("u", t, None)
         self.assertNotIn("<video", rich)
         self.assertIn("▶️ 视频", rich)
+
+
+class StripAnsiTest(unittest.TestCase):
+    """ANSI escape codes from colored CLI stderr must not reach TG alerts."""
+
+    def test_strip_ansi_removes_sgr_bold(self):
+        raw = "\x1b[1mgrok-4.5[1M]\x1b[22m failed"
+        self.assertEqual(twitter_monitor.strip_ansi(raw), "grok-4.5[1M] failed")
+
+    def test_strip_ansi_removes_colors_and_keeps_text(self):
+        raw = "\x1b[31mERROR\x1b[0m: boom \x1b[1mbold\x1b[22m"
+        self.assertEqual(twitter_monitor.strip_ansi(raw), "ERROR: boom bold")
+
+    def test_strip_ansi_none_and_empty(self):
+        self.assertEqual(twitter_monitor.strip_ansi(""), "")
+        self.assertEqual(twitter_monitor.strip_ansi(None), "")
+
+    def test_fetch_article_markdown_failure_strips_ansi_from_cli_stderr(self):
+        colored = "\x1b[31mfetch failed\x1b[0m: cookie expired"
+        entry = {
+            "article_id": "123",
+            "author": "dotey",
+            "tweet_id": "999",
+        }
+        fake = argparse.Namespace(
+            returncode=1, stdout="", stderr=colored,
+        )
+        with patch.object(twitter_monitor, "load_article_markdown_cmd",
+                          return_value="/usr/local/bin/x-article-to-markdown"), \
+             patch.object(twitter_monitor.subprocess, "run", return_value=fake):
+            md, err = twitter_monitor.fetch_article_markdown("dotey", entry)
+        self.assertIsNone(md)
+        self.assertTrue(err.startswith("markdown_fetch_failed:"))
+        self.assertNotIn("\x1b", err)
+        self.assertNotIn("[31m", err)
+        self.assertNotIn("[0m", err)
+        self.assertIn("fetch failed: cookie expired", err)
+
+    def test_format_article_failure_message_reason_has_no_ansi(self):
+        entry = {
+            "article_id": "123",
+            "author": "dotey",
+            "article_title": "t",
+            "attempts": 1,
+            "failed_stage": "fetch",
+        }
+        reason = "markdown_fetch_failed:\x1b[1mbad\x1b[22m"
+        msg, _ = twitter_monitor.format_article_failure_message("dotey", entry, reason)
+        self.assertNotIn("\x1b", msg)
+        self.assertNotIn("[1m", msg)
+        self.assertNotIn("[22m", msg)
+        self.assertIn("markdown_fetch_failed:bad", msg)
+
+    def test_note_account_failure_strips_ansi_in_stored_and_alert(self):
+        failures = {}
+        err = "HTTP 401: \x1b[31munauthorized\x1b[0m"
+        with patch.object(twitter_monitor, "send_telegram",
+                          return_value={"ok": True, "result": {"message_id": 1}}) as send, \
+             patch.object(twitter_monitor, "_tg_post_quiet", return_value={"ok": True}), \
+             patch.object(twitter_monitor, "FAIL_ALERT_THRESHOLD", 1):
+            twitter_monitor.note_account_failure(
+                failures, "dotey", err, "tok", "chat", dry_run=False)
+        self.assertEqual(failures["dotey"]["last_error"], "HTTP 401: unauthorized")
+        sent_text = send.call_args[0][2]
+        self.assertNotIn("\x1b", sent_text)
+        self.assertIn("HTTP 401: unauthorized", sent_text)
 
 
 class StripMediaTcoTest(unittest.TestCase):
@@ -473,16 +1589,100 @@ class StripMediaTcoTest(unittest.TestCase):
         self.assertIn("https://t.co/REALLINK", msg)
         self.assertNotIn("https://t.co/MEDIALINK", msg)
 
-    def test_no_strip_without_photo_media(self):
-        # 没有 photo 媒体（纯文字 / 仅视频）→ 不触发剥离，正文里的 t.co 原样保留
+    def test_no_strip_without_media(self):
+        # 没有任何媒体（t['media'] 缺失，GraphQL 未提取到）→ 门控不成立，不剥，
+        # 正文里的 t.co 原样保留
         t = {"id": "3",
              "text": "分享一个链接 https://t.co/PLAINLINK",
              "extended_entities": {"media": [
                  {"type": "photo", "url": "https://t.co/PLAINLINK",
                   "media_url_https": "https://pbs.twimg.com/media/p.jpg"}]}}
-        # 注意：t['media'] 缺失（GraphQL 未提取到 photo）→ 门控不成立，不剥
         _msg, rich, _ = twitter_monitor.format_message("vista8", t, None)
         self.assertIn("https://t.co/PLAINLINK", rich)
+
+    def test_media_tco_stripped_for_video_tweet(self):
+        # 视频推文（2026-07-13 修复）：视频已嵌 rich 媒体块（可播放 video 或封面+时长），
+        # 正文尾部的媒体 t.co 同样冗余，必须剥掉——此前门控只认 photo，视频推文漏剥。
+        t = {"id": "4",
+             "text": "新版的ChatGPT对话学英语 https://t.co/VIDEOLINK",
+             "media": [{"type": "video", "url": "https://pbs.twimg.com/cover.jpg",
+                        "duration_ms": 67000}],
+             "extended_entities": {"media": [
+                 {"type": "video", "url": "https://t.co/VIDEOLINK",
+                  "media_url_https": "https://pbs.twimg.com/cover.jpg"}]}}
+        with patch.object(twitter_monitor, "_RICH_VIDEO_ENABLED", False):
+            msg, rich, _ = twitter_monitor.format_message("vista8", t, None)
+        self.assertNotIn("https://t.co/VIDEOLINK", msg)   # HTML 回退不含媒体裸链
+        self.assertNotIn("https://t.co/VIDEOLINK", rich)  # rich 也不含
+        self.assertIn("新版的ChatGPT对话学英语", rich)      # 正文其余部分保留
+
+    def test_user_shared_tco_expanded_to_real_url(self):
+        # 用户主动分享的链接（entities.urls）：t.co 还原为 expanded_url，而不是保留
+        # 不透明短链，也不能误删（2026-07-13 第二形态：vista8 QMReader 推文）。
+        t = {"id": "5",
+             "text": "介绍视频不错。\n\nhttps://t.co/SHARELINK https://t.co/VIDEOLINK",
+             "media": [{"type": "video", "url": "https://pbs.twimg.com/cover.jpg",
+                        "duration_ms": 62000}],
+             "entities": {"urls": [
+                 {"url": "https://t.co/SHARELINK",
+                  "expanded_url": "https://rss.example.ai/",
+                  "display_url": "rss.example.ai"}]},
+             "extended_entities": {"media": [
+                 {"type": "video", "url": "https://t.co/VIDEOLINK",
+                  "media_url_https": "https://pbs.twimg.com/cover.jpg"}]}}
+        with patch.object(twitter_monitor, "_RICH_VIDEO_ENABLED", False):
+            msg, rich, _ = twitter_monitor.format_message("vista8", t, None)
+        for out in (msg, rich):
+            self.assertNotIn("https://t.co/SHARELINK", out)  # 短链不裸露
+            self.assertIn("https://rss.example.ai/", out)     # 换成真实 URL
+            self.assertNotIn("https://t.co/VIDEOLINK", out)  # 媒体短链仍剥掉
+
+    def test_shared_url_is_explicit_clickable_anchor_with_media(self):
+        t = {"id": "5a", "text": "开源地址 https://t.co/SHARELINK",
+             "entities": {"urls": [{
+                 "url": "https://t.co/SHARELINK",
+                 "expanded_url": "https://github.com/joeseesun/qiaomu-youtube-download",
+                 "display_url": "github.com/joeseesun/qiaomu-youtube-download"}]},
+             "media": [{"type": "photo", "url": "https://pbs.twimg.com/media/p1.jpg"}]}
+        msg, rich, _ = twitter_monitor.format_message("vista8", t, None)
+        anchor = ('<a href="https://github.com/joeseesun/qiaomu-youtube-download">'
+                  'github.com/joeseesun/qiaomu-youtube-download</a>')
+        self.assertIn(anchor, msg)
+        self.assertIn(anchor, rich)
+        self.assertIn('<img src="https://pbs.twimg.com/media/p1.jpg"/>', rich)
+
+    def test_unsafe_entity_destination_is_not_rendered_as_anchor(self):
+        t = {"id": "5b", "text": "不要打开 https://t.co/BADLINK",
+             "entities": {"urls": [{"url": "https://t.co/BADLINK",
+                                      "expanded_url": "javascript:alert(1)"}]}}
+        msg, rich, _ = twitter_monitor.format_message("vista8", t, None)
+        self.assertNotIn('<a href="javascript:', msg)
+        self.assertNotIn('<a href="javascript:', rich)
+        self.assertEqual(twitter_monitor._primary_external_url(t), "")
+
+    def test_link_label_is_escaped_and_capped(self):
+        t = {"id": "5c", "text": "链接 https://t.co/LABEL",
+             "entities": {"urls": [{
+                 "url": "https://t.co/LABEL", "expanded_url": "https://example.com/post",
+                 "display_url": "<b>not markup</b>" + "x" * 600}]}}
+        _msg, rich, _ = twitter_monitor.format_message("vista8", t, None)
+        self.assertNotIn("<b>not markup</b>", rich)
+        self.assertIn("&lt;b&gt;not markup&lt;/b&gt;", rich)
+        self.assertLessEqual(len(twitter_monitor._tweet_link_replacements(t)["https://t.co/LABEL"][1]),
+                             512)
+
+    def test_note_tweet_urls_expanded(self):
+        # 长推（note_tweet）里的分享短链也要用 note_tweet.entities.urls 还原
+        t = {"id": "6",
+             "text": "壳截断…",
+             "note_tweet": {"text": "长文正文，推荐 https://t.co/NOTELINK 这篇。",
+                             "entities": {"urls": [
+                                 {"url": "https://t.co/NOTELINK",
+                                  "expanded_url": "https://blog.example.com/post"}]}}}
+        msg, rich, _ = twitter_monitor.format_message("vista8", t, None)
+        for out in (msg, rich):
+            self.assertNotIn("https://t.co/NOTELINK", out)
+            self.assertIn("https://blog.example.com/post", out)
 
     def test_rt_reconstructed_text_strips_media_tco(self):
         # 转推重建全文时媒体 t.co 也要剥离：normalizer 把 entities/extended_entities
@@ -565,6 +1765,29 @@ class LatentFixRegressionTest(unittest.TestCase):
             ids = [t["id"] for t in tg.fetch_tweets("dotey", limit=20)]
         self.assertIn("100", ids)
         self.assertIn("200", ids)
+
+    def test_timeline_modules_are_flattened(self):
+        """Thread-heavy accounts can return only TimelineTimelineModule entries."""
+        import json as _json
+        import twitter_graphql as tg
+        def item(tweet_id, text):
+            return {"item": {"itemContent": {"tweet_results": {"result": {
+                "__typename": "Tweet",
+                "legacy": {"id_str": tweet_id, "full_text": text,
+                           "created_at": "Sat Jul 18 02:14:43 +0000 2026"},
+            }}}}}
+        synthetic = {"data": {"user": {"result": {"timeline_v2": {"timeline": {
+            "instructions": [{"entries": [{"content": {
+                "entryType": "TimelineTimelineModule",
+                "items": [item("301", "thread root"), item("302", "self reply")],
+            }}]}],
+        }}}}}}
+        with patch.object(tg, "_auth_headers", lambda: None), \
+             patch.object(tg, "_get_guest_token", lambda: "gt"), \
+             patch.object(tg, "get_user_id", lambda u: "123"), \
+             patch.object(tg, "_curl", lambda *a, **k: _json.dumps(synthetic)):
+            tweets = tg.fetch_tweets("claudeai", limit=20)
+        self.assertEqual([t["id"] for t in tweets], ["301", "302"])
 
 
 class ArticleQueuePruneTest(unittest.TestCase):
@@ -788,6 +2011,37 @@ class RetweetReconstructTest(unittest.TestCase):
         self.assertEqual(t["text"], "RT @orig: 原推完整正文一句话示意")
         self.assertNotIn("note_tweet", t)
         self.assertEqual(t.get("media", []), [])
+
+
+class NoteTweetEntityNormalizationTest(unittest.TestCase):
+    """Long-form URL entities must survive GraphQL normalization into rendering."""
+
+    def test_original_note_entity_becomes_clickable_link(self):
+        import json as _json
+        import twitter_graphql as tg
+        short = "https://t.co/NOTELINK"
+        raw = {
+            "__typename": "Tweet",
+            "legacy": {"id_str": "777", "full_text": "壳文本",
+                       "created_at": "Fri Jun 05 17:30:00 +0000 2026", "entities": {"urls": []}},
+            "note_tweet": {"note_tweet_results": {"result": {
+                "text": "完整长文推荐 " + short,
+                "entity_set": {"urls": [{
+                    "url": short, "expanded_url": "https://blog.example.com/post",
+                    "display_url": "blog.example.com/post"}]},
+            }}},
+        }
+        synthetic = {"data": {"user": {"result": {"timeline_v2": {"timeline": {"instructions": [
+            {"entries": [{"content": {"itemContent": {"tweet_results": {"result": raw}}}}]},
+        ]}}}}}}
+        with patch.object(tg, "_auth_headers", lambda: None), \
+             patch.object(tg, "_get_guest_token", lambda: "gt"), \
+             patch.object(tg, "get_user_id", lambda u: "1"), \
+             patch.object(tg, "_curl", lambda *a, **k: _json.dumps(synthetic)):
+            tweet = tg.fetch_tweets("vista8", limit=20)[0]
+        self.assertEqual(tweet["note_tweet"]["entities"]["urls"][0]["url"], short)
+        _msg, rich, _ = twitter_monitor.format_message("vista8", tweet)
+        self.assertIn('<a href="https://blog.example.com/post">blog.example.com/post</a>', rich)
 
 
 class QuoteArticleTest(unittest.TestCase):
@@ -1223,7 +2477,8 @@ class RichPushTest(unittest.TestCase):
             calls["rich_mds"].append(markdown_)
             return responses[min(calls["rich"] - 1, len(responses) - 1)]
 
-        def fake_legacy(token, chat_id, text, link="", thread_id=None):
+        def fake_legacy(token, chat_id, text, link="", thread_id=None,
+                        reply_to_message_id=None):
             calls["legacy"] += 1
             return {"ok": True, "result": {"message_id": 999}}
 
@@ -1360,14 +2615,17 @@ class PushCountTest(unittest.TestCase):
         args = argparse.Namespace(test=False, seed=False, dry_run=False,
                                   limit=20, max_push_age_minutes=45)
 
-        def flaky_send(token, chat_id, text, link="", thread_id=None):
-            return {"ok": "t2" not in text and "t2" not in link}
+        def flaky_send(token, chat_id, username, tweet, ai=None, thread_id=None,
+                       reply_to_message_id=None):
+            return {"ok": tweet["id"] != "t2"}
 
         with patch.object(twitter_monitor, "datetime", FixedDatetime), \
              patch.object(twitter_monitor, "fetch_tweets", return_value=tweets), \
              patch.object(twitter_monitor, "load_seen", return_value=({"old"}, None)), \
              patch.object(twitter_monitor, "save_seen", return_value=None), \
-             patch.object(twitter_monitor, "send_telegram", side_effect=flaky_send), \
+             patch.object(twitter_monitor, "load_push_retry", return_value=set()), \
+             patch.object(twitter_monitor, "save_push_retry", return_value=None), \
+             patch.object(twitter_monitor, "send_tweet", side_effect=flaky_send), \
              patch.object(twitter_monitor.time, "sleep", return_value=None):
             new, pushed, _f, _a = twitter_monitor.process_user(
                 pool=None, ai=FakeAI(False), username="u",
@@ -1755,12 +3013,14 @@ class SendTweetTest(unittest.TestCase):
     def test_rich_success_skips_html_fallback(self):
         calls = {"rich": 0, "legacy": 0, "html": ""}
 
-        def fake_rich(token, chat_id, markdown="", link="", *, html="", thread_id=None):
+        def fake_rich(token, chat_id, markdown="", link="", *, html="", thread_id=None,
+                      reply_to_message_id=None):
             calls["rich"] += 1
             calls["html"] = html
             return {"ok": True, "result": {"message_id": 1}}
 
-        def fake_legacy(token, chat_id, text, link="", thread_id=None):
+        def fake_legacy(token, chat_id, text, link="", thread_id=None,
+                        reply_to_message_id=None):
             calls["legacy"] += 1
             return {"ok": True}
 
@@ -1775,10 +3035,12 @@ class SendTweetTest(unittest.TestCase):
     def test_rich_rejected_falls_back_to_html(self):
         calls = {"legacy": 0}
 
-        def fake_rich(token, chat_id, markdown="", link="", *, html="", thread_id=None):
+        def fake_rich(token, chat_id, markdown="", link="", *, html="", thread_id=None,
+                      reply_to_message_id=None):
             return {"ok": False, "rich_fallback": True}
 
-        def fake_legacy(token, chat_id, text, link="", thread_id=None):
+        def fake_legacy(token, chat_id, text, link="", thread_id=None,
+                        reply_to_message_id=None):
             calls["legacy"] += 1
             return {"ok": True, "result": {"message_id": 2}}
 
@@ -1792,10 +3054,12 @@ class SendTweetTest(unittest.TestCase):
         # ok=False 但非 rich_fallback（如 429 重试穷尽）→ 直接返回，不二次发送
         calls = {"legacy": 0}
 
-        def fake_rich(token, chat_id, markdown="", link="", *, html="", thread_id=None):
+        def fake_rich(token, chat_id, markdown="", link="", *, html="", thread_id=None,
+                      reply_to_message_id=None):
             return {"ok": False}
 
-        def fake_legacy(token, chat_id, text, link="", thread_id=None):
+        def fake_legacy(token, chat_id, text, link="", thread_id=None,
+                        reply_to_message_id=None):
             calls["legacy"] += 1
             return {"ok": True}
 
@@ -1810,12 +3074,14 @@ class SendTweetTest(unittest.TestCase):
         # 所以 send_tweet 仍走 rich，不会产出超限内容
         calls = {"rich": 0, "legacy": 0, "html_len": 0}
 
-        def fake_rich(token, chat_id, markdown="", link="", *, html="", thread_id=None):
+        def fake_rich(token, chat_id, markdown="", link="", *, html="", thread_id=None,
+                      reply_to_message_id=None):
             calls["rich"] += 1
             calls["html_len"] = len(html)
             return {"ok": True}
 
-        def fake_legacy(token, chat_id, text, link="", thread_id=None):
+        def fake_legacy(token, chat_id, text, link="", thread_id=None,
+                        reply_to_message_id=None):
             calls["legacy"] += 1
             return {"ok": True}
 
@@ -1826,6 +3092,144 @@ class SendTweetTest(unittest.TestCase):
         self.assertEqual(calls["rich"], 1)
         self.assertEqual(calls["legacy"], 0)
         self.assertLessEqual(calls["html_len"], twitter_monitor.RICH_MESSAGE_MAX_CHARS)
+
+    def test_text_only_external_link_uses_standard_preview_path(self):
+        calls = {"rich": 0, "legacy": 0, "preview_url": "", "link": ""}
+        tweet = {
+            "id": "10", "text": "推荐 https://t.co/EXTERNAL",
+            "entities": {"urls": [{
+                "url": "https://t.co/EXTERNAL",
+                "expanded_url": "https://example.com/post",
+                "display_url": "example.com/post"}]},
+        }
+
+        def fake_rich(*args, **kwargs):
+            calls["rich"] += 1
+            return {"ok": True}
+
+        def fake_legacy(token, chat_id, text, link="", *, preview_url="", thread_id=None,
+                        reply_to_message_id=None):
+            calls["legacy"] += 1
+            calls["preview_url"] = preview_url
+            calls["link"] = link
+            return {"ok": True}
+
+        with patch.object(twitter_monitor, "send_telegram_rich", side_effect=fake_rich), \
+             patch.object(twitter_monitor, "send_telegram", side_effect=fake_legacy):
+            r = twitter_monitor.send_tweet("tok", "42", "vista8", tweet)
+        self.assertTrue(r["ok"])
+        self.assertEqual(calls["rich"], 0)
+        self.assertEqual(calls["legacy"], 1)
+        self.assertEqual(calls["preview_url"], "https://example.com/post")
+        self.assertEqual(calls["link"], "https://x.com/vista8/status/10")
+
+    def test_unrenderable_media_does_not_suppress_external_preview(self):
+        tweet = {
+            "id": "11", "text": "推荐 https://t.co/EXTERNAL",
+            "entities": {"urls": [{"url": "https://t.co/EXTERNAL",
+                                      "expanded_url": "https://example.com/post"}]},
+            "media": [{"type": "photo", "url": "http://invalid.example/photo.jpg"}],
+        }
+        calls = {"rich": 0, "legacy": 0}
+
+        def fake_legacy(*args, **kwargs):
+            calls["legacy"] += 1
+            self.assertEqual(kwargs["preview_url"], "https://example.com/post")
+            return {"ok": True}
+
+        with patch.object(twitter_monitor, "send_telegram_rich",
+                          side_effect=lambda *a, **k: calls.__setitem__("rich", calls["rich"] + 1)), \
+             patch.object(twitter_monitor, "send_telegram", side_effect=fake_legacy):
+            r = twitter_monitor.send_tweet("tok", "42", "vista8", tweet)
+        self.assertTrue(r["ok"])
+        self.assertEqual(calls, {"rich": 0, "legacy": 1})
+
+    def test_rich_media_rejection_keeps_photo_external_anchor_and_x_button(self):
+        tweet = {
+            "id": "12", "text": "开源地址 https://t.co/EXTERNAL",
+            "entities": {"urls": [{
+                "url": "https://t.co/EXTERNAL",
+                "expanded_url": "https://github.com/joeseesun/qiaomu-youtube-download",
+                "display_url": "github.com/joeseesun/qiaomu-youtube-download",
+            }]},
+            "media": [{"type": "photo", "url": "https://pbs.twimg.com/media/original.jpg"}],
+        }
+        calls = {"rich": 0, "photo": [], "legacy": 0}
+
+        def fake_photo(token, chat_id, photo, caption="", link="", *, thread_id=None,
+                       reply_to_message_id=None):
+            calls["photo"].append({"photo": photo, "caption": caption,
+                                   "link": link, "thread_id": thread_id})
+            return {"ok": True, "result": {"message_id": 12}}
+
+        with patch.object(twitter_monitor, "send_telegram_rich",
+                          side_effect=lambda *a, **k: calls.__setitem__("rich", calls["rich"] + 1)
+                          or {"ok": False, "rich_fallback": True}), \
+             patch.object(twitter_monitor, "send_telegram_photo", side_effect=fake_photo), \
+             patch.object(twitter_monitor, "send_telegram",
+                          side_effect=lambda *a, **k: calls.__setitem__("legacy", calls["legacy"] + 1)
+                          or {"ok": True}):
+            r = twitter_monitor.send_tweet("tok", "42", "vista8", tweet, thread_id=19)
+
+        self.assertTrue(r["ok"])
+        self.assertEqual(calls["rich"], 1)
+        self.assertEqual(calls["legacy"], 0)
+        self.assertEqual(len(calls["photo"]), 1)
+        sent = calls["photo"][0]
+        self.assertEqual(sent["photo"], "https://pbs.twimg.com/media/original.jpg")
+        self.assertIn('href="https://github.com/joeseesun/qiaomu-youtube-download"',
+                      sent["caption"])
+        self.assertEqual(sent["link"], "https://x.com/vista8/status/12")
+        self.assertEqual(sent["thread_id"], 19)
+
+    def test_rejected_photo_falls_back_to_full_html_text(self):
+        tweet = {"id": "13", "text": "带图正文", "media": [
+            {"type": "photo", "url": "https://pbs.twimg.com/media/original.jpg"}]}
+        calls = {"photo": 0, "legacy": 0}
+
+        def fake_legacy(token, chat_id, text, link="", *, preview_url="", thread_id=None,
+                        reply_to_message_id=None):
+            calls["legacy"] += 1
+            self.assertIn("带图正文", text)
+            self.assertEqual(link, "https://x.com/vista8/status/13")
+            return {"ok": True}
+
+        with patch.object(twitter_monitor, "send_telegram_rich",
+                          return_value={"ok": False, "rich_fallback": True}), \
+             patch.object(twitter_monitor, "send_telegram_photo",
+                          side_effect=lambda *a, **k: calls.__setitem__("photo", calls["photo"] + 1)
+                          or {"ok": False, "photo_fallback": True, "description": "bad image"}), \
+             patch.object(twitter_monitor, "send_telegram", side_effect=fake_legacy):
+            r = twitter_monitor.send_tweet("tok", "42", "vista8", tweet)
+
+        self.assertTrue(r["ok"])
+        self.assertEqual(calls, {"photo": 1, "legacy": 1})
+
+    def test_photo_caption_stays_inside_caption_budget_with_external_link(self):
+        tweet = {
+            "text": "🐍" * 1200 + " https://t.co/EXTERNAL",
+            "entities": {"urls": [{
+                "url": "https://t.co/EXTERNAL", "expanded_url": "https://example.com/post",
+                "display_url": "example.com/post"}]},
+        }
+        caption = twitter_monitor._tweet_photo_caption(
+            "📢 @vista8\n\n" + twitter_monitor._render_tweet_urls(tweet["text"], tweet, rich=False), tweet)
+        self.assertLessEqual(len(twitter_monitor._html_to_plain(caption).encode("utf-16-le")) // 2,
+                             twitter_monitor.PHOTO_CAPTION_MAX_UTF16)
+        self.assertIn('href="https://example.com/post"', caption)
+
+    def test_send_telegram_keeps_x_button_but_previews_external_url(self):
+        captured = []
+        with patch.object(twitter_monitor, "_tg_post",
+                          side_effect=lambda token, payload, method="sendMessage": captured.append(payload) or {"ok": True}):
+            r = twitter_monitor.send_telegram(
+                "tok", "42", '<a href="https://example.com/post">example.com/post</a>',
+                "https://x.com/vista8/status/10", preview_url="https://example.com/post")
+        self.assertTrue(r["ok"])
+        payload = captured[0]
+        self.assertEqual(payload["link_preview_options"]["url"], "https://example.com/post")
+        self.assertEqual(payload["reply_markup"]["inline_keyboard"][0][0]["url"],
+                         "https://x.com/vista8/status/10")
 
 
 class _FakeBackend:
@@ -1838,6 +3242,26 @@ class _FakeBackend:
         if self._exc:
             raise self._exc
         return self._result
+
+    def complete_with_images(self, prompt, images, max_tokens=1200, temperature=0.2):
+        if self._exc:
+            raise self._exc
+        return self._result
+
+    def classify(self, username, text):
+        if self._exc:
+            raise self._exc
+        return False, self._result or ""
+
+    def classify_musing(self, username, text):
+        if self._exc:
+            raise self._exc
+        return False, self._result or ""
+
+
+def _http_error(code, body, reason="Forbidden"):
+    return urllib.error.HTTPError(
+        "http://example.test/v1", code, reason, {}, io.BytesIO(body.encode("utf-8")))
 
 
 class AIClassifierCompleteTest(unittest.TestCase):
@@ -1870,6 +3294,266 @@ class AIClassifierCompleteTest(unittest.TestCase):
             _FakeBackend("gemini", result="ok"),
         ])
         self.assertEqual(ai.complete("p"), ("ok", "gemini"))
+
+    def test_http_403_body_surfaced_instead_of_all_ai_failed(self):
+        body = json.dumps({
+            "error": {
+                "code": 403,
+                "message": "Your project has been denied access. Please contact support.",
+                "status": "PERMISSION_DENIED",
+            }
+        })
+        ai = twitter_monitor.AIClassifier([
+            _FakeBackend("gemini", exc=_http_error(403, body)),
+        ])
+        text, reason = ai.complete("p")
+        self.assertIsNone(text)
+        self.assertNotEqual(reason, "all_ai_failed")
+        self.assertIn("gemini:http_403", reason)
+        self.assertIn("PERMISSION_DENIED", reason)
+        self.assertIn("denied access", reason)
+
+    def test_http_403_body_surfaced_for_vision_complete(self):
+        body = json.dumps({
+            "error": {"code": "permission_denied", "message": "project denied"}
+        })
+        ai = twitter_monitor.AIClassifier([
+            _FakeBackend("gemini", exc=_http_error(403, body)),
+        ])
+        text, reason = ai.complete_with_images("p", [])
+        self.assertIsNone(text)
+        self.assertIn("gemini:http_403", reason)
+        self.assertIn("project denied", reason)
+        self.assertNotEqual(reason, "all_image_ai_failed")
+
+    def test_format_ai_backend_error_reads_http_body(self):
+        err = twitter_monitor.format_ai_backend_error(
+            "gemini", _http_error(403, '{"error":{"status":"PERMISSION_DENIED","message":"nope"}}'))
+        self.assertEqual(err, "gemini:http_403:PERMISSION_DENIED: nope")
+
+    def test_provider_auth_failure_helper(self):
+        self.assertTrue(twitter_monitor._is_ai_provider_auth_failure(
+            "gemini:http_403:PERMISSION_DENIED: nope"))
+        self.assertFalse(twitter_monitor._is_ai_provider_auth_failure("all_ai_failed"))
+        self.assertFalse(twitter_monitor._is_ai_provider_auth_failure(
+            "gemini:http_429:RESOURCE_EXHAUSTED"))
+
+    def test_ai_call_failed_covers_http_and_exhausted(self):
+        self.assertTrue(twitter_monitor._is_ai_call_failed("all_ai_failed"))
+        self.assertTrue(twitter_monitor._is_ai_call_failed(
+            "gemini:http_403:PERMISSION_DENIED: nope"))
+        self.assertTrue(twitter_monitor._is_ai_call_failed("gemini:http_429:RESOURCE_EXHAUSTED"))
+        self.assertFalse(twitter_monitor._is_ai_call_failed("gemini:not_promo"))
+
+
+class GeminiApiBaseGuardTest(unittest.TestCase):
+    """Gemini backends must never fall back to Google's official endpoint."""
+
+    def test_empty_api_base_rejected(self):
+        with self.assertRaises(ValueError) as ctx:
+            twitter_monitor.resolve_gemini_api_base("")
+        self.assertNotIn("generativelanguage.googleapis.com/v1beta/models", str(ctx.exception))
+
+    def test_google_direct_url_rejected(self):
+        with self.assertRaises(ValueError):
+            twitter_monitor.resolve_gemini_api_base(
+                "https://generativelanguage.googleapis.com/v1beta")
+        self.assertTrue(twitter_monitor.is_direct_google_gemini_base(
+            "https://generativelanguage.googleapis.com/v1beta"))
+        self.assertFalse(twitter_monitor.is_direct_google_gemini_base(
+            "http://100.71.254.40:8317/v1beta"))
+
+    def test_backend_init_rejects_google_default(self):
+        with self.assertRaises(ValueError):
+            twitter_monitor.AIBackend("gemini", "", "k", "gemini-3.7-flash-high", "gemini")
+        with self.assertRaises(ValueError):
+            twitter_monitor.AIBackend(
+                "gemini",
+                "https://generativelanguage.googleapis.com/v1beta",
+                "k",
+                "gemini-3.7-flash-high",
+                "gemini",
+            )
+
+    def test_generate_url_uses_configured_proxy_only(self):
+        backend = twitter_monitor.AIBackend(
+            "gemini",
+            "http://127.0.0.1:8317/v1beta",
+            "proxy-key",
+            "gemini-3.7-flash-high",
+            "gemini",
+        )
+        url = backend._gemini_generate_url()
+        self.assertTrue(url.startswith("http://127.0.0.1:8317/v1beta/models/"))
+        self.assertIn("generateContent", url)
+        self.assertNotIn("generativelanguage.googleapis.com", url)
+
+    def test_load_skips_google_direct_and_missing_api_base(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "twitter_ai.json")
+            with open(path, "w") as f:
+                json.dump({
+                    "backends": [
+                        {
+                            "name": "google-dead",
+                            "type": "gemini",
+                            "api_base": "https://generativelanguage.googleapis.com/v1beta",
+                            "api_key": "k",
+                            "model": "gemini-3.5-flash",
+                        },
+                        {
+                            "name": "no-base",
+                            "type": "gemini",
+                            "api_key": "k",
+                            "model": "gemini-3.7-flash-high",
+                        },
+                        {
+                            "name": "cliproxy",
+                            "type": "gemini",
+                            "api_base": "http://127.0.0.1:8317/v1beta",
+                            "api_key": "k",
+                            "model": "gemini-3.7-flash-high",
+                        },
+                    ]
+                }, f)
+            with patch.object(twitter_monitor, "AI_CONFIG_PATH", path):
+                ai = twitter_monitor.AIClassifier.load()
+        self.assertEqual([b.name for b in ai._backends], ["cliproxy"])
+        self.assertEqual(ai._backends[0].api_base, "http://127.0.0.1:8317/v1beta")
+
+    def test_article_model_overrides_only_article_backends(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "twitter_ai.json")
+            with open(path, "w") as f:
+                json.dump({
+                    "backends": [{
+                        "name": "cliproxy",
+                        "type": "gemini",
+                        "api_base": "http://127.0.0.1:8317/v1beta",
+                        "api_key": "k",
+                        "model": "gemini-3.7-flash-high",
+                        "timeout": 45,
+                    }],
+                    "article_model": "gemini-3.8-flash-high",
+                }, f)
+            with patch.object(twitter_monitor, "AI_CONFIG_PATH", path):
+                ai = twitter_monitor.AIClassifier.load()
+        self.assertEqual(ai._backends[0].model, "gemini-3.7-flash-high")
+        article_ai = ai.for_articles()
+        self.assertIsNot(article_ai, ai)
+        self.assertEqual(article_ai._backends[0].model, "gemini-3.8-flash-high")
+        self.assertEqual(article_ai._backends[0].api_base, "http://127.0.0.1:8317/v1beta")
+        self.assertEqual(article_ai._backends[0].timeout, 45)
+        url = article_ai._backends[0]._gemini_generate_url()
+        self.assertIn("/models/gemini-3.8-flash-high:generateContent", url)
+        self.assertNotIn("gemini-3.7-flash-high", url)
+
+    def test_without_article_model_for_articles_reuses_classifier(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "twitter_ai.json")
+            with open(path, "w") as f:
+                json.dump({
+                    "backends": [{
+                        "name": "cliproxy",
+                        "type": "gemini",
+                        "api_base": "http://127.0.0.1:8317/v1beta",
+                        "api_key": "k",
+                        "model": "gemini-3.7-flash-high",
+                    }]
+                }, f)
+            with patch.object(twitter_monitor, "AI_CONFIG_PATH", path):
+                ai = twitter_monitor.AIClassifier.load()
+        self.assertIs(ai.for_articles(), ai)
+
+
+class AIKeyResolveTest(unittest.TestCase):
+    def test_api_key_file_used_when_inline_empty(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "device.key")
+            with open(path, "w") as f:
+                f.write("sk-cpa-test-key\n")
+            self.assertEqual(
+                twitter_monitor.resolve_ai_api_key({"api_key_file": path}),
+                "sk-cpa-test-key")
+
+    def test_inline_key_wins_over_file(self):
+        self.assertEqual(
+            twitter_monitor.resolve_ai_api_key({
+                "api_key": "inline",
+                "api_key_file": "/no/such/file",
+            }),
+            "inline")
+
+
+class ArticleAIHttpFailureTest(unittest.TestCase):
+    def test_queue_surfaces_http_403_and_does_not_burn_attempts(self):
+        reason = "gemini:http_403:PERMISSION_DENIED: Your project has been denied access."
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            qpath = root / "u_queue.json"
+            entry = {
+                "article_id": "2095047892482609152",
+                "tweet_id": "1",
+                "author": "Khazix0918",
+                "article_title": "T",
+                "status": "pending",
+                "attempts": 0,
+                "content": None,
+                "detected_at": datetime.now(timezone.utc).isoformat(),
+            }
+            qpath.write_text(json.dumps([entry]), encoding="utf-8")
+            sent = []
+
+            def capture_send(*args, **kwargs):
+                sent.append(args[2] if len(args) > 2 else kwargs.get("text"))
+                return {"ok": True, "result": {"message_id": 11}}
+
+            with patch.object(twitter_monitor, "ARTICLE_QUEUE_DIR", str(root)), \
+                 patch.object(twitter_monitor, "ARTICLE_CACHE_DIR", str(root / "cache")), \
+                 patch.object(twitter_monitor, "fetch_article_markdown",
+                              return_value=("# Article\n\n" + "x" * 300, None)), \
+                 patch.object(twitter_monitor, "summarize_article",
+                              return_value=(None, reason)), \
+                 patch.object(twitter_monitor, "send_telegram", side_effect=capture_send), \
+                 patch.object(twitter_monitor.time, "sleep", return_value=None):
+                twitter_monitor.process_article_queue(
+                    twitter_monitor.AIClassifier([]), "bot", "chat")
+            saved = json.loads(qpath.read_text(encoding="utf-8"))[0]
+            self.assertEqual(saved["status"], "failed")
+            self.assertEqual(saved["failed_stage"], "ai_summary")
+            self.assertEqual(saved["last_error"], reason)
+            self.assertEqual(saved["attempts"], 0)
+            self.assertEqual(len(sent), 1)
+            self.assertIn("gemini:http_403", sent[0])
+            self.assertIn("PERMISSION_DENIED", sent[0])
+
+    def test_repeat_auth_failure_skips_telegram(self):
+        reason = "gemini:http_403:PERMISSION_DENIED: denied"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            qpath = root / "u_queue.json"
+            entry = {
+                "article_id": "1", "tweet_id": "1", "author": "u",
+                "article_title": "T", "status": "failed", "attempts": 0,
+                "content": None, "failure_msg_id": 7404,
+                "detected_at": datetime.now(timezone.utc).isoformat(),
+            }
+            qpath.write_text(json.dumps([entry]), encoding="utf-8")
+            with patch.object(twitter_monitor, "ARTICLE_QUEUE_DIR", str(root)), \
+                 patch.object(twitter_monitor, "ARTICLE_CACHE_DIR", str(root / "cache")), \
+                 patch.object(twitter_monitor, "fetch_article_markdown",
+                              return_value=("# Article\n\n" + "x" * 300, None)), \
+                 patch.object(twitter_monitor, "summarize_article",
+                              return_value=(None, reason)), \
+                 patch.object(twitter_monitor, "send_telegram",
+                              side_effect=AssertionError("should not notify")) as send, \
+                 patch.object(twitter_monitor.time, "sleep", return_value=None):
+                twitter_monitor.process_article_queue(
+                    twitter_monitor.AIClassifier([]), "bot", "chat")
+            self.assertFalse(send.called)
+            saved = json.loads(qpath.read_text(encoding="utf-8"))[0]
+            self.assertEqual(saved["attempts"], 0)
+            self.assertEqual(saved["last_error"], reason)
 
 
 class NoteTweetSummaryBudgetTest(unittest.TestCase):
@@ -1917,6 +3601,12 @@ class RtBreakTest(unittest.TestCase):
             "dotey", {"id": "9", "note_tweet": {"text": note}}, None)
         self.assertIn("RT @bigaccount:\n\n", msg)
         self.assertIn("RT @bigaccount:<br><br>", rich)
+
+    def test_retweet_source_button_targets_rendered_original(self):
+        _msg, _rich, link = twitter_monitor.format_message(
+            "dotey", {"id": "999", "text": "RT @orig: 原推正文",
+                      "retweeted_status": {"id": "888", "screen_name": "orig"}}, None)
+        self.assertEqual(link, "https://x.com/orig/status/888")
 
 
 class RichPreserveTest(unittest.TestCase):
@@ -1988,6 +3678,34 @@ class ArticleAttributionTest(unittest.TestCase):
         self.assertIn("作者 @liuren", captured["prompt"])
         self.assertNotIn("@dotey", captured["prompt"])
 
+    def test_summarize_article_uses_for_articles_backend(self):
+        class ArticleAI:
+            def is_available(self):
+                return True
+
+            def complete(self, prompt, max_tokens=1200, temperature=0.2):
+                return "from-article-model", "gemini-3.8"
+
+            def complete_with_images(self, prompt, images, max_tokens=1200, temperature=0.2):
+                raise AssertionError("no images in this test")
+
+        class WrapperAI:
+            def is_available(self):
+                return True
+
+            def for_articles(self):
+                return ArticleAI()
+
+            def complete(self, prompt, max_tokens=1200, temperature=0.2):
+                raise AssertionError("must not use default complete")
+
+        entry = {"article_id": "1", "article_title": "t", "author": "liuren"}
+        with patch.object(twitter_monitor, "fetch_article_images", return_value=[]):
+            summary, backend = twitter_monitor.summarize_article(
+                WrapperAI(), "dotey", entry, "# t\n\nbody")
+        self.assertEqual(summary, "from-article-model")
+        self.assertEqual(backend, "gemini-3.8")
+
 
 class ArticleDedupPushTest(unittest.TestCase):
     """Issue 4a: 带 article 的推文只入队，不再作为普通推文重复推送。"""
@@ -2033,7 +3751,8 @@ class PushRetryTest(unittest.TestCase):
         args = argparse.Namespace(test=False, seed=False, dry_run=False,
                                   limit=20, max_push_age_minutes=45)
 
-        def fake_send(token, chat_id, username, t, ai=None, thread_id=None):
+        def fake_send(token, chat_id, username, t, ai=None, thread_id=None,
+                      reply_to_message_id=None):
             sent.append(t["id"])
             return {"ok": True}
 
@@ -2168,7 +3887,8 @@ class AIFailClosedTest(unittest.TestCase):
         ai = twitter_monitor.AIClassifier([self.FailingBackend()])
         pushed_ids = []
 
-        def fake_send_tweet(token, chat_id, username, t, ai=None, thread_id=None):
+        def fake_send_tweet(token, chat_id, username, t, ai=None, thread_id=None,
+                            reply_to_message_id=None):
             pushed_ids.append(t["id"])
             return {"ok": True}
 
@@ -2188,161 +3908,45 @@ class AIFailClosedTest(unittest.TestCase):
         self.assertEqual(ov, 0)
         self.assertEqual(pushed_ids, [])
 
-
-class MusingClassifyTest(unittest.TestCase):
-    """碎碎念规则层：classify 启发式 + 不误伤实质内容。"""
-
-    def test_pocket3_fishing_sample_is_musing_suspicious(self):
-        t = {
-            "text": "把pocket3充满电，准备去钓鱼。",
-            "media": [{"type": "photo", "url": "https://pbs.twimg.com/media/x.jpg"}],
-        }
-        status, reason = twitter_monitor.classify(t)
-        self.assertEqual(status, "suspicious")
-        self.assertTrue(
-            reason.startswith(twitter_monitor.REASON_MUSING_PREFIX),
-            msg=reason,
-        )
-
-    def test_short_photo_status_is_musing(self):
-        t = {
-            # ≥ MIN_LEN=18，否则会先被 too_short 硬过滤
-            "text": "今天天气真的不错呀，出门去晒太阳了。",
-            "media": [{"type": "photo", "url": "https://pbs.twimg.com/media/x.jpg"}],
-        }
-        status, reason = twitter_monitor.classify(t)
-        self.assertEqual(status, "suspicious")
-        self.assertTrue(reason.startswith(twitter_monitor.REASON_MUSING_PREFIX), msg=reason)
-
-    def test_life_kw_without_photo_is_musing(self):
-        t = {"text": "周末宅家追剧，什么都不想干就这样过。"}
-        status, reason = twitter_monitor.classify(t)
-        self.assertEqual(status, "suspicious")
-        self.assertIn("musing_life_kw", reason)
-
-    def test_technical_post_still_passes(self):
-        t = {"text": "Claude 新 API 支持 prompt caching，延迟降一半。"}
-        status, reason = twitter_monitor.classify(t)
-        self.assertEqual((status, reason), ("pass", "ok"))
-
-    def test_substantive_keyword_blocks_musing(self):
-        # 含生活词「充电」但有实质信号「模型/评测」
-        t = {
-            "text": "把手机充满电后继续跑本地模型评测，结果很意外。",
-            "media": [{"type": "photo", "url": "https://pbs.twimg.com/media/x.jpg"}],
-        }
-        status, reason = twitter_monitor.classify(t)
-        self.assertEqual((status, reason), ("pass", "ok"))
-
-    def test_non_media_url_blocks_musing(self):
-        t = {
-            "text": "出门钓鱼前看这篇 https://example.com/guide 讲得不错。",
-            "media": [{"type": "photo", "url": "https://pbs.twimg.com/media/x.jpg"}],
-            "entities": {
-                "urls": [{"url": "https://t.co/abc", "expanded_url": "https://example.com/guide"}],
-            },
-        }
-        status, reason = twitter_monitor.classify(t)
-        self.assertEqual((status, reason), ("pass", "ok"))
-
-    def test_too_short_still_hard_filter(self):
-        status, reason = twitter_monitor.classify({"text": "短"})
-        self.assertEqual(status, "filter")
-        self.assertTrue(reason.startswith("too_short"), msg=reason)
-
-    def test_long_note_tweet_not_musing(self):
-        t = {
-            "text": "把pocket3充满电，准备去钓鱼。",  # 壳短，但 note 很长
-            "note_tweet": {"text": "关于 AI agent 工作流的一些观察：" + ("细节" * 80)},
-            "media": [{"type": "photo", "url": "https://pbs.twimg.com/media/x.jpg"}],
-        }
-        status, reason = twitter_monitor.classify(t)
-        self.assertEqual((status, reason), ("pass", "ok"))
-
-    def test_commercial_still_suspicious_not_musing(self):
-        t = {
-            "text": "byteplus seedance 2.0 api 文档访问体验开通模型冲 200 立即体验方舟平台",
-        }
-        status, reason = twitter_monitor.classify(t)
-        self.assertEqual(status, "suspicious")
-        self.assertTrue(reason.startswith("commercial"), msg=reason)
-
-
-class MusingProcessUserTest(unittest.TestCase):
-    """碎碎念 process_user：AI 确认/否决/失败/无 AI 默认 filter。"""
-
-    SAMPLE = {
-        "id": "m1",
-        "text": "把pocket3充满电，准备去钓鱼。",
-        "media": [{"type": "photo", "url": "https://pbs.twimg.com/media/x.jpg"}],
-        "createdAt": "Tue May 12 00:20:00 +0000 2026",
-    }
-
-    def _run(self, ai, tweet=None):
+    def test_process_user_http_403_is_fail_closed_not_ai_veto(self):
         args = argparse.Namespace(test=False, seed=False, dry_run=False,
                                   limit=20, max_push_age_minutes=45)
+        suspicious_tweet = {
+            "id": "s403",
+            "text": "byteplus seedance 2.0 api 文档访问体验开通模型冲 200 立即体验方舟平台",
+            "createdAt": "Tue May 12 00:20:00 +0000 2026",
+        }
+
+        class AuthFailBackend:
+            name = "gemini"
+
+            def classify(self, username, text):
+                raise _http_error(403, '{"error":{"status":"PERMISSION_DENIED","message":"denied"}}')
+
+        ai = twitter_monitor.AIClassifier([AuthFailBackend()])
         pushed_ids = []
 
-        def fake_send_tweet(token, chat_id, username, t, ai=None, thread_id=None):
+        def fake_send_tweet(token, chat_id, username, t, ai=None, thread_id=None,
+                            reply_to_message_id=None):
             pushed_ids.append(t["id"])
             return {"ok": True}
 
         with patch.object(twitter_monitor, "datetime", FixedDatetime), \
-             patch.object(twitter_monitor, "fetch_tweets",
-                          return_value=[tweet or self.SAMPLE]), \
+             patch.object(twitter_monitor, "fetch_tweets", return_value=[suspicious_tweet]), \
              patch.object(twitter_monitor, "load_seen", return_value=({"old"}, None)), \
              patch.object(twitter_monitor, "save_seen", return_value=None), \
              patch.object(twitter_monitor, "send_tweet", side_effect=fake_send_tweet), \
-             patch.object(twitter_monitor, "_alert_ai_all_failed", return_value=None), \
+             patch.object(twitter_monitor, "_alert_ai_all_failed", return_value=None) as alert, \
              patch.object(twitter_monitor.time, "sleep", return_value=None):
             new, pushed, filt, ov = twitter_monitor.process_user(
-                pool=None, ai=ai, username="vista8",
+                pool=None, ai=ai, username="u",
                 bot_token="b", chat_id="c", args=args)
-        return new, pushed, filt, ov, pushed_ids
-
-    def test_ai_confirms_musing_filters(self):
-        new, pushed, filt, ov, ids = self._run(FakeAI(True, musing=True, musing_reason="life"))
         self.assertEqual((new, pushed, filt, ov), (1, 0, 1, 0))
-        self.assertEqual(ids, [])
-
-    def test_ai_rejects_musing_pushes(self):
-        new, pushed, filt, ov, ids = self._run(
-            FakeAI(True, musing=False, musing_reason="has_insight"))
-        self.assertEqual((new, pushed, filt), (1, 1, 0))
-        self.assertEqual(ov, 1)
-        self.assertEqual(ids, ["m1"])
-
-    def test_no_ai_filters_musing_by_default(self):
-        # 与 promo 无 AI 放行不对称：musing 无 AI → filter
-        new, pushed, filt, ov, ids = self._run(FakeAI(False))
-        self.assertEqual((new, pushed, filt, ov), (1, 0, 1, 0))
-        self.assertEqual(ids, [])
-
-    def test_ai_all_failed_filters_musing(self):
-        class FailAI:
-            def is_available(self):
-                return True
-
-            def confirm_musing(self, username, text):
-                return False, "all_ai_failed"
-
-            def confirm_promo(self, username, text):
-                return False, "all_ai_failed"
-
-        new, pushed, filt, ov, ids = self._run(FailAI())
-        self.assertEqual((new, pushed, filt, ov), (1, 0, 1, 0))
-        self.assertEqual(ids, [])
-
-    def test_promo_no_ai_still_passes(self):
-        # 对照：promo suspicious 无 AI 仍放行（既有行为）
-        promo = {
-            "id": "p1",
-            "text": "byteplus seedance 2.0 api 文档访问体验开通模型冲 200 立即体验方舟平台",
-            "createdAt": "Tue May 12 00:20:00 +0000 2026",
-        }
-        new, pushed, filt, ov, ids = self._run(FakeAI(False), tweet=promo)
-        self.assertEqual((new, pushed, filt), (1, 1, 0))
-        self.assertEqual(ids, ["p1"])
+        self.assertEqual(pushed_ids, [])
+        self.assertTrue(alert.called)
+        self.assertEqual(
+            ai.confirm_promo("u", suspicious_tweet["text"])[1].split(":")[1],
+            "http_403")
 
 
 class LoadSeenCorruptedTest(unittest.TestCase):
@@ -2375,7 +3979,8 @@ class LoadSeenCorruptedTest(unittest.TestCase):
         }
         pushed_ids = []
 
-        def fake_send_tweet(token, chat_id, username, t, ai=None, thread_id=None):
+        def fake_send_tweet(token, chat_id, username, t, ai=None, thread_id=None,
+                            reply_to_message_id=None):
             pushed_ids.append(t["id"])
             return {"ok": True}
 
@@ -2450,6 +4055,25 @@ class GraphqlEmptyListTest(unittest.TestCase):
 
 
 class GraphqlCurlTest(unittest.TestCase):
+    def test_x_html_entities_are_normalized_once_before_telegram_rendering(self):
+        import html as std_html
+        import twitter_graphql as tg
+        normalized = tg.normalize_x_text("写作 -&gt; 为了写作去学习实践 &amp; 分享")
+        self.assertEqual(normalized, "写作 -> 为了写作去学习实践 & 分享")
+        fallback, rich, _ = twitter_monitor.format_message("dotey", {"id": "entity-1", "text": normalized}, None)
+        self.assertNotIn("&amp;gt;", fallback)
+        self.assertNotIn("&amp;gt;", rich)
+        self.assertIn("写作 ->", std_html.unescape(fallback))
+        self.assertIn("写作 ->", std_html.unescape(rich))
+
+    def test_x_html_entity_normalization_does_not_weaken_html_escaping(self):
+        import twitter_graphql as tg
+        normalized = tg.normalize_x_text("&lt;script&gt;alert(1)&lt;/script&gt;")
+        fallback, rich, _ = twitter_monitor.format_message("dotey", {"id": "entity-2", "text": normalized}, None)
+        for rendered in (fallback, rich):
+            self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", rendered)
+            self.assertNotIn("<script>alert(1)</script>", rendered)
+
     def test_curl_file_not_found_returns_empty(self):
         import twitter_graphql as tg
         with patch.object(tg.subprocess, "run", side_effect=FileNotFoundError):
@@ -2522,15 +4146,37 @@ class ContentRoutingTest(unittest.TestCase):
             twitter_monitor.send_telegram_rich("tok", "chat", html="hi", thread_id=19)
         self.assertEqual(captured["payload"].get("message_thread_id"), 19)
 
+    def test_send_telegram_photo_keeps_caption_button_and_thread(self):
+        captured = {}
+
+        def fake_post(token, payload, method="sendMessage"):
+            captured["payload"] = payload
+            captured["method"] = method
+            return {"ok": True}
+
+        with patch.object(twitter_monitor, "_tg_post", side_effect=fake_post):
+            r = twitter_monitor.send_telegram_photo(
+                "tok", "chat", "https://pbs.twimg.com/media/a.jpg",
+                '<a href="https://example.com">打开外链</a>',
+                "https://x.com/u/status/1", thread_id=19)
+        self.assertTrue(r["ok"])
+        self.assertEqual(captured["method"], "sendPhoto")
+        self.assertEqual(captured["payload"].get("message_thread_id"), 19)
+        self.assertEqual(captured["payload"]["photo"], "https://pbs.twimg.com/media/a.jpg")
+        self.assertEqual(captured["payload"]["reply_markup"]["inline_keyboard"][0][0]["url"],
+                         "https://x.com/u/status/1")
+
     def test_send_tweet_propagates_thread_id_to_rich_and_fallback(self):
         rich_calls = []
         legacy_calls = []
 
-        def fake_rich(token, chat_id, markdown="", link="", *, html="", thread_id=None):
+        def fake_rich(token, chat_id, markdown="", link="", *, html="", thread_id=None,
+                      reply_to_message_id=None):
             rich_calls.append(thread_id)
             return {"ok": False, "rich_fallback": True}
 
-        def fake_legacy(token, chat_id, text, link="", thread_id=None):
+        def fake_legacy(token, chat_id, text, link="", thread_id=None,
+                        reply_to_message_id=None):
             legacy_calls.append(thread_id)
             return {"ok": True}
 
@@ -2545,7 +4191,8 @@ class ContentRoutingTest(unittest.TestCase):
         pushed_to = []
         alert_to = []
 
-        def fake_send_tweet(token, chat_id, username, t, ai=None, thread_id=None):
+        def fake_send_tweet(token, chat_id, username, t, ai=None, thread_id=None,
+                            reply_to_message_id=None):
             pushed_to.append((chat_id, thread_id))
             return {"ok": True}
 
@@ -2576,7 +4223,8 @@ class ContentRoutingTest(unittest.TestCase):
     def test_process_user_falls_back_to_chat_id_when_content_target_unset(self):
         pushed_to = []
 
-        def fake_send_tweet(token, chat_id, username, t, ai=None, thread_id=None):
+        def fake_send_tweet(token, chat_id, username, t, ai=None, thread_id=None,
+                            reply_to_message_id=None):
             pushed_to.append((chat_id, thread_id))
             return {"ok": True}
 
@@ -2607,7 +4255,8 @@ class ContentRoutingTest(unittest.TestCase):
             captured["rich"].append(thread_id)
             return {"ok": True}
 
-        def fake_legacy(token, chat_id, text, link="", thread_id=None):
+        def fake_legacy(token, chat_id, text, link="", thread_id=None,
+                        reply_to_message_id=None):
             return {"ok": True}
 
         entry = {"article_id": "777", "tweet_id": "1", "author": "u",
@@ -2660,7 +4309,8 @@ class CrossAccountDedupTest(unittest.TestCase):
     def _run(self, tweet, username="u", args=None, seen=None):
         pushed, saved_seen = [], {}
 
-        def fake_send_tweet(token, chat_id, username, t, ai=None, thread_id=None):
+        def fake_send_tweet(token, chat_id, username, t, ai=None, thread_id=None,
+                            reply_to_message_id=None):
             pushed.append(t["id"])
             return {"ok": True}
 
@@ -2748,7 +4398,8 @@ class CrossAccountDedupTest(unittest.TestCase):
             with patch.object(twitter_monitor, "PUSHED_INDEX_PATH", path), \
                  patch.object(twitter_monitor, "_PUSHED_INDEX_CACHE", cache):
                 twitter_monitor.save_pushed_index()
-                saved = json.load(open(path))["entries"]
+                with open(path) as f:
+                    saved = json.load(f)["entries"]
         self.assertNotIn("t:old", saved)
         self.assertLessEqual(len(saved), twitter_monitor.PUSHED_INDEX_MAX_ENTRIES)
 
@@ -2777,7 +4428,8 @@ class CrossAccountDedupTest(unittest.TestCase):
                  patch.object(twitter_monitor, "ARTICLE_CACHE_DIR",
                               _os.path.join(d, "cache")):
                 twitter_monitor.process_article_queue(FakeAI(True), "bot", "chat")
-            saved = _json.load(open(qpath))[0]
+            with open(qpath) as f:
+                saved = _json.load(f)[0]
         self.assertEqual(saved["status"], "skipped")
         self.assertEqual(saved["skip_reason"], "cross_dup")
         # skipped 是终态，纳入 7 天保留期清理
@@ -2785,6 +4437,747 @@ class CrossAccountDedupTest(unittest.TestCase):
             {"status": "skipped",
              "updated_at": (datetime.now(timezone.utc) - timedelta(days=8)).isoformat()})
         self.assertTrue(expired)
+
+
+class ArticleSupersedeTest(unittest.TestCase):
+    """X Article 删减：同篇文章的引用版取代裸摘要（= 投递时没有引用评论那次）。
+
+    两个方向都要覆盖。线上两周 22 篇文章有 5 篇被推两次，其中 3 次裸摘要先到
+    （间隔 1~3h）→ 删已发的那条；另 2 次引用版先到（间隔 15~17s、同一轮）→
+    裸摘要根本不该发。判定用记录里的 quoted 字段而非 ab:/a: 键前缀：flat 路径
+    的引用文章也落 a:<id> 键。
+    """
+
+    MD = "# 标题\n\n" + "正文内容。" * 40
+    SUMMARY = "> 结论\n\n### 小节\n正文"
+
+    def setUp(self):
+        self._patches = [
+            patch.object(twitter_monitor, "_ARTICLE_SUPERSEDE_ENABLED", True),
+            patch.object(twitter_monitor, "_CROSS_DEDUP_ENABLED", True),
+            patch.object(twitter_monitor, "_PUSHED_INDEX_CACHE", {}),
+            patch.object(twitter_monitor, "save_pushed_index", lambda: None),
+            patch.object(twitter_monitor, "learning_feed", None),
+        ]
+        for p in self._patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    @staticmethod
+    def _record(quoted, *, mids=(5681,), by="vista8", ts="2026-08-16T06:00:00+00:00",
+                chat="-1004424841223", **extra):
+        rec = {"ts": ts, "by": by, "article_key": "a:777", "message_ids": list(mids),
+               "chat_id": chat, "thread_id": 19, "quoted": quoted}
+        rec.update(extra)
+        return rec
+
+    def _entry(self, **kw):
+        entry = {"article_id": "777", "tweet_id": "1", "author": "vista8",
+                 "article_title": "T", "article_preview": "P", "quote_comment": "",
+                 "comment_author": "vista8", "status": "pending", "attempts": 0,
+                 "content": None,
+                 "detected_at": datetime.now(timezone.utc).isoformat()}
+        entry.update(kw)
+        # save_semantic_article 里 quote_comment 与 _bundle_key 由同一个
+        # has_substantive_comment 同时置位；带评论却无 bundle_key 的条目在跨账号
+        # 去重开启时会先被入队闸拦掉，根本到不了删减逻辑 → 夹具跟着一起置位。
+        if entry["quote_comment"] and not entry.get("bundle_key"):
+            entry["bundle_key"] = "t:888"
+        return entry
+
+    def _run_queue(self, entry, *, delete_ok=True, rich_ok=True, parts=1,
+                   chat_id="-1004424841223"):
+        """跑一遍 article 队列，返回 (最终盘面条目, quiet 调用序列, 抓取次数)。"""
+        import json as _json
+        import os as _os
+        import tempfile
+        quiet_calls, fetches, next_mid = [], [], [9001]
+
+        def fake_quiet(token, payload, method):
+            quiet_calls.append((method, payload))
+            return {"ok": delete_ok if method == "deleteMessage" else True}
+
+        def fake_fetch(username, e):
+            fetches.append(e.get("article_id"))
+            return (self.MD, None)
+
+        def fake_rich(token, cid, markdown_, link="", thread_id=None):
+            if not rich_ok:
+                return {"ok": False, "rich_fallback": True, "description": "rejected"}
+            next_mid[0] += 1
+            return {"ok": True, "result": {"message_id": next_mid[0]}}
+
+        def fake_plain(token, cid, text, link="", thread_id=None):
+            next_mid[0] += 1
+            return {"ok": True, "result": {"message_id": next_mid[0]}}
+
+        with tempfile.TemporaryDirectory() as d:
+            qpath = _os.path.join(d, "vista8_queue.json")
+            with open(qpath, "w") as f:
+                _json.dump([entry], f)
+            with patch.object(twitter_monitor, "ARTICLE_QUEUE_DIR", d), \
+                 patch.object(twitter_monitor, "ARTICLE_CACHE_DIR",
+                              _os.path.join(d, "cache")), \
+                 patch.object(twitter_monitor, "fetch_article_markdown",
+                              side_effect=fake_fetch), \
+                 patch.object(twitter_monitor, "summarize_article",
+                              return_value=(self.SUMMARY, "mimo")), \
+                 patch.object(twitter_monitor, "format_article_summary_messages",
+                              return_value=[f"part{i}" for i in range(1, parts + 1)]), \
+                 patch.object(twitter_monitor, "send_telegram_rich", side_effect=fake_rich), \
+                 patch.object(twitter_monitor, "send_telegram", side_effect=fake_plain), \
+                 patch.object(twitter_monitor, "_tg_post_quiet", side_effect=fake_quiet), \
+                 patch.object(twitter_monitor.time, "sleep", return_value=None):
+                twitter_monitor.process_article_queue(FakeAI(True), "bot", chat_id,
+                                                      thread_id=19)
+            with open(qpath) as f:
+                final = _json.load(f)[0]
+        return final, quiet_calls, fetches
+
+    # ── 方向一：裸摘要先到，引用版后到 → 删掉裸摘要 ──
+
+    def test_quoted_delivery_deletes_earlier_bare_message(self):
+        idx = twitter_monitor._PUSHED_INDEX_CACHE
+        idx["a:777"] = self._record(False, mids=(5681,))
+        final, quiet, _ = self._run_queue(
+            self._entry(quote_comment="这篇值得看", comment_author="dotey"))
+        self.assertEqual(final["status"], "sent")
+        deletes = [p for m, p in quiet if m == "deleteMessage"]
+        self.assertEqual([p["message_id"] for p in deletes], [5681])
+        self.assertEqual(deletes[0]["chat_id"], "-1004424841223")
+        # 撤回落痕 = 幂等闸；引用版本身登记为 quoted
+        self.assertTrue(idx["a:777"].get("retracted_at"))
+        self.assertEqual(idx["a:777"]["retracted_by"], "dotey")
+
+    def test_quoted_delivery_with_bundle_key_records_quoted_and_keeps_itself(self):
+        idx = twitter_monitor._PUSHED_INDEX_CACHE
+        idx["a:777"] = self._record(False)
+        self._run_queue(self._entry(quote_comment="值得看", comment_author="dotey",
+                                    bundle_key="t:888"))
+        self.assertTrue(idx["ab:t:888"]["quoted"])
+        self.assertTrue(idx["ab:t:888"]["message_ids"])   # 自己不被当成撤回对象
+        self.assertNotIn("retracted_at", idx["ab:t:888"])
+
+    def test_chunked_fallback_deletes_every_part(self):
+        idx = twitter_monitor._PUSHED_INDEX_CACHE
+        idx["a:777"] = self._record(False, mids=(11, 12, 13))
+        _, quiet, _ = self._run_queue(
+            self._entry(quote_comment="值得看", comment_author="dotey"))
+        self.assertEqual([p["message_id"] for m, p in quiet if m == "deleteMessage"],
+                         [11, 12, 13])
+
+    def test_chunked_send_records_all_message_ids(self):
+        idx = twitter_monitor._PUSHED_INDEX_CACHE
+        self._run_queue(self._entry(), rich_ok=False, parts=3)
+        # 分块回退路径每条都要记，否则后续删减只删得掉最后一条
+        self.assertEqual(len(idx["a:777"]["message_ids"]), 3)
+        self.assertFalse(idx["a:777"]["quoted"])
+
+    def test_delete_rejected_falls_back_to_edit_pointer(self):
+        twitter_monitor._PUSHED_INDEX_CACHE["a:777"] = self._record(False, mids=(5681,))
+        _, quiet, _ = self._run_queue(
+            self._entry(quote_comment="值得看", comment_author="dotey"), delete_ok=False)
+        edits = [p for m, p in quiet if m == "editMessageText"]
+        self.assertEqual(len(edits), 1)
+        self.assertEqual(edits[0]["message_id"], 5681)
+        self.assertIn("@dotey", edits[0]["text"])
+        # 深链指向刚发出的引用版，旧消息不留整篇重复摘要
+        self.assertIn("https://t.me/c/4424841223/19/", edits[0]["text"])
+
+    def test_retraction_is_idempotent_across_runs(self):
+        twitter_monitor._PUSHED_INDEX_CACHE["a:777"] = self._record(
+            False, mids=(5681,), retracted_at="2026-08-16T07:00:00+00:00")
+        _, quiet, _ = self._run_queue(
+            self._entry(quote_comment="值得看", comment_author="dotey"))
+        self.assertEqual([m for m, _ in quiet if m == "deleteMessage"], [])
+
+    def test_assumed_delivery_without_message_id_is_not_retractable(self):
+        # 响应缺失的投递没有 message_id，删不了也不能崩
+        twitter_monitor._PUSHED_INDEX_CACHE["a:777"] = self._record(False, mids=())
+        final, quiet, _ = self._run_queue(
+            self._entry(quote_comment="值得看", comment_author="dotey"))
+        self.assertEqual(final["status"], "sent")
+        self.assertEqual([m for m, _ in quiet if m == "deleteMessage"], [])
+
+    def test_other_article_bare_delivery_untouched(self):
+        idx = twitter_monitor._PUSHED_INDEX_CACHE
+        idx["a:999"] = self._record(False, mids=(4242,), article_key="a:999")
+        _, quiet, _ = self._run_queue(
+            self._entry(quote_comment="值得看", comment_author="dotey"))
+        self.assertEqual([m for m, _ in quiet if m == "deleteMessage"], [])
+        self.assertNotIn("retracted_at", idx["a:999"])
+
+    # ── 方向二：引用版先到 → 裸摘要根本不发 ──
+
+    def test_bare_entry_skipped_before_fetch_when_quoted_already_delivered(self):
+        twitter_monitor._PUSHED_INDEX_CACHE["ab:t:888"] = self._record(
+            True, by="dotey", mids=(6001,))
+        final, quiet, fetches = self._run_queue(self._entry())
+        self.assertEqual(final["status"], "skipped")
+        self.assertEqual(final["skip_reason"], "superseded_by_quote")
+        self.assertEqual(fetches, [])          # 省掉抓取 + AI 摘要
+        self.assertEqual([m for m, _ in quiet if m == "deleteMessage"], [])
+        # skipped 是终态，走 7 天保留期清理
+        self.assertTrue(twitter_monitor._article_entry_expired(
+            {"status": "skipped",
+             "updated_at": (datetime.now(timezone.utc) - timedelta(days=8)).isoformat()}))
+
+    def test_quoted_entry_not_suppressed_by_another_quoted_delivery(self):
+        # 多人引用同一篇：引用版之间互不抑制（各自是独立的编辑单元）
+        twitter_monitor._PUSHED_INDEX_CACHE["ab:t:888"] = self._record(
+            True, by="dotey", mids=(6001,))
+        final, quiet, fetches = self._run_queue(
+            self._entry(quote_comment="我也说两句", comment_author="vista8",
+                        bundle_key="t:999"))
+        self.assertEqual(final["status"], "sent")
+        self.assertEqual(fetches, ["777"])
+        self.assertEqual([m for m, _ in quiet if m == "deleteMessage"], [])
+
+    # ── 开关与兼容 ──
+
+    def test_disabled_by_default_keeps_both_deliveries(self):
+        with patch.object(twitter_monitor, "_ARTICLE_SUPERSEDE_ENABLED", False):
+            twitter_monitor._PUSHED_INDEX_CACHE["a:777"] = self._record(False, mids=(5681,))
+            final, quiet, fetches = self._run_queue(
+                self._entry(quote_comment="值得看", comment_author="dotey",
+                            bundle_key="t:888"))
+        self.assertEqual(final["status"], "sent")
+        self.assertEqual(fetches, ["777"])
+        self.assertEqual([m for m, _ in quiet if m == "deleteMessage"], [])
+
+    def test_legacy_records_without_quoted_field_fall_back_to_key_prefix(self):
+        # 8-14 之前的老条目没有 quoted/message_ids：能识别归属但无从撤回，不能崩
+        twitter_monitor._PUSHED_INDEX_CACHE["a:777"] = {"ts": "2026-08-05T08:31:02+00:00",
+                                                        "by": "vista8"}
+        self.assertTrue(twitter_monitor._is_bare_article_delivery(
+            "a:777", twitter_monitor._PUSHED_INDEX_CACHE["a:777"]))
+        self.assertIsNone(twitter_monitor._find_retractable_bare_delivery("a:777"))
+        final, quiet, _ = self._run_queue(
+            self._entry(quote_comment="值得看", comment_author="dotey"))
+        self.assertEqual(final["status"], "sent")
+        self.assertEqual([m for m, _ in quiet if m == "deleteMessage"], [])
+
+    def test_legacy_ab_record_without_article_key_is_ignored(self):
+        # ab: 老条目无从还原文章 id → 不参与删减，不能误伤同名裸摘要
+        twitter_monitor._PUSHED_INDEX_CACHE["ab:t:888"] = {"ts": "x", "by": "dotey"}
+        self.assertEqual(twitter_monitor._article_delivery_rows("a:777"), [])
+        self.assertIsNone(twitter_monitor._quoted_article_delivered("a:777"))
+
+    def test_dry_run_neither_records_nor_deletes(self):
+        import json as _json
+        import os as _os
+        import tempfile
+        idx = twitter_monitor._PUSHED_INDEX_CACHE
+        idx["a:777"] = self._record(False, mids=(5681,))
+        quiet = []
+        with tempfile.TemporaryDirectory() as d:
+            qpath = _os.path.join(d, "vista8_queue.json")
+            with open(qpath, "w") as f:
+                _json.dump([self._entry(quote_comment="值得看",
+                                        comment_author="dotey")], f)
+            with patch.object(twitter_monitor, "ARTICLE_QUEUE_DIR", d), \
+                 patch.object(twitter_monitor, "ARTICLE_CACHE_DIR",
+                              _os.path.join(d, "cache")), \
+                 patch.object(twitter_monitor, "fetch_article_markdown",
+                              return_value=(self.MD, None)), \
+                 patch.object(twitter_monitor, "summarize_article",
+                              return_value=(self.SUMMARY, "mimo")), \
+                 patch.object(twitter_monitor, "_tg_post_quiet",
+                              side_effect=lambda t, p, m: quiet.append(m)), \
+                 patch.object(twitter_monitor.time, "sleep", return_value=None):
+                twitter_monitor.process_article_queue(FakeAI(True), "bot", "chat",
+                                                      dry_run=True, thread_id=19)
+        self.assertEqual(quiet, [])
+        self.assertNotIn("retracted_at", idx["a:777"])
+
+    def test_main_wires_config_flag_both_ways(self):
+        seen = {}
+
+        def fake_queue(ai, bot_token, chat_id, dry_run=False, *, thread_id=None,
+                       thread_map=None):
+            seen["flag"] = twitter_monitor._ARTICLE_SUPERSEDE_ENABLED
+            return 0
+
+        for value, expected in (("true", True), ("false", False), (None, False)):
+            key = "" if value is None else f', "article_supersede_enabled": {value}'
+            cfg = Path("test_config_supersede.json")
+            cfg.write_text('{"telegram_bot_token": "b", "telegram_chat_id": "c"'
+                           + key + "}")
+            try:
+                with patch.object(twitter_monitor, "CONFIG_PATH", str(cfg)), \
+                     patch.object(twitter_monitor, "ROUTE_TABLE_PATH",
+                                  "test_route_table_absent.json"), \
+                     patch.object(twitter_monitor, "FAILURES_PATH",
+                                  "test_failures_supersede.json"), \
+                     patch.object(twitter_monitor, "update_status_dashboard"), \
+                     patch.object(twitter_monitor, "check_cookie_health"), \
+                     patch.object(twitter_monitor.TokenPool, "load", return_value=None), \
+                     patch.object(twitter_monitor.AIClassifier, "load",
+                                  return_value=FakeAI(False)), \
+                     patch.object(twitter_monitor, "load_accounts",
+                                  return_value=[{"username": "u"}]), \
+                     patch.object(twitter_monitor, "process_user",
+                                  return_value=(0, 0, 0, 0)), \
+                     patch.object(twitter_monitor, "process_article_queue",
+                                  side_effect=fake_queue), \
+                     patch.object(sys, "argv", ["twitter_monitor.py"]):
+                    self.assertEqual(twitter_monitor.main(), 0)
+            finally:
+                cfg.unlink(missing_ok=True)
+                Path("test_failures_supersede.json").unlink(missing_ok=True)
+            self.assertIs(seen["flag"], expected, f"config value {value!r}")
+
+    def test_message_link_forms(self):
+        link = twitter_monitor._tg_message_link
+        self.assertEqual(link("-1004424841223", 19, 5681),
+                         "https://t.me/c/4424841223/19/5681")
+        self.assertEqual(link("-1004424841223", None, 5681),
+                         "https://t.me/c/4424841223/5681")
+        self.assertEqual(link("123456", 19, 5681), "")    # DM 无该链接形式
+        self.assertEqual(link("-1004424841223", 19, 0), "")
+
+
+class ArticleQuoteCardTest(unittest.TestCase):
+    """多人引用同一篇文章：首条发完整摘要，后续引用者只发增量评论卡片 reply 其下。
+
+    锚点必须是完整摘要而非卡片，否则第三个引用者会挂到第二个人的卡片下越挂越深；
+    锚点已被撤回（正文不在了）时必须退回发完整摘要。卡片路径完全跳过 Markdown
+    抓取和 AI 摘要 —— N 个引用者的成本从 N 次降到 1 次，这是本方案的全部意义。
+    """
+
+    MD = "# 标题\n\n" + "正文内容。" * 40
+    SUMMARY = "> 结论\n\n### 小节\n正文"
+
+    def setUp(self):
+        self._patches = [
+            patch.object(twitter_monitor, "_ARTICLE_QUOTE_CARD_ENABLED", True),
+            patch.object(twitter_monitor, "_ARTICLE_SUPERSEDE_ENABLED", True),
+            patch.object(twitter_monitor, "_CROSS_DEDUP_ENABLED", True),
+            patch.object(twitter_monitor, "_PUSHED_INDEX_CACHE", {}),
+            patch.object(twitter_monitor, "save_pushed_index", lambda: None),
+            patch.object(twitter_monitor, "learning_feed", None),
+        ]
+        for p in self._patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    @staticmethod
+    def _record(**extra):
+        rec = {"ts": "2026-08-16T06:00:00+00:00", "by": "vista8", "article_key": "a:777",
+               "message_ids": [5681], "chat_id": "-1004424841223", "thread_id": 19,
+               "quoted": False, "form": "summary"}
+        rec.update(extra)
+        return rec
+
+    def _entry(self, **kw):
+        entry = {"article_id": "777", "tweet_id": "1", "author": "vista8",
+                 "article_title": "Agent 的上下文工程", "article_preview": "P",
+                 "quote_comment": "这篇把上下文窗口的取舍讲透了", "comment_author": "dotey",
+                 "bundle_key": "t:888", "status": "pending", "attempts": 0,
+                 "content": None,
+                 "detected_at": datetime.now(timezone.utc).isoformat()}
+        entry.update(kw)
+        return entry
+
+    def _run_queue(self, entry, *, send_result=None, chat_id="-1004424841223"):
+        """返回 (最终盘面条目, sendMessage 调用列表, 抓取次数, AI 摘要次数)。"""
+        import json as _json
+        import os as _os
+        import tempfile
+        plain, fetches, summaries = [], [], []
+
+        def fake_plain(token, cid, text, link="", *, preview_url="", thread_id=None,
+                       reply_to_message_id=None, button_text=""):
+            plain.append({"chat_id": cid, "text": text, "link": link,
+                          "thread_id": thread_id, "reply_to": reply_to_message_id,
+                          "button_text": button_text})
+            return send_result if send_result is not None else {
+                "ok": True, "result": {"message_id": 6001}}
+
+        def fake_fetch(u, e):
+            fetches.append(e.get("article_id"))
+            return (self.MD, None)
+
+        def fake_summary(ai, u, e, md):
+            summaries.append(e.get("article_id"))
+            return (self.SUMMARY, "mimo")
+
+        with tempfile.TemporaryDirectory() as d:
+            qpath = _os.path.join(d, "vista8_queue.json")
+            with open(qpath, "w") as f:
+                _json.dump([entry], f)
+            with patch.object(twitter_monitor, "ARTICLE_QUEUE_DIR", d), \
+                 patch.object(twitter_monitor, "ARTICLE_CACHE_DIR",
+                              _os.path.join(d, "cache")), \
+                 patch.object(twitter_monitor, "fetch_article_markdown",
+                              side_effect=fake_fetch), \
+                 patch.object(twitter_monitor, "summarize_article",
+                              side_effect=fake_summary), \
+                 patch.object(twitter_monitor, "send_telegram", side_effect=fake_plain), \
+                 patch.object(twitter_monitor, "send_telegram_rich",
+                              return_value={"ok": True, "result": {"message_id": 7001}}), \
+                 patch.object(twitter_monitor, "_tg_post_quiet",
+                              return_value={"ok": True}), \
+                 patch.object(twitter_monitor.time, "sleep", return_value=None):
+                twitter_monitor.process_article_queue(FakeAI(True), "bot", chat_id,
+                                                      thread_id=19)
+            with open(qpath) as f:
+                final = _json.load(f)[0]
+        return final, plain, fetches, summaries
+
+    def test_second_quoter_gets_card_replying_to_summary_without_resummarizing(self):
+        idx = twitter_monitor._PUSHED_INDEX_CACHE
+        idx["a:777"] = self._record()
+        final, plain, fetches, summaries = self._run_queue(self._entry())
+        self.assertEqual(final["status"], "sent")
+        self.assertEqual(final["delivery_form"], "quote_card")
+        # 全方案的意义所在：一次抓取都没有，一次 AI 摘要都没有
+        self.assertEqual(fetches, [])
+        self.assertEqual(summaries, [])
+        self.assertEqual(len(plain), 1)
+        self.assertEqual(plain[0]["reply_to"], 5681)
+        self.assertEqual(plain[0]["thread_id"], 19)
+        self.assertIn("这篇把上下文窗口的取舍讲透了", plain[0]["text"])
+        self.assertIn("Agent 的上下文工程", plain[0]["text"])
+        # 不带署名：卡片正文只有标题行 + 评论
+        self.assertNotIn("也引用了这篇文章", plain[0]["text"])
+        self.assertNotIn("@dotey", plain[0]["text"])
+        # 按钮指向写这条评论的引用推，不是文章原文页（那条锚点摘要已经给过）
+        self.assertEqual(plain[0]["link"], "https://x.com/dotey/status/888")
+        self.assertEqual(plain[0]["button_text"], "\U0001f517 查看引用推文")
+        # 卡片自身登记为 form=card，不能成为下一个引用者的锚点
+        self.assertEqual(idx["ab:t:888"]["form"], "card")
+        self.assertEqual(idx["ab:t:888"]["message_ids"], [6001])
+
+    def test_third_quoter_anchors_on_summary_not_on_previous_card(self):
+        idx = twitter_monitor._PUSHED_INDEX_CACHE
+        idx["a:777"] = self._record()
+        idx["ab:t:888"] = self._record(ts="2026-08-16T07:00:00+00:00", by="dotey",
+                                       message_ids=[6001], quoted=True, form="card")
+        _, plain, _, _ = self._run_queue(
+            self._entry(comment_author="_philschmid", bundle_key="t:999"))
+        self.assertEqual(plain[0]["reply_to"], 5681)   # 不是 6001
+
+    def test_earliest_summary_wins_as_anchor(self):
+        idx = twitter_monitor._PUSHED_INDEX_CACHE
+        idx["ab:t:111"] = self._record(ts="2026-08-16T09:00:00+00:00", by="late",
+                                       message_ids=[7777], quoted=True)
+        idx["a:777"] = self._record(ts="2026-08-16T06:00:00+00:00", message_ids=[5681])
+        _, plain, _, _ = self._run_queue(self._entry())
+        self.assertEqual(plain[0]["reply_to"], 5681)
+
+    def test_retracted_summary_is_not_an_anchor_falls_back_to_full_summary(self):
+        # 锚点被删减撤回后正文已不在群里 → 必须退回发完整摘要，否则只剩一条评论
+        twitter_monitor._PUSHED_INDEX_CACHE["a:777"] = self._record(
+            retracted_at="2026-08-16T07:00:00+00:00")
+        final, plain, fetches, summaries = self._run_queue(self._entry())
+        self.assertEqual(final["status"], "sent")
+        self.assertNotIn("delivery_form", final)
+        self.assertEqual(fetches, ["777"])
+        self.assertEqual(summaries, ["777"])
+
+    def test_no_prior_summary_delivers_full_summary(self):
+        final, plain, fetches, _ = self._run_queue(self._entry())
+        self.assertEqual(final["status"], "sent")
+        self.assertNotIn("delivery_form", final)
+        self.assertEqual(fetches, ["777"])
+
+    def test_anchor_without_message_id_falls_back_to_full_summary(self):
+        # 响应缺失的投递没有 message_id，挂不上去 → 只能重发完整摘要
+        twitter_monitor._PUSHED_INDEX_CACHE["a:777"] = self._record(message_ids=[])
+        final, _, fetches, _ = self._run_queue(self._entry())
+        self.assertEqual(final["status"], "sent")
+        self.assertEqual(fetches, ["777"])
+
+    def test_bare_entry_never_gets_a_card(self):
+        # 无评论的裸条目没有可补充的内容，走已有的 superseded_by_quote 抑制。
+        # 引用版记在 ab: 键下（semantic 路径的真实形状），a:777 尚空 = 跨账号
+        # 二闸不会先以 cross_dup 拦下，走到的正是删减那道闸。
+        twitter_monitor._PUSHED_INDEX_CACHE["ab:t:888"] = self._record(
+            by="dotey", message_ids=[6001], quoted=True)
+        final, plain, fetches, _ = self._run_queue(
+            self._entry(quote_comment="", bundle_key=""))
+        self.assertEqual(final["status"], "skipped")
+        self.assertEqual(final["skip_reason"], "superseded_by_quote")
+        self.assertEqual(plain, [])
+        self.assertEqual(fetches, [])
+
+    def test_card_send_failure_is_retryable_not_silently_dropped(self):
+        twitter_monitor._PUSHED_INDEX_CACHE["a:777"] = self._record()
+        final, _, _, _ = self._run_queue(
+            self._entry(), send_result={"ok": False, "description": "boom"})
+        self.assertEqual(final["status"], "failed")
+        self.assertEqual(final["failed_stage"], "quote_card_send")
+        self.assertEqual(final["attempts"], 1)     # 计入重试次数，下轮再来
+        self.assertNotIn("ab:t:888", twitter_monitor._PUSHED_INDEX_CACHE)
+
+    def test_disabled_by_default_resummarizes(self):
+        with patch.object(twitter_monitor, "_ARTICLE_QUOTE_CARD_ENABLED", False):
+            twitter_monitor._PUSHED_INDEX_CACHE["a:777"] = self._record()
+            final, _, fetches, summaries = self._run_queue(self._entry())
+        self.assertEqual(final["status"], "sent")
+        self.assertEqual(fetches, ["777"])         # 回到今天的行为：重新抓取 + 摘要
+        self.assertEqual(summaries, ["777"])
+
+    def test_legacy_record_without_form_counts_as_summary_anchor(self):
+        rec = self._record()
+        rec.pop("form")
+        twitter_monitor._PUSHED_INDEX_CACHE["a:777"] = rec
+        _, plain, fetches, _ = self._run_queue(self._entry())
+        self.assertEqual(plain[0]["reply_to"], 5681)
+        self.assertEqual(fetches, [])
+
+    def test_send_telegram_builds_reply_parameters_with_fallback(self):
+        captured = {}
+
+        def fake_post(token, payload, method="sendMessage"):
+            captured["payload"] = payload
+            return {"ok": True}
+
+        with patch.object(twitter_monitor, "_tg_post", side_effect=fake_post):
+            twitter_monitor.send_telegram("tok", "chat", "hi", "https://x.com/i/article/1",
+                                          thread_id=19, reply_to_message_id=5681)
+        rp = captured["payload"]["reply_parameters"]
+        self.assertEqual(rp["message_id"], 5681)
+        # 锚点可能已被删；缺目标必须降级而不是 400 丢掉这条评论
+        self.assertTrue(rp["allow_sending_without_reply"])
+        self.assertEqual(captured["payload"]["message_thread_id"], 19)
+
+    def test_send_telegram_omits_reply_parameters_when_not_replying(self):
+        captured = {}
+        with patch.object(twitter_monitor, "_tg_post",
+                          side_effect=lambda t, p, method="sendMessage": (
+                              captured.update(payload=p), {"ok": True})[1]):
+            twitter_monitor.send_telegram("tok", "chat", "hi")
+        self.assertNotIn("reply_parameters", captured["payload"])
+
+    def test_card_escapes_html_in_title_and_comment(self):
+        card, _ = twitter_monitor.format_article_quote_card(
+            "vista8", {"article_id": "777", "article_title": "<b>标题</b> & 更多",
+                       "quote_comment": "看 <script>alert(1)</script>",
+                       "comment_author": "@dotey", "bundle_key": "t:888"})
+        self.assertNotIn("<script>", card)
+        self.assertNotIn("<b>标题</b>", card)
+        self.assertIn("&lt;script&gt;", card)
+        self.assertIn("&amp;", card)
+
+    def test_card_is_title_plus_comment_only(self):
+        card, _ = twitter_monitor.format_article_quote_card(
+            "vista8", {"article_id": "777", "article_title": "标题",
+                       "quote_comment": "评论", "comment_author": "dotey",
+                       "bundle_key": "t:888"})
+        self.assertEqual(card, "\U0001f4c4 标题\n<blockquote>评论</blockquote>")
+
+    def test_card_without_title_is_comment_only(self):
+        card, _ = twitter_monitor.format_article_quote_card(
+            "vista8", {"article_id": "777", "quote_comment": "评论",
+                       "comment_author": "dotey", "bundle_key": "t:888"})
+        self.assertEqual(card, "<blockquote>评论</blockquote>")
+
+    def test_button_targets_quote_tweet_not_article(self):
+        url = twitter_monitor._quote_tweet_url
+        # bundle_key 是引用推 id，comment_author 是它的作者
+        self.assertEqual(url({"bundle_key": "t:888", "comment_author": "dotey"}),
+                         "https://x.com/dotey/status/888")
+        self.assertEqual(url({"bundle_key": "t:888", "comment_author": "@dotey"}),
+                         "https://x.com/dotey/status/888")
+
+    def test_flat_path_without_bundle_key_falls_back_to_article_url(self):
+        # flat 路径没有 bundle_key；entry["tweet_id"] 是文章所有者的推，不是评论推
+        url = twitter_monitor._quote_tweet_url
+        self.assertEqual(url({"bundle_key": "", "comment_author": "dotey",
+                              "tweet_id": "999"}), "")
+        self.assertEqual(url({"bundle_key": "t:abc", "comment_author": "dotey"}), "")
+        self.assertEqual(url({"bundle_key": "t:888", "comment_author": ""}), "")
+        _, link = twitter_monitor.format_article_quote_card(
+            "vista8", {"article_id": "777", "quote_comment": "评论",
+                       "comment_author": "dotey", "bundle_key": ""})
+        self.assertEqual(link, "https://x.com/i/article/777")
+
+    def test_fallback_to_article_url_keeps_original_button_label(self):
+        # 无 bundle_key 时按钮回落文章页，文案也要跟着回落（否则「查看引用推文」
+        # 点开的是文章，名不副实）。直调 deliver：flat 引用条目在跨账号去重开启时
+        # 走不到这里（会先被 a:<id> 二闸以 cross_dup 拦掉）。
+        sent = {}
+
+        def fake_plain(token, cid, text, link="", *, preview_url="", thread_id=None,
+                       reply_to_message_id=None, button_text=""):
+            sent.update(link=link, button_text=button_text)
+            return {"ok": True, "result": {"message_id": 6002}}
+
+        entry = self._entry(bundle_key="")
+        with patch.object(twitter_monitor, "send_telegram", side_effect=fake_plain), \
+             patch.object(twitter_monitor.time, "sleep", return_value=None):
+            twitter_monitor._deliver_article_quote_card(
+                "bot", "-1004424841223", "vista8", entry,
+                {"message_ids": [5681], "chat_id": "-1004424841223",
+                 "form": "summary", "cover_url": ""}, thread_id=19)
+        self.assertEqual(entry["status"], "sent")
+        self.assertEqual(sent["link"], "https://x.com/i/article/777")
+        self.assertEqual(sent["button_text"], "\U0001f517 打开原文")
+
+    # ── 卡片配图（复用首条摘要记下的封面，不为一张图重抓全文）──
+
+    def _run_card_with_cover(self, *, cover="https://pbs.twimg.com/media/cover.jpg",
+                             comment=None, photo_result=None):
+        import json as _json
+        import os as _os
+        import tempfile
+        photos, plains = [], []
+
+        def fake_photo(token, cid, ph, caption="", link="", *, thread_id=None,
+                       reply_to_message_id=None, button_text=""):
+            photos.append({"photo": ph, "caption": caption, "link": link,
+                           "reply_to": reply_to_message_id, "thread_id": thread_id,
+                           "button_text": button_text})
+            return photo_result if photo_result is not None else {
+                "ok": True, "result": {"message_id": 6001}, "send_method": "sendPhoto"}
+
+        def fake_plain(token, cid, text, link="", *, preview_url="", thread_id=None,
+                       reply_to_message_id=None, button_text=""):
+            plains.append({"text": text, "reply_to": reply_to_message_id,
+                           "link": link, "button_text": button_text})
+            return {"ok": True, "result": {"message_id": 6002}}
+
+        entry = self._entry() if comment is None else self._entry(quote_comment=comment)
+        twitter_monitor._PUSHED_INDEX_CACHE["a:777"] = self._record(cover_url=cover)
+        with tempfile.TemporaryDirectory() as d:
+            with open(_os.path.join(d, "vista8_queue.json"), "w") as f:
+                _json.dump([entry], f)
+            with patch.object(twitter_monitor, "ARTICLE_QUEUE_DIR", d), \
+                 patch.object(twitter_monitor, "ARTICLE_CACHE_DIR",
+                              _os.path.join(d, "cache")), \
+                 patch.object(twitter_monitor, "fetch_article_markdown",
+                              side_effect=AssertionError("卡片路径不该抓取")), \
+                 patch.object(twitter_monitor, "send_telegram_photo",
+                              side_effect=fake_photo), \
+                 patch.object(twitter_monitor, "send_telegram", side_effect=fake_plain), \
+                 patch.object(twitter_monitor, "_tg_post_quiet",
+                              return_value={"ok": True}), \
+                 patch.object(twitter_monitor.time, "sleep", return_value=None):
+                twitter_monitor.process_article_queue(FakeAI(True), "bot",
+                                                      "-1004424841223", thread_id=19)
+            with open(_os.path.join(d, "vista8_queue.json")) as f:
+                final = _json.load(f)[0]
+        return final, photos, plains
+
+    def test_card_carries_cover_as_photo_reply(self):
+        final, photos, plains = self._run_card_with_cover()
+        self.assertEqual(final["status"], "sent")
+        self.assertEqual(final["delivery_form"], "quote_card")
+        self.assertEqual(len(photos), 1)
+        self.assertEqual(plains, [])           # 带图时不再发纯文本
+        self.assertEqual(photos[0]["photo"], "https://pbs.twimg.com/media/cover.jpg")
+        self.assertEqual(photos[0]["reply_to"], 5681)
+        self.assertEqual(photos[0]["thread_id"], 19)
+        self.assertEqual(photos[0]["link"], "https://x.com/dotey/status/888")
+        self.assertEqual(photos[0]["button_text"], "\U0001f517 查看引用推文")
+        self.assertNotIn("也引用了这篇文章", photos[0]["caption"])
+        self.assertIn("这篇把上下文窗口的取舍讲透了", photos[0]["caption"])
+
+    def test_summary_delivery_records_cover_for_later_cards(self):
+        # 卡片不抓 markdown，封面只能来自首条摘要投递时的登记
+        idx = twitter_monitor._PUSHED_INDEX_CACHE
+        with patch.object(twitter_monitor, "extract_article_cover",
+                          return_value="https://pbs.twimg.com/media/c.jpg"):
+            self._run_queue(self._entry(quote_comment="", bundle_key=""))
+        self.assertEqual(idx["a:777"]["cover_url"], "https://pbs.twimg.com/media/c.jpg")
+
+    def test_no_cover_recorded_falls_back_to_plain_text_card(self):
+        final, photos, plains = self._run_card_with_cover(cover="")
+        self.assertEqual(final["status"], "sent")
+        self.assertEqual(photos, [])
+        self.assertEqual(len(plains), 1)
+        self.assertEqual(plains[0]["reply_to"], 5681)
+
+    def test_rejected_photo_falls_back_to_plain_text_not_dropped(self):
+        # 图挂了不能把评论一起丢掉
+        final, photos, plains = self._run_card_with_cover(
+            photo_result={"ok": False, "photo_fallback": True,
+                          "description": "wrong file identifier"})
+        self.assertEqual(final["status"], "sent")
+        self.assertEqual(len(photos), 1)
+        self.assertEqual(len(plains), 1)
+        self.assertIn("这篇把上下文窗口的取舍讲透了", plains[0]["text"])
+
+    def test_long_comment_shrinks_to_fit_caption_limit(self):
+        _, photos, plains = self._run_card_with_cover(comment="很长的评论。" * 200)
+        self.assertEqual(len(photos), 1)
+        self.assertLessEqual(
+            twitter_monitor._utf16_len(photos[0]["caption"]),
+            twitter_monitor.ARTICLE_CARD_CAPTION_MAX)
+        self.assertEqual(plains, [])
+
+    def test_caption_still_too_long_uses_plain_text_instead_of_400(self):
+        # 标题本身就撑满 caption 时收紧评论也救不回来 → 走 4096 上限的纯文本
+        long_title = "标" * 900
+        with patch.object(twitter_monitor, "ARTICLE_CARD_CAPTION_MAX", 40):
+            final, photos, plains = self._run_card_with_cover(comment=long_title)
+        self.assertEqual(final["status"], "sent")
+        self.assertEqual(photos, [])
+        self.assertEqual(len(plains), 1)
+
+    def test_photo_send_builds_reply_parameters(self):
+        captured = {}
+        with patch.object(twitter_monitor, "_tg_post",
+                          side_effect=lambda t, p, method="sendMessage": (
+                              captured.update(payload=p, method=method), {"ok": True})[1]):
+            twitter_monitor.send_telegram_photo(
+                "tok", "chat", "https://pbs.twimg.com/media/a.jpg", "cap",
+                "https://x.com/i/article/1", thread_id=19, reply_to_message_id=5681)
+        self.assertEqual(captured["method"], "sendPhoto")
+        self.assertEqual(captured["payload"]["reply_parameters"]["message_id"], 5681)
+        self.assertTrue(
+            captured["payload"]["reply_parameters"]["allow_sending_without_reply"])
+        # 配图卡片仍要保留「打开原文」按钮
+        self.assertEqual(
+            captured["payload"]["reply_markup"]["inline_keyboard"][0][0]["url"],
+            "https://x.com/i/article/1")
+
+    def test_photo_send_omits_reply_parameters_when_not_replying(self):
+        captured = {}
+        with patch.object(twitter_monitor, "_tg_post",
+                          side_effect=lambda t, p, method="sendMessage": (
+                              captured.update(payload=p), {"ok": True})[1]):
+            twitter_monitor.send_telegram_photo("tok", "chat", "u", "cap")
+        self.assertNotIn("reply_parameters", captured["payload"])
+
+    def test_main_wires_quote_card_flag(self):
+        seen = {}
+
+        def fake_queue(ai, bot_token, chat_id, dry_run=False, *, thread_id=None,
+                       thread_map=None):
+            seen["flag"] = twitter_monitor._ARTICLE_QUOTE_CARD_ENABLED
+            return 0
+
+        for value, expected in (("true", True), (None, False)):
+            key = "" if value is None else f', "article_quote_card_enabled": {value}'
+            cfg = Path("test_config_quotecard.json")
+            cfg.write_text('{"telegram_bot_token": "b", "telegram_chat_id": "c"'
+                           + key + "}")
+            try:
+                with patch.object(twitter_monitor, "CONFIG_PATH", str(cfg)), \
+                     patch.object(twitter_monitor, "ROUTE_TABLE_PATH",
+                                  "test_route_table_absent.json"), \
+                     patch.object(twitter_monitor, "FAILURES_PATH",
+                                  "test_failures_quotecard.json"), \
+                     patch.object(twitter_monitor, "update_status_dashboard"), \
+                     patch.object(twitter_monitor, "check_cookie_health"), \
+                     patch.object(twitter_monitor.TokenPool, "load", return_value=None), \
+                     patch.object(twitter_monitor.AIClassifier, "load",
+                                  return_value=FakeAI(False)), \
+                     patch.object(twitter_monitor, "load_accounts",
+                                  return_value=[{"username": "u"}]), \
+                     patch.object(twitter_monitor, "process_user",
+                                  return_value=(0, 0, 0, 0)), \
+                     patch.object(twitter_monitor, "process_article_queue",
+                                  side_effect=fake_queue), \
+                     patch.object(sys, "argv", ["twitter_monitor.py"]):
+                    self.assertEqual(twitter_monitor.main(), 0)
+            finally:
+                cfg.unlink(missing_ok=True)
+                Path("test_failures_quotecard.json").unlink(missing_ok=True)
+            self.assertIs(seen["flag"], expected, f"config value {value!r}")
 
 
 class MainContentRoutingTest(unittest.TestCase):
@@ -2993,6 +5386,15 @@ class ThreadNotFoundFallbackTest(unittest.TestCase):
         self.assertNotIn("rich_fallback", r)
         self.assertEqual([c.get("message_thread_id") for c in calls], [555, 19])
 
+    def test_send_telegram_photo_falls_back_to_default_thread(self):
+        calls = []
+        with patch.object(twitter_monitor, "_tg_post",
+                          side_effect=self._thread_not_found_post(calls)):
+            r = twitter_monitor.send_telegram_photo(
+                "bot", "chat", "https://pbs.twimg.com/media/a.jpg", "hi", thread_id=555)
+        self.assertTrue(r.get("ok"))
+        self.assertEqual([c.get("message_thread_id") for c in calls], [555, 19])
+
     def test_no_fallback_id_drops_to_general(self):
         calls = []
         with patch.object(twitter_monitor, "_THREAD_FALLBACK_ID", None), \
@@ -3078,6 +5480,7 @@ class TgPostDeliveryClassificationTest(unittest.TestCase):
         import io
         import urllib.error
         err = urllib.error.HTTPError("url", 400, "Bad Request", {}, io.BytesIO(b"{}"))
+        self.addCleanup(err.close)
         with patch("urllib.request.urlopen", side_effect=err):
             with self.assertRaises(urllib.error.HTTPError) as ctx:
                 twitter_monitor._tg_post("tok", {"chat_id": "1"})
@@ -3136,15 +5539,14 @@ class TgPostDeliveryClassificationTest(unittest.TestCase):
             with self.assertRaises(twitter_monitor.TgAmbiguousDelivery):
                 twitter_monitor._tg_post("tok", {"chat_id": "1"})
 
-    def test_5xx_does_not_reset_ambiguous_streak(self):
-        """502/504 多为边缘 nginx 在后端挂死时生成：清零会让「一半 502 一半超时」
-        的大面积故障绕过熔断、批量静默丢推。"""
+    def test_5xx_becomes_ambiguous_and_does_not_reset_streak(self):
+        """5xx 不能证明请求未被接收；必须禁止重试且不能清零熔断。"""
         import io
         import urllib.error
         twitter_monitor._AMBIGUOUS_STREAK = 1
         err = urllib.error.HTTPError("url", 502, "Bad Gateway", {}, io.BytesIO(b""))
         with patch("urllib.request.urlopen", side_effect=err):
-            with self.assertRaises(urllib.error.HTTPError):
+            with self.assertRaises(twitter_monitor.TgAmbiguousDelivery):
                 twitter_monitor._tg_post("tok", {"chat_id": "1"})
         self.assertEqual(twitter_monitor._AMBIGUOUS_STREAK, 1)
 
@@ -3154,6 +5556,7 @@ class TgPostDeliveryClassificationTest(unittest.TestCase):
         import urllib.error
         twitter_monitor._AMBIGUOUS_STREAK = 1
         err = urllib.error.HTTPError("url", 429, "Too Many Requests", {}, io.BytesIO(b"{}"))
+        self.addCleanup(err.close)
         with patch("urllib.request.urlopen", side_effect=err):
             with self.assertRaises(urllib.error.HTTPError):
                 twitter_monitor._tg_post("tok", {"chat_id": "1"})
@@ -3170,7 +5573,7 @@ class TgPostDeliveryClassificationTest(unittest.TestCase):
 
 class SendAmbiguousDeliveryTest(unittest.TestCase):
     """发送函数对 TgAmbiguousDelivery 按已送达处理：不重发、不回退、返回 ok；
-    连续歧义熔断按失败；痕迹落盘隔离到临时文件。"""
+    连续歧义也不得改判为可重试失败；痕迹落盘隔离到临时文件。"""
 
     def setUp(self):
         twitter_monitor._AMBIGUOUS_STREAK = 0
@@ -3225,8 +5628,8 @@ class SendAmbiguousDeliveryTest(unittest.TestCase):
         self.assertTrue(r["ok"])
         self.assertEqual(calls, ["sendRichMessage"])  # 无 sendMessage 回退
 
-    def test_consecutive_ambiguous_breaks_to_failure(self):
-        """熔断：进程内第 2 条连续歧义按失败抛出（进 push_retry），防大面积故障批量丢推。"""
+    def test_consecutive_ambiguous_remain_unknown_without_retry(self):
+        """连续未知结果仍不能证明未送达；每条只尝试一次并持久留痕。"""
 
         def fake_post(token, payload, method="sendMessage"):
             raise twitter_monitor.TgAmbiguousDelivery("socket.timeout: timed out")
@@ -3235,8 +5638,23 @@ class SendAmbiguousDeliveryTest(unittest.TestCase):
                 patch("time.sleep"):
             first = twitter_monitor.send_telegram("tok", "1", "msg-1")
             self.assertTrue(first["assumed_delivered"])
-            with self.assertRaises(twitter_monitor.TgAmbiguousDelivery):
-                twitter_monitor.send_telegram("tok", "1", "msg-2")
+            second = twitter_monitor.send_telegram("tok", "1", "msg-2")
+            self.assertTrue(second["assumed_delivered"])
+        entries = json.loads(Path(twitter_monitor.ASSUMED_DELIVERY_PATH).read_text())
+        self.assertEqual(len(entries), 2)  # 每个未知结果都必须可审计
+
+    def test_success_results_include_send_method_for_ledger_audit(self):
+        # Each HTTP call returns a fresh decoded object in production. A shared
+        # return_value would retain the first wrapper's setdefault annotation.
+        with patch.object(twitter_monitor, "_tg_post",
+                          side_effect=lambda *a, **k: {"ok": True}), \
+             patch("time.sleep"):
+            self.assertEqual(twitter_monitor.send_telegram("t", "c", "x")["send_method"],
+                             "sendMessage")
+            self.assertEqual(twitter_monitor.send_telegram_photo(
+                "t", "c", "https://example.com/a.jpg")["send_method"], "sendPhoto")
+            self.assertEqual(twitter_monitor.send_telegram_rich(
+                "t", "c", html="x")["send_method"], "sendRichMessage")
 
     def test_ambiguous_leaves_persistent_trace(self):
         """按已送达处理必须留痕：下一轮汇总 DM 靠这个文件发现真丢推。"""
@@ -3316,7 +5734,8 @@ class PushBudgetAndCheckpointTest(unittest.TestCase):
         """第 1 条送达后进程被 SIGALRM 杀（SystemExit）：seen 必须已落盘。"""
         seen_snapshots = []
 
-        def fake_send(token, chat_id, username, t, ai=None, thread_id=None):
+        def fake_send(token, chat_id, username, t, ai=None, thread_id=None,
+                      reply_to_message_id=None):
             if t["id"] == "t2":
                 raise SystemExit(1)  # 模拟 SIGALRM handler 的 sys.exit
             return {"ok": True}
@@ -3347,7 +5766,8 @@ class PushBudgetAndCheckpointTest(unittest.TestCase):
                  "text": "这是一条长度足够通过分类过滤器的正常推文内容等待重试",
                  "createdAt": "Mon May 11 15:55:43 +0000 2026"}
 
-        def fake_send(token, chat_id, username, t, ai=None, thread_id=None):
+        def fake_send(token, chat_id, username, t, ai=None, thread_id=None,
+                      reply_to_message_id=None):
             return {"ok": True}
 
         with patch.object(twitter_monitor, "datetime", FixedDatetime), \
@@ -3397,6 +5817,47 @@ class PushBudgetAndCheckpointTest(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 twitter_monitor.send_telegram_rich("tok", "1", html="<b>hi</b>")
         m.assert_not_called()
+
+    def test_ambiguous_circuit_trip_checkpoints_current_and_defers_rest(self):
+        """The tripping request is unknown, while later requests were never sent."""
+        tweets = [self._tweet(f"t{i}", 19 + i) for i in range(1, 4)]
+        calls, seen_snapshots, retry_snapshots = [], [], []
+        ledger_tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(ledger_tmp.cleanup)
+        ledger = str(Path(ledger_tmp.name) / "events.sqlite3")
+
+        def fake_send(_token, _chat_id, _username, tweet, _ai=None, thread_id=None,
+                      reply_to_message_id=None):
+            calls.append(tweet["id"])
+            if tweet["id"] == "t2":
+                raise twitter_monitor.TgAmbiguousDelivery("HTTP 504: Gateway Timeout")
+            return {"ok": True, "result": {"message_id": 1},
+                    "send_method": "sendRichMessage"}
+
+        with patch.object(twitter_monitor, "_EVENT_DEDUP_EFFECTIVE_MODE", "observe"), \
+             patch.object(twitter_monitor, "EVENT_LEDGER_PATH", ledger), \
+             patch.object(twitter_monitor, "datetime", FixedDatetime), \
+             patch.object(twitter_monitor, "fetch_tweets", return_value=tweets), \
+             patch.object(twitter_monitor, "load_seen", return_value=({"old"}, None)), \
+             patch.object(twitter_monitor, "load_push_retry", return_value=set()), \
+             patch.object(twitter_monitor, "save_seen",
+                          side_effect=lambda _u, ids, last_post_ts=None:
+                          seen_snapshots.append(set(ids))), \
+             patch.object(twitter_monitor, "save_push_retry",
+                          side_effect=lambda _u, ids: retry_snapshots.append(set(ids))), \
+             patch.object(twitter_monitor, "send_tweet", side_effect=fake_send), \
+             patch.object(twitter_monitor.time, "sleep", return_value=None):
+            _new, pushed, _filtered, _overridden = twitter_monitor.process_user(
+                None, FakeAI(False), "u", "b", "c", self._args())
+
+        self.assertEqual(calls, ["t1", "t2"])
+        self.assertEqual(pushed, 2)
+        self.assertTrue(any("t2" in snapshot for snapshot in seen_snapshots))
+        self.assertIn("t3", retry_snapshots[-1])
+        with twitter_monitor._event_ledger_connect(ledger) as db:
+            states = {row["tweet_id"]: row["state"] for row in db.execute(
+                "SELECT tweet_id,state FROM deliveries")}
+        self.assertEqual(states, {"t1": "confirmed", "t2": "ambiguous"})
 
     def test_orphan_retry_entry_already_seen_is_pruned_not_repushed(self):
         """checkpoint 顺序被杀留下的孤儿（seen ∧ push_retry）：清理且不重推。"""
@@ -3460,8 +5921,8 @@ class MacrumorsAmbiguousDeliveryTest(unittest.TestCase):
         self.assertEqual(len(calls), 1)  # 不盲目重发
         self.assertEqual(self.recorded, [("sendMessage(macrumors)", "digest 1/2")])
 
-    def test_send_html_consecutive_ambiguous_breaks_to_failure(self):
-        """连续歧义熔断：第 2 条 digest 消息按失败抛出 → main 不标 seen 次日重试。"""
+    def test_send_html_consecutive_ambiguous_never_retries(self):
+        """连续歧义仍按未知送达收口，不让 digest 次日盲重发。"""
 
         def fake_post(token, payload, method="sendMessage"):
             raise twitter_monitor.TgAmbiguousDelivery("socket.timeout: timed out")
@@ -3469,11 +5930,14 @@ class MacrumorsAmbiguousDeliveryTest(unittest.TestCase):
         with patch.object(twitter_monitor, "_tg_post", side_effect=fake_post), \
                 patch("time.sleep"):
             self.md.send_html("tok", "1", "part1", trace_id="digest 1/2")  # 首条按已送达
-            with self.assertRaises(twitter_monitor.TgAmbiguousDelivery):
-                self.md.send_html("tok", "1", "part2", trace_id="digest 2/2")
+            self.md.send_html("tok", "1", "part2", trace_id="digest 2/2")
+        self.assertEqual(self.recorded, [
+            ("sendMessage(macrumors)", "digest 1/2"),
+            ("sendMessage(macrumors)", "digest 2/2"),
+        ])
 
-    def test_card_ambiguous_counts_toward_streak_so_html_breaks_first(self):
-        """卡片歧义计入连续计数：大面积故障时 send_html 第一条即可熔断。"""
+    def test_card_then_html_ambiguous_are_both_audited_without_retry(self):
+        """卡片后续文字都无回执时，两者均只留痕而不重发。"""
 
         def fake_post(token, payload, method="sendMessage"):
             raise twitter_monitor.TgAmbiguousDelivery("socket.timeout: timed out")
@@ -3483,8 +5947,11 @@ class MacrumorsAmbiguousDeliveryTest(unittest.TestCase):
         with patch.object(twitter_monitor, "_tg_post", side_effect=fake_post), \
                 patch("time.sleep"):
             self.md.send_card("tok", "1", item)  # 卡片按已送达，但计数=1
-            with self.assertRaises(twitter_monitor.TgAmbiguousDelivery):
-                self.md.send_html("tok", "1", "part1")  # 连续第 2 条 → 熔断
+            self.md.send_html("tok", "1", "part1", trace_id="digest 1/1")
+        self.assertEqual(self.recorded, [
+            ("sendPhoto(macrumors)", "https://www.macrumors.com/x"),
+            ("sendMessage(macrumors)", "digest 1/1"),
+        ])
 
 
 class FlushAssumedDeliveryNoticeTest(unittest.TestCase):
@@ -3674,6 +6141,447 @@ class CookieHealthAlertTest(unittest.TestCase):
                 st = json.loads(Path(path).read_text())
             self.assertEqual(sent, [])
             self.assertEqual(st["consecutive_degraded"], 0)
+
+
+class MusingClassifyTest(unittest.TestCase):
+    """碎碎念规则层：classify 启发式 + 不误伤实质内容。"""
+
+    def test_pocket3_fishing_sample_is_musing_suspicious(self):
+        t = {
+            "text": "把pocket3充满电，准备去钓鱼。",
+            "media": [{"type": "photo", "url": "https://pbs.twimg.com/media/x.jpg"}],
+        }
+        status, reason = twitter_monitor.classify(t)
+        self.assertEqual(status, "suspicious")
+        self.assertTrue(
+            reason.startswith(twitter_monitor.REASON_MUSING_PREFIX),
+            msg=reason,
+        )
+
+    def test_short_photo_status_is_musing(self):
+        t = {
+            # ≥ MIN_LEN=18，否则会先被 too_short 硬过滤
+            "text": "今天天气真的不错呀，出门去晒太阳了。",
+            "media": [{"type": "photo", "url": "https://pbs.twimg.com/media/x.jpg"}],
+        }
+        status, reason = twitter_monitor.classify(t)
+        self.assertEqual(status, "suspicious")
+        self.assertTrue(reason.startswith(twitter_monitor.REASON_MUSING_PREFIX), msg=reason)
+
+    def test_life_kw_without_photo_is_musing(self):
+        t = {"text": "周末宅家追剧，什么都不想干就这样过。"}
+        status, reason = twitter_monitor.classify(t)
+        self.assertEqual(status, "suspicious")
+        self.assertIn("musing_life_kw", reason)
+
+    def test_technical_post_still_passes(self):
+        t = {"text": "Claude 新 API 支持 prompt caching，延迟降一半。"}
+        status, reason = twitter_monitor.classify(t)
+        self.assertEqual((status, reason), ("pass", "ok"))
+
+    def test_substantive_keyword_blocks_musing(self):
+        t = {
+            "text": "把手机充满电后继续跑本地模型评测，结果很意外。",
+            "media": [{"type": "photo", "url": "https://pbs.twimg.com/media/x.jpg"}],
+        }
+        status, reason = twitter_monitor.classify(t)
+        self.assertEqual((status, reason), ("pass", "ok"))
+
+    def test_non_media_url_blocks_musing(self):
+        t = {
+            "text": "出门钓鱼前看这篇 https://example.com/guide 讲得不错。",
+            "media": [{"type": "photo", "url": "https://pbs.twimg.com/media/x.jpg"}],
+            "entities": {
+                "urls": [{"url": "https://t.co/abc", "expanded_url": "https://example.com/guide"}],
+            },
+        }
+        status, reason = twitter_monitor.classify(t)
+        self.assertEqual((status, reason), ("pass", "ok"))
+
+    def test_too_short_still_hard_filter(self):
+        status, reason = twitter_monitor.classify({"text": "短"})
+        self.assertEqual(status, "filter")
+        self.assertTrue(reason.startswith("too_short"), msg=reason)
+
+    def test_long_note_tweet_not_musing(self):
+        t = {
+            "text": "把pocket3充满电，准备去钓鱼。",
+            "note_tweet": {"text": "关于 AI agent 工作流的一些观察：" + ("细节" * 80)},
+            "media": [{"type": "photo", "url": "https://pbs.twimg.com/media/x.jpg"}],
+        }
+        status, reason = twitter_monitor.classify(t)
+        self.assertEqual((status, reason), ("pass", "ok"))
+
+    def test_commercial_still_suspicious_not_musing(self):
+        t = {
+            "text": "byteplus seedance 2.0 api 文档访问体验开通模型冲 200 立即体验方舟平台",
+        }
+        status, reason = twitter_monitor.classify(t)
+        self.assertEqual(status, "suspicious")
+        self.assertTrue(reason.startswith("commercial"), msg=reason)
+
+
+class MusingProcessUserTest(unittest.TestCase):
+    """碎碎念 process_user：AI 确认/否决/失败/无 AI 默认 filter。"""
+
+    SAMPLE = {
+        "id": "m1",
+        "text": "把pocket3充满电，准备去钓鱼。",
+        "media": [{"type": "photo", "url": "https://pbs.twimg.com/media/x.jpg"}],
+        "createdAt": "Tue May 12 00:20:00 +0000 2026",
+    }
+
+    def _run(self, ai, tweet=None):
+        args = argparse.Namespace(test=False, seed=False, dry_run=False,
+                                  limit=20, max_push_age_minutes=45)
+        pushed_ids = []
+
+        def fake_send_tweet(token, chat_id, username, t, ai=None, thread_id=None,
+                            reply_to_message_id=None):
+            pushed_ids.append(t["id"])
+            return {"ok": True}
+
+        with patch.object(twitter_monitor, "datetime", FixedDatetime), \
+             patch.object(twitter_monitor, "fetch_tweets",
+                          return_value=[tweet or self.SAMPLE]), \
+             patch.object(twitter_monitor, "load_seen", return_value=({"old"}, None)), \
+             patch.object(twitter_monitor, "save_seen", return_value=None), \
+             patch.object(twitter_monitor, "send_tweet", side_effect=fake_send_tweet), \
+             patch.object(twitter_monitor, "_alert_ai_all_failed", return_value=None), \
+             patch.object(twitter_monitor.time, "sleep", return_value=None):
+            new, pushed, filt, ov = twitter_monitor.process_user(
+                pool=None, ai=ai, username="vista8",
+                bot_token="b", chat_id="c", args=args)
+        return new, pushed, filt, ov, pushed_ids
+
+    def test_ai_confirms_musing_filters(self):
+        new, pushed, filt, ov, ids = self._run(FakeAI(True, musing=True, musing_reason="life"))
+        self.assertEqual((new, pushed, filt, ov), (1, 0, 1, 0))
+        self.assertEqual(ids, [])
+
+    def test_ai_rejects_musing_pushes(self):
+        new, pushed, filt, ov, ids = self._run(
+            FakeAI(True, musing=False, musing_reason="has_insight"))
+        self.assertEqual((new, pushed, filt), (1, 1, 0))
+        self.assertEqual(ov, 1)
+        self.assertEqual(ids, ["m1"])
+
+    def test_no_ai_filters_musing_by_default(self):
+        new, pushed, filt, ov, ids = self._run(FakeAI(False))
+        self.assertEqual((new, pushed, filt, ov), (1, 0, 1, 0))
+        self.assertEqual(ids, [])
+
+    def test_ai_all_failed_filters_musing(self):
+        class FailAI:
+            def is_available(self):
+                return True
+
+            def confirm_musing(self, username, text):
+                return False, "all_ai_failed"
+
+            def confirm_promo(self, username, text):
+                return False, "all_ai_failed"
+
+        new, pushed, filt, ov, ids = self._run(FailAI())
+        self.assertEqual((new, pushed, filt, ov), (1, 0, 1, 0))
+        self.assertEqual(ids, [])
+
+    def test_promo_no_ai_still_passes(self):
+        promo = {
+            "id": "p1",
+            "text": "byteplus seedance 2.0 api 文档访问体验开通模型冲 200 立即体验方舟平台",
+            "createdAt": "Tue May 12 00:20:00 +0000 2026",
+        }
+        new, pushed, filt, ov, ids = self._run(FakeAI(False), tweet=promo)
+        self.assertEqual((new, pushed, filt), (1, 1, 0))
+        self.assertEqual(ids, ["p1"])
+
+
+class SelfReplyParentTest(unittest.TestCase):
+    """self_reply_parent_id：只认「同作者接自己上一条」，其余一律不接线程。"""
+
+    @staticmethod
+    def reply(parent_id="100", screen_name="vista8", user_id="", **extra):
+        t = {"id": "101", "text": "补充一句",
+             "user": {"screen_name": "vista8", "id_str": "42"},
+             "in_reply_to_status": {"id": parent_id, "screen_name": screen_name,
+                                    "user_id": user_id}}
+        t.update(extra)
+        return t
+
+    def test_self_reply_matches_on_screen_name(self):
+        self.assertEqual(
+            twitter_monitor.self_reply_parent_id(self.reply(), "vista8"), "100")
+
+    def test_screen_name_match_is_case_insensitive(self):
+        self.assertEqual(
+            twitter_monitor.self_reply_parent_id(self.reply(screen_name="ViSta8"), "vista8"),
+            "100")
+
+    def test_reply_to_another_author_never_threads(self):
+        # 接到自己某条消息下面会张冠李戴：别人的推文不是本账号的串
+        self.assertEqual(
+            twitter_monitor.self_reply_parent_id(self.reply(screen_name="dotey"), "vista8"), "")
+
+    def test_missing_screen_name_falls_back_to_numeric_user_id(self):
+        self.assertEqual(
+            twitter_monitor.self_reply_parent_id(
+                self.reply(screen_name="", user_id="42"), "vista8"), "100")
+        self.assertEqual(
+            twitter_monitor.self_reply_parent_id(
+                self.reply(screen_name="", user_id="43"), "vista8"), "")
+
+    def test_unresolvable_author_never_threads(self):
+        self.assertEqual(
+            twitter_monitor.self_reply_parent_id(
+                self.reply(screen_name="", user_id=""), "vista8"), "")
+
+    def test_retweet_shell_never_threads(self):
+        # 转推壳正文来自他人，即便 legacy 带 in_reply_to 也不能接自己的串
+        tweet = self.reply(retweeted_status={"id": "900", "screen_name": "other"})
+        self.assertEqual(twitter_monitor.self_reply_parent_id(tweet, "vista8"), "")
+
+    def test_non_reply_and_malformed_parent_return_empty(self):
+        self.assertEqual(twitter_monitor.self_reply_parent_id({"id": "1"}, "vista8"), "")
+        self.assertEqual(
+            twitter_monitor.self_reply_parent_id(self.reply(parent_id="not-an-id"), "vista8"), "")
+        self.assertEqual(
+            twitter_monitor.self_reply_parent_id({"in_reply_to_status": "x"}, "vista8"), "")
+
+
+class TweetAnchorStoreTest(unittest.TestCase):
+    """推文 → Telegram 消息锚点：按投递目标隔离 + TTL 回收 + 一次性回填。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = str(Path(self.tmp.name) / "ledger.sqlite3")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_roundtrip_and_overwrite(self):
+        twitter_monitor.record_tweet_anchor("100", 5754, username="Khazix0918",
+                                            target_chat_id="g", target_thread_id=1145,
+                                            path=self.db)
+        self.assertEqual(twitter_monitor.lookup_tweet_anchor(
+            "100", target_chat_id="g", target_thread_id=1145, path=self.db), 5754)
+        twitter_monitor.record_tweet_anchor("100", 5999, target_chat_id="g",
+                                            target_thread_id=1145, path=self.db)
+        self.assertEqual(twitter_monitor.lookup_tweet_anchor(
+            "100", target_chat_id="g", target_thread_id=1145, path=self.db), 5999)
+
+    def test_lookup_is_scoped_to_chat_and_thread(self):
+        # 话题改路由后旧锚点属于别的话题，跨话题回复会被 Telegram 400 拒；
+        # 查不到才是正确的降级。
+        twitter_monitor.record_tweet_anchor("100", 5754, target_chat_id="g",
+                                            target_thread_id=1145, path=self.db)
+        for chat, thread in (("g", 1146), ("other", 1145), ("g", None)):
+            self.assertIsNone(twitter_monitor.lookup_tweet_anchor(
+                "100", target_chat_id=chat, target_thread_id=thread, path=self.db))
+
+    def test_missing_message_id_is_not_recorded(self):
+        # 歧义送达没有 message_id：宁可退化成独立消息，也不能记个空锚点
+        self.assertFalse(twitter_monitor.record_tweet_anchor("100", None, path=self.db))
+        self.assertIsNone(twitter_monitor.lookup_tweet_anchor("100", path=self.db))
+
+    def test_write_evicts_entries_past_ttl(self):
+        stale = datetime.now(timezone.utc) - timedelta(
+            days=twitter_monitor.TWEET_ANCHOR_TTL_DAYS + 1)
+        twitter_monitor.record_tweet_anchor("old", 1, path=self.db, now=stale)
+        self.assertEqual(twitter_monitor.lookup_tweet_anchor("old", path=self.db), 1)
+        twitter_monitor.record_tweet_anchor("fresh", 2, path=self.db)
+        self.assertIsNone(twitter_monitor.lookup_tweet_anchor("old", path=self.db))
+        self.assertEqual(twitter_monitor.lookup_tweet_anchor("fresh", path=self.db), 2)
+
+    def _rewind_to_pre_anchor_ledger(self):
+        """把库退回「只有 deliveries、还没有锚点表」的升级前状态。"""
+        with twitter_monitor._event_ledger_connect(self.db) as db:
+            db.execute("DELETE FROM tweet_anchors")
+            db.execute("PRAGMA user_version=0")
+
+    def test_backfills_confirmed_deliveries_exactly_once(self):
+        with patch.object(twitter_monitor, "_EVENT_DEDUP_EFFECTIVE_MODE", "observe"):
+            for tid, message_id, state in (("100", 4242, "confirmed"),
+                                           ("200", 4243, "ambiguous"),
+                                           ("300", None, "failed_pre_send")):
+                claim = twitter_monitor.claim_event_delivery(
+                    {"id": tid, "text": "parent " + tid}, "vista8",
+                    target_chat_id="g", target_thread_id=1145, path=self.db)
+                twitter_monitor.finish_event_delivery(
+                    claim, state, {"result": {"message_id": message_id}}, path=self.db)
+        self._rewind_to_pre_anchor_ledger()
+
+        def anchor(tid):
+            return twitter_monitor.lookup_tweet_anchor(
+                tid, target_chat_id="g", target_thread_id=1145, path=self.db)
+
+        # 升级后首次连接即回填，历史父推立刻可接线程，不必空等一个 TTL 攒锚点
+        self.assertEqual(anchor("100"), 4242)
+        # 只认已确认送达：歧义/失败的投递没有可靠的 message_id
+        self.assertIsNone(anchor("200"))
+        self.assertIsNone(anchor("300"))
+        # 回填只跑一次：TTL 清掉的锚点不该被下次连接反复捞回来
+        with twitter_monitor._event_ledger_connect(self.db) as db:
+            db.execute("DELETE FROM tweet_anchors")
+        self.assertIsNone(anchor("100"))
+
+    def test_backfill_survives_a_ledger_without_target_columns(self):
+        # 目标列是后加的；回填若排在列迁移之前，老库会 no such column 直接炸库
+        legacy = sqlite3.connect(self.db)
+        legacy.executescript("""
+            CREATE TABLE deliveries (
+                delivery_key TEXT PRIMARY KEY, event_key TEXT NOT NULL,
+                event_type TEXT NOT NULL DEFAULT '', facts_json TEXT NOT NULL DEFAULT '[]',
+                tweet_id TEXT NOT NULL, username TEXT NOT NULL,
+                state TEXT NOT NULL CHECK(state IN
+                    ('pending','confirmed','ambiguous','failed_pre_send')),
+                claim_token TEXT NOT NULL, claimed_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL, message_id TEXT, send_method TEXT, detail TEXT);
+            INSERT INTO deliveries VALUES
+                ('k','v1:e','','[]','100','vista8','confirmed','tok',
+                 '2026-05-12T00:00:00+00:00','2026-05-12T00:00:00+00:00','4242',
+                 'sendRichMessage',NULL);
+        """)
+        legacy.commit()
+        legacy.close()
+        self.assertEqual(twitter_monitor.lookup_tweet_anchor("100", path=self.db), 4242)
+
+
+class SelfReplyThreadSendTest(unittest.TestCase):
+    """锚点一路带到各降级档，并在 process_user 里把评论接到父推消息下面。"""
+
+    PARENT = {"id": "100", "text": "先说结论，Scaling Law 并没有撞墙，这里展开讲讲我的理由",
+              "createdAt": "Tue May 12 00:20:00 +0000 2026",
+              "user": {"screen_name": "vista8", "id_str": "42"}}
+    REPLY = {"id": "101", "text": "补一张图，这是我说的那份实验数据的完整对照表",
+             "createdAt": "Tue May 12 00:25:00 +0000 2026",
+             "user": {"screen_name": "vista8", "id_str": "42"},
+             "in_reply_to_status": {"id": "100", "screen_name": "vista8", "user_id": "42"}}
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = str(Path(self.tmp.name) / "ledger.sqlite3")
+        self.ledger = patch.object(twitter_monitor, "EVENT_LEDGER_PATH", self.db)
+        self.ledger.start()
+
+    def tearDown(self):
+        self.ledger.stop()
+        self.tmp.cleanup()
+
+    def test_send_telegram_rich_sets_reply_parameters(self):
+        seen = {}
+        with patch.object(twitter_monitor, "_tg_post",
+                          side_effect=lambda tok, payload, method="": seen.update(payload)
+                          or {"ok": True}):
+            twitter_monitor.send_telegram_rich("tok", "g", html="hi", reply_to_message_id=5754)
+        # allow_sending_without_reply：父推消息被删时降级为普通消息，不是 400 丢推
+        self.assertEqual(seen["reply_parameters"],
+                         {"message_id": 5754, "allow_sending_without_reply": True})
+
+    def test_no_anchor_leaves_reply_parameters_unset(self):
+        seen = {}
+        with patch.object(twitter_monitor, "_tg_post",
+                          side_effect=lambda tok, payload, method="": seen.update(payload)
+                          or {"ok": True}):
+            twitter_monitor.send_telegram_rich("tok", "g", html="hi")
+        self.assertNotIn("reply_parameters", seen)
+
+    def test_anchor_survives_the_whole_fallback_ladder(self):
+        # rich 被拒 → sendPhoto 被拒 → HTML：任何一档掉了锚点，评论都会脱离线程
+        anchors = {}
+        tweet = dict(self.REPLY, media=[{"type": "photo",
+                                         "url": "https://pbs.twimg.com/media/x.png"}])
+
+        def fake_rich(token, chat_id, markdown="", link="", *, html="", thread_id=None,
+                      reply_to_message_id=None):
+            anchors["rich"] = reply_to_message_id
+            return {"ok": False, "rich_fallback": True}
+
+        def fake_photo(token, chat_id, photo, caption="", link="", *, thread_id=None,
+                       reply_to_message_id=None, button_text=""):
+            anchors["photo"] = reply_to_message_id
+            return {"ok": False, "photo_fallback": True}
+
+        def fake_legacy(token, chat_id, text, link="", *, preview_url="", thread_id=None,
+                        reply_to_message_id=None, button_text=""):
+            anchors["html"] = reply_to_message_id
+            return {"ok": True, "result": {"message_id": 9}}
+
+        with patch.object(twitter_monitor, "send_telegram_rich", side_effect=fake_rich), \
+             patch.object(twitter_monitor, "send_telegram_photo", side_effect=fake_photo), \
+             patch.object(twitter_monitor, "send_telegram", side_effect=fake_legacy):
+            twitter_monitor.send_tweet("tok", "g", "vista8", tweet, reply_to_message_id=5754)
+        self.assertEqual(anchors, {"rich": 5754, "photo": 5754, "html": 5754})
+
+    def _process(self, tweets, **overrides):
+        args = argparse.Namespace(test=False, seed=False, dry_run=False,
+                                  limit=20, max_push_age_minutes=45)
+        sent = []
+        message_ids = iter([5754, 5764, 5774])
+
+        def fake_send_tweet(token, chat_id, username, t, ai=None, thread_id=None,
+                            reply_to_message_id=None):
+            sent.append((t["id"], reply_to_message_id))
+            return {"ok": True, "result": {"message_id": next(message_ids)}}
+
+        with patch.object(twitter_monitor, "datetime", FixedDatetime), \
+             patch.object(twitter_monitor, "fetch_tweets", return_value=list(tweets)), \
+             patch.object(twitter_monitor, "load_seen", return_value=({"old"}, None)), \
+             patch.object(twitter_monitor, "save_seen", return_value=None), \
+             patch.object(twitter_monitor, "send_tweet", side_effect=fake_send_tweet), \
+             patch.object(twitter_monitor.time, "sleep", return_value=None):
+            twitter_monitor.process_user(pool=None, ai=FakeAI(False), username="vista8",
+                                         bot_token="b", chat_id="c", args=args,
+                                         **overrides)
+        return sent
+
+    def test_same_run_thread_sends_parent_first_then_replies_under_it(self):
+        # 时间线是倒序的；父推必须先落地才有 message_id 可锚
+        sent = self._process([self.REPLY, self.PARENT])
+        self.assertEqual(sent, [("100", None), ("101", 5754)])
+
+    def test_reply_threads_onto_a_parent_pushed_in_an_earlier_run(self):
+        twitter_monitor.record_tweet_anchor("100", 5754, username="vista8",
+                                            target_chat_id="c", path=self.db)
+        self.assertEqual(self._process([self.REPLY]), [("101", 5754)])
+
+    def test_reply_without_a_telegram_anchor_stays_standalone(self):
+        # 父推被过滤/超出保留期时无锚点可接，退化成独立消息而不是丢推
+        self.assertEqual(self._process([self.REPLY]), [("101", None)])
+
+    def test_anchor_lookup_follows_the_content_route(self):
+        twitter_monitor.record_tweet_anchor("100", 5754, target_chat_id="group",
+                                            target_thread_id=1145, path=self.db)
+        sent = self._process([self.REPLY], content_chat_id="group", content_thread_id=1145)
+        self.assertEqual(sent, [("101", 5754)])
+        # 同一批锚点不属于默认 DM 目标
+        self.assertEqual(self._process([self.REPLY]), [("101", None)])
+
+
+class SemanticMediaOnlyRenderTest(unittest.TestCase):
+    """无正文的纯媒体推：媒体块必须是真 <img> 标签，不能被削成裸文本。"""
+
+    @staticmethod
+    def tweet(url="https://pbs.twimg.com/media/HQE63QGaAAIFQfx.png"):
+        media = [{"type": "photo", "url": url}]
+        return {"id": "101", "text": "", "media": media, "_semantic_active": True,
+                "semantic_bundle": {
+                    "observation": {"outer_id": "101", "observed_via": "Khazix0918"},
+                    "anchor": {"tweet_id": "101", "author": "Khazix0918", "text": "",
+                               "media": media,
+                               "source_url": "https://x.com/Khazix0918/status/101"},
+                    "repost_path": [], "context_nodes": [], "assets": [],
+                    "resolution": {"status": "complete"}}}
+
+    def test_media_only_anchor_keeps_the_img_tag_intact(self):
+        with patch.object(twitter_monitor, "_SEMANTIC_BUNDLE_ENABLED", True):
+            _plain, rich, _link = twitter_monitor.format_message("Khazix0918", self.tweet())
+        # 回归：曾用 str.lstrip("<br>") 削前缀，把 "<img" 的 "<" 一起吃掉，
+        # 图片降级成裸文本 `img src="…"/>`
+        self.assertIn('<img src="https://pbs.twimg.com/media/HQE63QGaAAIFQfx.png"/>', rich)
+        self.assertNotRegex(rich, r'(?<!<)img src=')
+        # 头部与媒体块之间恰好一层分隔，媒体块自带的前导 <br><br> 已按前缀删掉
+        self.assertEqual(rich.count("<br>"), 2)
 
 
 if __name__ == "__main__":
