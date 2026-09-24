@@ -37,3 +37,11 @@ x_review_bot.py 是 bot 的唯一 getUpdates 消费者。它接收 callback_quer
 ## 富媒体复核卡
 
 回调中的 rich_message 对象可作为可访问原卡。富媒体卡只调用 editMessageReplyMarkup 更新选中按钮，不编辑正文，因此图片、视频和原生富文本保持原样。answerCallbackQuery 显示“已选择 20/20”和“门槛有效标注 8/8”等进度；前者包含历史案例和 uncertain，后者只计 gate eligible 案例中的 keep/merge。纯文本卡继续更新正文状态。已有 SQLite 会自动补上 rich_message 标记列。
+
+## 复核卡媒体回填
+
+`x_review_cards.py` 根据固定 packet、Telegram receipt 和只读 X 详情缓存生成 `editMessageText` 的 `rich_message`。`tools_x_review_media_fetch.py` 只读抓取固定 tweet ID，`tools_x_review_media_cards.py preview` 先生成 HTML 与 payload，`apply` 在 review consumer lock 下原地更新既有消息，并保留当前选择。运行数据、详情缓存和 Telegram receipt 放在 `state/`，不提交 Git。
+
+## 共享 Telegram 接收器
+
+r4s 上的 CC98 poller 是该 bot 的唯一 `getUpdates` 消费者。`x_review_relay.py` 通过 SSH 读取 r4s bridge 的只读导出，向 BWG 的复核处理器交付 callback；BWG 不再直接调用 `getUpdates`。服务交接前必须确认 CC98 bridge 已启用且 outbox 可读。
