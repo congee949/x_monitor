@@ -7,7 +7,7 @@ R4S 的 CC98 poller 统一读取共享 bot 的 Telegram updates。桥接模块�
 - x_review_bridge.py：配置、输入筛选、整批持久化，以及只读 export 命令。
 - cc98_telegram_bot.py.patch：在 get_updates 增加已启用时的 callback 订阅，在 run_once 的原处理逻辑前提交整批 outbox。
 - test_x_review_bridge.py：模块与原 poller 函数的集成测试。
-- cc98_telegram_bot.py.baseline：补丁对应的 R4S 源码快照，SHA-256 为 0302e6ac7cfaadb8d93ae5ae166e739b915dcdbfcab8e10578be63ba9588a124。
+- fixtures/cc98_update_functions.py：仅保留补丁触及的两个原函数，用于隔离测试。生产完整源文件的补丁基线 SHA-256 为 0302e6ac7cfaadb8d93ae5ae166e739b915dcdbfcab8e10578be63ba9588a124。
 
 模块仅使用 Python 标准库。R4S 当前 Python 3.11 可用，无新增第三方依赖。
 
