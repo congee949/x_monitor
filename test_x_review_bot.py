@@ -204,6 +204,56 @@ class ReviewTest(unittest.TestCase):
         self.api.fail_method=None;self.bot.handle(self.update())
         self.assertEqual(self.store.offset(),2);self.assertEqual(len(self.audit()),1)
 
+    def rich_update(self, update_id=1, verdict='keep', case='R01', message=301):
+        update=self.update(update_id,verdict,case=case,message=message)
+        msg=update['callback_query']['message']
+        msg.pop('text');msg.pop('entities')
+        msg['rich_message']={'html':'<p>Original</p><img src="https://example.com/p.jpg"><video src="https://example.com/v.mp4"></video>'}
+        return update
+
+    def test_rich_only_callback_accepts_and_changes_only_markup(self):
+        update=self.rich_update();original=copy.deepcopy(update['callback_query']['message']['rich_message'])
+        self.bot.handle(update)
+        self.assertEqual(self.gate(),(1,1))
+        self.assertEqual(self.audit()[0]['rich_message'],1)
+        methods=[name for name,_ in self.api.calls]
+        self.assertNotIn('editMessageText',methods)
+        markup=next(p for name,p in self.api.calls if name=='editMessageReplyMarkup')
+        self.assertEqual(set(markup),{'chat_id','message_id','reply_markup'})
+        self.assertTrue(markup['reply_markup']['inline_keyboard'][-1][0]['text'].startswith('✓'))
+        self.assertEqual(update['callback_query']['message']['rich_message'],original)
+        answer=next(p for name,p in self.api.calls if name=='answerCallbackQuery')
+        self.assertIn('已选择 1/2',answer['text']);self.assertIn('门槛有效标注 1/1',answer['text'])
+
+    def test_rich_repeat_and_changed_verdict_preserve_media(self):
+        first=self.rich_update();self.bot.handle(first);self.bot.handle(first)
+        self.bot.handle(self.rich_update(2,'merge'))
+        self.bot.handle(self.rich_update(3,'uncertain'))
+        self.assertEqual(len(self.audit()),3);self.assertEqual(self.gate(),(0,None))
+        self.assertTrue(all(row['rich_message']==1 for row in self.audit()))
+        self.assertNotIn('editMessageText',[name for name,_ in self.api.calls])
+        last=next(p for name,p in reversed(self.api.calls) if name=='editMessageReplyMarkup')
+        self.assertTrue(last['reply_markup']['inline_keyboard'][-1][2]['text'].startswith('✓'))
+        self.assertIn('门槛有效标注 0/1',self.bot.progress())
+
+    def test_card_converted_from_text_to_rich_uses_current_message_mode(self):
+        self.bot.handle(self.update())
+        self.api.calls=[]
+        self.bot.handle(self.rich_update(2,'merge'))
+        self.assertNotIn('editMessageText',[name for name,_ in self.api.calls])
+        self.assertEqual(self.audit()[-1]['rich_message'],1)
+
+    def test_twenty_selected_is_distinct_from_eight_gate_eligible(self):
+        # Extend only this isolated fixture; the deployed packet remains unchanged.
+        original=self.bot.cases['R01']
+        self.bot.cases={f'R{i:02}':dict(original,case_id=f'R{i:02}',gate_eligible=i<=8) for i in range(1,21)}
+        for i in range(1,21):
+            with self.store.db:
+                self.store.db.execute("""INSERT INTO callbacks(callback_id,update_id,case_id,verdict,
+                    actor_id,chat_id,message_id,accepted,reason,clicked_at) VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                    (f'progress{i}',i,f'R{i:02}','uncertain' if i==8 else 'merge','42','42','301',1,'','now'))
+        self.assertEqual(self.bot.progress(),'已选择 20/20；门槛有效标注 7/8')
+
     def test_packet_owner_mapping_and_binding_validation(self):
         bad=copy.deepcopy(self.receipt);bad['chat_id']='99'
         with self.assertRaises(ValueError):xr.ReviewBot(self.api,self.store,self.packet,bad,42,self.ledger)

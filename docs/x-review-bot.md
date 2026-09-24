@@ -33,3 +33,7 @@ x_review_bot.py 是 bot 的唯一 getUpdates 消费者。它接收 callback_quer
 --after 是最后已接收的 Telegram update_id。输出为 JSON 数组，元素含 id（message_id）、update_id、date、text。relay 同时要求 sender 和 private chat 都等于 owner。caption 投影到 text，其他非文本消息的原始 payload 保存在 SQLite。调用方成功保存消息后再推进自身游标；旧 Bot API offset 若存的是 next offset，转为 --after 时应减一。relay 只读打开数据库，不消费或删除消息。
 
 针对测试：python3 -m unittest -q test_x_review_bot.py。API 行为参考 [Telegram Bot API](https://core.telegram.org/bots/api#getupdates)。
+
+## 富媒体复核卡
+
+回调中的 rich_message 对象可作为可访问原卡。富媒体卡只调用 editMessageReplyMarkup 更新选中按钮，不编辑正文，因此图片、视频和原生富文本保持原样。answerCallbackQuery 显示“已选择 20/20”和“门槛有效标注 8/8”等进度；前者包含历史案例和 uncertain，后者只计 gate eligible 案例中的 keep/merge。纯文本卡继续更新正文状态。已有 SQLite 会自动补上 rich_message 标记列。

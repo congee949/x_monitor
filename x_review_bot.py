@@ -96,6 +96,9 @@ class ReviewStore:
             accepted INTEGER NOT NULL,reason TEXT NOT NULL,clicked_at TEXT NOT NULL,
             base_text TEXT,entities_json TEXT);
         """)
+        columns = {row[1] for row in self.db.execute("PRAGMA table_info(callbacks)")}
+        if "rich_message" not in columns:
+            self.db.execute("ALTER TABLE callbacks ADD COLUMN rich_message INTEGER NOT NULL DEFAULT 0")
         self.db.commit()
 
     def close(self):
@@ -177,7 +180,8 @@ class ReviewBot:
         case_id, verdict = match.groups()
         if case_id not in self.cases or str(message.get("message_id")) != str(self.mapping[case_id]):
             raise ReviewRejected("case_message_mismatch")
-        if not isinstance(message.get("text"), str) or not message["text"]:
+        if not ((isinstance(message.get("text"), str) and bool(message["text"]))
+                or isinstance(message.get("rich_message"), dict)):
             raise ReviewRejected("inaccessible_message")
         return case_id, verdict
 
@@ -230,9 +234,20 @@ class ReviewBot:
                 return
             raise
 
+    def progress(self) -> str:
+        rows = self.store.db.execute("""SELECT c.case_id,c.verdict FROM callbacks c
+            JOIN (SELECT case_id,max(seq) AS seq FROM callbacks WHERE accepted=1
+                  GROUP BY case_id) latest ON c.seq=latest.seq""").fetchall()
+        selections = {row["case_id"]: row["verdict"] for row in rows if row["case_id"] in self.cases}
+        eligible = sum(case.get("gate_eligible") is True for case in self.cases.values())
+        decisive = sum(self.cases[case_id].get("gate_eligible") is True
+                       and verdict != "uncertain" for case_id, verdict in selections.items())
+        return f"已选择 {len(selections)}/{len(self.cases)}；门槛有效标注 {decisive}/{eligible}"
+
     def render(self, callback_id: str, row):
         case_id, verdict = row["case_id"], row["verdict"]
-        text = row["base_text"] + "\n\n复核状态：" + VERDICTS[verdict] + "（可再次点击改判）"
+        progress = self.progress()
+        text = row["base_text"] + "\n\n复核状态：" + VERDICTS[verdict] + "（可再次点击改判）\n" + progress
         buttons = [{"text": ("✓ " if key == verdict else "") + label,
                     "callback_data": f"xreview:{case_id}:{key}"} for key, label in VERDICTS.items()]
         urls = []
@@ -241,16 +256,21 @@ class ReviewBot:
             if isinstance(url, str) and url.startswith(("https://x.com/", "https://twitter.com/")):
                 urls.append({"text": label, "url": url})
         keyboard = ([urls] if urls else []) + [buttons]
+        payload = {"chat_id": self.owner, "message_id": self.mapping[case_id],
+                   "reply_markup": {"inline_keyboard": keyboard}}
         try:
-            self.api.call("editMessageText", {"chat_id": self.owner,
-                "message_id": self.mapping[case_id], "text": text,
-                "entities": json.loads(row["entities_json"] or "[]"),
-                "link_preview_options": {"is_disabled": True},
-                "reply_markup": {"inline_keyboard": keyboard}})
+            if row["rich_message"]:
+                # Native rich cards store images and videos outside text. Only
+                # modify the keyboard so a verdict never replaces that media.
+                self.api.call("editMessageReplyMarkup", payload)
+            else:
+                payload.update(text=text, entities=json.loads(row["entities_json"] or "[]"),
+                               link_preview_options={"is_disabled": True})
+                self.api.call("editMessageText", payload)
         except BotError as exc:
             if not (exc.code == 400 and "message is not modified" in exc.description.lower()):
                 raise
-        self._answer(callback_id, "已记录：" + VERDICTS[verdict])
+        self._answer(callback_id, "已记录：" + VERDICTS[verdict] + "。" + progress)
 
     def persist(self, update: dict):
         """Retain the full fetched batch before a failing callback can stop processing."""
@@ -298,16 +318,18 @@ class ReviewBot:
             except ReviewRejected as exc:
                 reason, accepted = str(exc), 0
             message = callback.get("message") or {}
-            original = db.execute("SELECT base_text,entities_json FROM callbacks WHERE case_id=? AND accepted=1 ORDER BY seq LIMIT 1",
+            original = db.execute("SELECT base_text,entities_json,rich_message FROM callbacks WHERE case_id=? AND accepted=1 ORDER BY seq LIMIT 1",
                                   (case_id,)).fetchone()
             base = original["base_text"] if original else str(message.get("text") or "")
             entities = original["entities_json"] if original else json_text(message.get("entities") or [])
+            rich_message = int(isinstance(message.get("rich_message"), dict)
+                               or bool(original and original["rich_message"]))
             with db:
                 db.execute("""INSERT INTO callbacks(callback_id,update_id,case_id,verdict,actor_id,chat_id,
-                  message_id,accepted,reason,clicked_at,base_text,entities_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                  message_id,accepted,reason,clicked_at,base_text,entities_json,rich_message) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                   (callback_id, update_id, case_id, verdict, str((callback.get("from") or {}).get("id") or ""),
                    str((message.get("chat") or {}).get("id") or ""), str(message.get("message_id") or ""),
-                   accepted, reason, datetime.now(timezone.utc).isoformat(), base, entities))
+                   accepted, reason, datetime.now(timezone.utc).isoformat(), base, entities, rich_message))
             saved = db.execute("SELECT * FROM callbacks WHERE callback_id=?", (callback_id,)).fetchone()
         if saved["update_id"] != update_id:
             # The same callback delivered under another update is not a new click.
