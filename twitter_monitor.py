@@ -635,6 +635,9 @@ def fetch_article_images(image_urls: list[str], max_bytes: int = 4_000_000) -> l
 def summarize_article(ai: "AIClassifier", username: str, entry: dict, markdown: str) -> tuple[str | None, str | None]:
     if not ai.is_available():
         return None, "ai_unavailable"
+    # Article summaries may use a dedicated model (article_model) without
+    # changing promo/musing/quote-review backends. Fake test doubles skip this.
+    worker = ai.for_articles() if hasattr(ai, "for_articles") else ai
     image_urls = extract_article_image_urls(markdown)
     images = fetch_article_images(image_urls) if image_urls else []
     source_url = article_url(entry["article_id"])
@@ -645,12 +648,12 @@ def summarize_article(ai: "AIClassifier", username: str, entry: dict, markdown: 
         f"文章 Markdown：\n{markdown[:30000]}"
     )
     if images:
-        summary, backend_name = ai.complete_with_images(prompt, images, max_tokens=4000, temperature=0.2)
+        summary, backend_name = worker.complete_with_images(prompt, images, max_tokens=4000, temperature=0.2)
         if not summary:
             print(f"    Article image summary failed ({backend_name}); retrying Gemini text-only")
-            summary, backend_name = ai.complete(prompt, max_tokens=4000, temperature=0.2)
+            summary, backend_name = worker.complete(prompt, max_tokens=4000, temperature=0.2)
     else:
-        summary, backend_name = ai.complete(prompt, max_tokens=4000, temperature=0.2)
+        summary, backend_name = worker.complete(prompt, max_tokens=4000, temperature=0.2)
     if not summary:
         return None, backend_name or "ai_summary_empty"
     return summary.strip(), backend_name
@@ -1363,8 +1366,16 @@ class AIBackend:
 class AIClassifier:
     """多后端 AI 分类器，按顺序尝试，自动 fallback。"""
 
-    def __init__(self, backends: list[AIBackend]):
+    def __init__(self, backends: list[AIBackend],
+                 article_backends: list[AIBackend] | None = None):
         self._backends = backends
+        self._article_backends = backends if article_backends is None else article_backends
+
+    def for_articles(self) -> "AIClassifier":
+        """Classifier that uses article_model backends when configured."""
+        if self._article_backends is self._backends:
+            return self
+        return AIClassifier(self._article_backends)
 
     @classmethod
     def load(cls) -> "AIClassifier":
@@ -1408,10 +1419,26 @@ class AIClassifier:
                 timeout=cfg.get("timeout", 15),
             ))
 
+        article_backends = backends
+        article_model = str(cfg.get("article_model") or "").strip()
+        if article_model and backends:
+            article_backends = [
+                AIBackend(
+                    name=b.name,
+                    api_base=b.api_base,
+                    api_key=b.api_key,
+                    model=article_model,
+                    backend_type=b.backend_type,
+                    timeout=b.timeout,
+                )
+                for b in backends
+            ]
+            print(f"  Article 摘要模型: {article_model}")
+
         if backends:
             names = ", ".join(b.name for b in backends)
             print(f"  AI 推广识别已启用（{names}）")
-        return cls(backends)
+        return cls(backends, article_backends)
 
     def is_available(self) -> bool:
         return bool(self._backends)

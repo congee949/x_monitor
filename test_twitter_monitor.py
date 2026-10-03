@@ -3294,6 +3294,50 @@ class GeminiApiBaseGuardTest(unittest.TestCase):
         self.assertEqual([b.name for b in ai._backends], ["cliproxy"])
         self.assertEqual(ai._backends[0].api_base, "http://127.0.0.1:8317/v1beta")
 
+    def test_article_model_overrides_only_article_backends(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "twitter_ai.json")
+            with open(path, "w") as f:
+                json.dump({
+                    "backends": [{
+                        "name": "cliproxy",
+                        "type": "gemini",
+                        "api_base": "http://127.0.0.1:8317/v1beta",
+                        "api_key": "k",
+                        "model": "gemini-3.7-flash-high",
+                        "timeout": 45,
+                    }],
+                    "article_model": "gemini-3.8-flash-high",
+                }, f)
+            with patch.object(twitter_monitor, "AI_CONFIG_PATH", path):
+                ai = twitter_monitor.AIClassifier.load()
+        self.assertEqual(ai._backends[0].model, "gemini-3.7-flash-high")
+        article_ai = ai.for_articles()
+        self.assertIsNot(article_ai, ai)
+        self.assertEqual(article_ai._backends[0].model, "gemini-3.8-flash-high")
+        self.assertEqual(article_ai._backends[0].api_base, "http://127.0.0.1:8317/v1beta")
+        self.assertEqual(article_ai._backends[0].timeout, 45)
+        url = article_ai._backends[0]._gemini_generate_url()
+        self.assertIn("/models/gemini-3.8-flash-high:generateContent", url)
+        self.assertNotIn("gemini-3.7-flash-high", url)
+
+    def test_without_article_model_for_articles_reuses_classifier(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "twitter_ai.json")
+            with open(path, "w") as f:
+                json.dump({
+                    "backends": [{
+                        "name": "cliproxy",
+                        "type": "gemini",
+                        "api_base": "http://127.0.0.1:8317/v1beta",
+                        "api_key": "k",
+                        "model": "gemini-3.7-flash-high",
+                    }]
+                }, f)
+            with patch.object(twitter_monitor, "AI_CONFIG_PATH", path):
+                ai = twitter_monitor.AIClassifier.load()
+        self.assertIs(ai.for_articles(), ai)
+
 
 class AIKeyResolveTest(unittest.TestCase):
     def test_api_key_file_used_when_inline_empty(self):
@@ -3506,6 +3550,34 @@ class ArticleAttributionTest(unittest.TestCase):
         self.assertEqual(summary, "摘要正文")
         self.assertIn("作者 @liuren", captured["prompt"])
         self.assertNotIn("@dotey", captured["prompt"])
+
+    def test_summarize_article_uses_for_articles_backend(self):
+        class ArticleAI:
+            def is_available(self):
+                return True
+
+            def complete(self, prompt, max_tokens=1200, temperature=0.2):
+                return "from-article-model", "gemini-3.8"
+
+            def complete_with_images(self, prompt, images, max_tokens=1200, temperature=0.2):
+                raise AssertionError("no images in this test")
+
+        class WrapperAI:
+            def is_available(self):
+                return True
+
+            def for_articles(self):
+                return ArticleAI()
+
+            def complete(self, prompt, max_tokens=1200, temperature=0.2):
+                raise AssertionError("must not use default complete")
+
+        entry = {"article_id": "1", "article_title": "t", "author": "liuren"}
+        with patch.object(twitter_monitor, "fetch_article_images", return_value=[]):
+            summary, backend = twitter_monitor.summarize_article(
+                WrapperAI(), "dotey", entry, "# t\n\nbody")
+        self.assertEqual(summary, "from-article-model")
+        self.assertEqual(backend, "gemini-3.8")
 
 
 class ArticleDedupPushTest(unittest.TestCase):

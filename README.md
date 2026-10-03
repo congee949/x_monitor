@@ -96,6 +96,7 @@ flowchart TD
   "backends": [
     { "name": "gemini", "type": "gemini", "api_base": "http://<cliproxy-host>:8317/v1beta", "api_key_file": "<cliproxy device key path>", "model": "gemini-3.7-flash-high", "timeout": 45 }
   ],
+  "article_model": "gemini-3.8-flash-high",
   "article_markdown_cmd": "/usr/local/bin/x-article-to-markdown"
 }
 ```
