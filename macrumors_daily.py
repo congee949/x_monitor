@@ -197,39 +197,108 @@ def build_prompt(items: list[dict]) -> str:
     )
 
 
-def parse_ai_json(text: str) -> dict:
+def _translation_quality_base(expected: "int | None") -> dict:
+    return {
+        "expected_indices": expected,
+        "root_entries": 0,
+        "valid_entries": 0,
+        "invalid_elements": 0,
+        "invalid_indices": 0,
+        "duplicate_indices": 0,
+        "missing_indices": expected if expected is not None else 0,
+        "status": "empty",
+    }
+
+
+def _log_translation_quality(batch_start: int, batch_size: int,
+                             attempt: int, quality: dict) -> None:
+    payload = dict(quality)
+    payload.update({
+        "attempt": attempt,
+        "batch_size": batch_size,
+        "batch_start": batch_start,
+    })
+    print("MACRUMORS_QUALITY translation_parse " +
+          json.dumps(payload, ensure_ascii=False, sort_keys=True), file=sys.stderr)
+
+
+def parse_ai_json(text: str, expected: "int | None" = None,
+                  quality: "dict | None" = None) -> dict:
+    """解析翻译 JSON；混合类型、坏编号和缺项均降级并记录质量。"""
+    metrics = _translation_quality_base(expected)
+
+    def finish(status):
+        metrics["status"] = status
+        if quality is not None:
+            quality.clear()
+            quality.update(metrics)
+
     if not text:
+        finish("empty")
         return {}
     m = re.search(r"\[.*\]", text, re.S)
     if not m:
+        finish("no_array")
         return {}
     try:
         arr = json.loads(m.group())
     except Exception:
+        finish("invalid_json")
         return {}
+    if not isinstance(arr, list):
+        finish("root_not_array")
+        return {}
+    metrics["root_entries"] = len(arr)
     out = {}
     for e in arr:
-        try:
-            out[int(e["i"])] = (str(e.get("zh_title", "")).strip(),
-                                str(e.get("zh_summary", "")).strip())
-        except Exception:
+        if not isinstance(e, dict):
+            metrics["invalid_elements"] += 1
             continue
+        index = e.get("i")
+        if isinstance(index, bool) or not isinstance(index, int):
+            metrics["invalid_indices"] += 1
+            continue
+        if expected is not None and not 0 <= index < expected:
+            metrics["invalid_indices"] += 1
+            continue
+        if index in out:
+            metrics["duplicate_indices"] += 1
+            continue
+        out[index] = (str(e.get("zh_title", "")).strip(),
+                      str(e.get("zh_summary", "")).strip())
+    metrics["valid_entries"] = len(out)
+    if expected is not None:
+        metrics["missing_indices"] = expected - len(out)
+    if not out:
+        finish("no_valid_entries")
+    elif any(metrics[k] for k in (
+            "invalid_elements", "invalid_indices", "duplicate_indices", "missing_indices")):
+        finish("degraded")
+    else:
+        finish("ok")
     return out
 
 
-def translate(ai, items: list[dict], batch: int = 8) -> None:
+def translate(ai, items: list[dict], batch: int = 8) -> dict:
     """分批翻译并直接写回每条的 zh_title/zh_summary，缺失回退英文原标题。
 
     分批是因为推理模型在大请求（如 16 条）上会偶发返回不可解析内容；每批从 0 编号、重试 3 次。
     """
     for it in items:
         it["zh_title"], it["zh_summary"] = it["title"], ""
+    translated_titles: set[int] = set()
+    translated_summaries: set[int] = set()
     for start in range(0, len(items), batch):
         chunk = items[start:start + batch]
         part: dict = {}
-        for _ in range(3):
+        for attempt in range(3):
             txt, _backend = ai.complete(build_prompt(chunk), max_tokens=2500)
-            part = parse_ai_json(txt or "")
+            quality = {}
+            candidate = parse_ai_json(txt or "", len(chunk), quality)
+            _log_translation_quality(start, len(chunk), attempt + 1, quality)
+            # 重试结果可能比前一次更差；保留覆盖最多的一版，避免把已有译文丢掉。
+            if len(candidate) > len(part):
+                part = candidate
             if len(part) >= len(chunk):
                 break
             time.sleep(1)
@@ -237,6 +306,17 @@ def translate(ai, items: list[dict], batch: int = 8) -> None:
             if 0 <= local < len(chunk):
                 chunk[local]["zh_title"] = zt or chunk[local]["title"]
                 chunk[local]["zh_summary"] = zs
+                if zt:
+                    translated_titles.add(start + local)
+                if zs:
+                    translated_summaries.add(start + local)
+    return {
+        "fallback_summaries": len(items) - len(translated_summaries),
+        "fallback_titles": len(items) - len(translated_titles),
+        "translated_summaries": len(translated_summaries),
+        "translated_titles": len(translated_titles),
+        "total": len(items),
+    }
 
 
 def build_merge_prompt(items: list[dict]) -> str:
@@ -255,24 +335,93 @@ def build_merge_prompt(items: list[dict]) -> str:
     )
 
 
-def parse_merge_json(text, n):
+def _merge_quality_base(n: int) -> dict:
+    """创建一次聚类响应的质量计数器；仅含适合写日志的标量。"""
+    return {
+        "expected_indices": n,
+        "root_entries": 0,
+        "valid_groups": 0,
+        "invalid_elements": 0,
+        "invalid_indices": 0,
+        "duplicate_indices": 0,
+        "missing_indices": n,
+        "status": "empty",
+    }
+
+
+def _log_merge_quality(attempt: int, quality: dict) -> None:
+    """输出单行结构化指标，供 cron 日志审计内容质量降级。"""
+    payload = dict(quality)
+    payload["attempt"] = attempt
+    print("MACRUMORS_QUALITY merge_parse " +
+          json.dumps(payload, ensure_ascii=False, sort_keys=True), file=sys.stderr)
+
+
+def parse_merge_json(text, n, quality=None):
+    """解析 AI 聚类结果，并通过 ``quality`` 可选参数返回质量计数。
+
+    模型输出是非可信数据：根数组和其中元素都可能混入数字、字符串、
+    ``null`` 或结构错误的对象。无效成员一律跳过；有效组仍可使用，漏掉的
+    新闻则补成单条，保持“全集恰好覆盖”的既有安全行为。
+    """
+    metrics = _merge_quality_base(n)
+
+    def finish(status):
+        metrics["status"] = status
+        if quality is not None:
+            quality.clear()
+            quality.update(metrics)
+
     if not text:
+        finish("empty")
         return None
     m = re.search(r"\[.*\]", text, re.S)
     if not m:
+        finish("no_array")
         return None
     try:
         arr = json.loads(m.group())
     except Exception:
+        finish("invalid_json")
         return None
+    if not isinstance(arr, list):
+        finish("root_not_array")
+        return None
+    metrics["root_entries"] = len(arr)
     seen_indices = set()
     groups = []
     for e in arr:
+        if not isinstance(e, dict):
+            metrics["invalid_elements"] += 1
+            continue
         indices = e.get("indices", [])
         if not isinstance(indices, list) or not indices:
+            metrics["invalid_elements"] += 1
             continue
-        indices = [int(i) for i in indices if isinstance(i, (int, float)) and 0 <= int(i) < n]
+        valid_indices = []
+        for i in indices:
+            # bool 是 int 的子类，但不是合法新闻编号；非整数 float 也不能静默截断。
+            if isinstance(i, bool):
+                metrics["invalid_indices"] += 1
+                continue
+            if isinstance(i, int):
+                index = i
+            elif isinstance(i, float) and i.is_integer():
+                # NaN/inf 的 is_integer() 均为 False，不会进入 int()。
+                index = int(i)
+            else:
+                metrics["invalid_indices"] += 1
+                continue
+            if not 0 <= index < n:
+                metrics["invalid_indices"] += 1
+                continue
+            if index in seen_indices or index in valid_indices:
+                metrics["duplicate_indices"] += 1
+                continue
+            valid_indices.append(index)
+        indices = valid_indices
         if not indices:
+            metrics["invalid_elements"] += 1
             continue
         groups.append({
             "indices": indices,
@@ -281,10 +430,17 @@ def parse_merge_json(text, n):
         })
         seen_indices.update(indices)
     if not groups:
+        finish("no_valid_groups")
         return None
+    metrics["valid_groups"] = len(groups)
+    metrics["missing_indices"] = n - len(seen_indices)
     for i in range(n):
         if i not in seen_indices:
             groups.append({"indices": [i], "zh_title": "", "zh_summary": ""})
+    degraded = any(metrics[k] for k in (
+        "invalid_elements", "invalid_indices", "duplicate_indices", "missing_indices"
+    ))
+    finish("degraded" if degraded else "ok")
     return groups
 
 
@@ -294,7 +450,9 @@ def merge_similar(ai, items: list[dict]) -> list[dict]:
     merged_result = None
     for attempt in range(3):
         txt, backend = ai.complete(build_merge_prompt(items), max_tokens=4000)
-        merged_result = parse_merge_json(txt or "", len(items))
+        quality = {}
+        merged_result = parse_merge_json(txt or "", len(items), quality)
+        _log_merge_quality(attempt + 1, quality)
         if merged_result is not None:
             break
         print(f"  合并第 {attempt+1} 次失败（{backend}）: {repr((txt or '')[:200])}", file=sys.stderr)
@@ -528,9 +686,12 @@ def main() -> int:
 
     ai = tm.AIClassifier.load()
     n_original = len(push)
-    translate(ai, push)
-    n_zh = sum(1 for it in push if it["zh_title"] != it["title"])
+    translation_quality = translate(ai, push)
+    n_zh = translation_quality["translated_titles"]
     print(f"AI 翻译 {n_zh}/{len(push)} 条（缺失回退英文原标题）")
+    print("MACRUMORS_QUALITY translation " +
+          json.dumps(translation_quality, ensure_ascii=False, sort_keys=True),
+          file=sys.stderr)
 
     push = merge_similar(ai, push)
 
