@@ -8,10 +8,70 @@ import twitter_graphql as tg
 
 
 class QuoteTranslationTest(unittest.TestCase):
+    def old_tweets_fixture(self, *, retweet=True, quote=True):
+        source = raw('1847662906961514935', 'dontbesilent', 'sell me this pen',
+                     media=[self.photo('original')])
+        archive = raw('2095921106536317397', 'dbs_old_tweets', 'sell me this pen',
+                      quote=source if quote else None, media=[self.photo('duplicate')])
+        outer = raw('2095921106536317398', 'dontbesilent', 'RT @dbs_old_tweets',
+                    retweet=archive) if retweet else archive
+        return {'id': outer['legacy']['id_str'],
+                'semantic_bundle': tg.build_semantic_bundle(outer, 'dontbesilent')}
 
+    def test_old_tweets_quote_uses_source_without_ai_and_keeps_identity(self):
+        for retweet in (True, False):
+            with self.subTest(retweet=retweet):
+                t = self.old_tweets_fixture(retweet=retweet)
+                before = copy.deepcopy(t)
+                ai = self.ai()
+                tm._prepare_quote_translation(t, ai)
+                ai.complete.assert_not_called()
+                self.assertEqual(t['id'], before['id'])
+                self.assertEqual(t['semantic_bundle'], before['semantic_bundle'])
+                self.assertEqual(t['_quote_translation']['action'], 'source_only')
+                plain, rich, link = tm.format_semantic_message('dontbesilent', t)
+                self.assertEqual(link, 'https://x.com/dontbesilent/status/1847662906961514935')
+                self.assertEqual(rich.count('sell me this pen'), 1)
+                self.assertNotIn('↳ 引用', rich)
+                self.assertNotIn('/duplicate.jpg', rich)
+                self.assertIn('/original.jpg', rich)
+                view = tm._semantic_media_view(tm._quote_presentation_tweet(t))
+                self.assertEqual([m['url'] for m in view['media']],
+                                 ['https://pbs.twimg.com/media/original.jpg'])
 
+    def test_old_tweets_missing_or_incomplete_quote_preserves_content(self):
+        t = self.old_tweets_fixture(quote=False)
+        tm._prepare_quote_translation(t, None)
+        self.assertNotIn('_quote_presentation_bundle', t)
+        for status in ('degraded_optional', 'auth_degraded', 'truncated_budget'):
+            t = self.old_tweets_fixture()
+            t['semantic_bundle']['resolution']['status'] = status
+            tm._prepare_quote_translation(t, None)
+            self.assertNotIn('_quote_presentation_bundle', t)
 
+    def test_old_tweets_send_fallback_uses_only_original_photo_and_text(self):
+        t = self.old_tweets_fixture()
+        with patch.object(tm, '_SEMANTIC_BUNDLE_ENABLED', True), \
+                patch.object(tm, '_SEMANTIC_CURATOR_ALLOWLIST', set()), \
+                patch.object(tm, 'send_telegram_rich', return_value={
+                    'ok': False, 'rich_fallback': True}) as rich, \
+                patch.object(tm, 'send_telegram_photo', return_value={
+                    'ok': False, 'photo_fallback': True}) as photo, \
+                patch.object(tm, 'send_telegram', return_value={'ok': True}) as plain:
+            tm.send_tweet('fake', 'fake', 'dontbesilent', t, None, thread_id=19)
+        self.assertNotIn('/duplicate.jpg', rich.call_args.kwargs['html'])
+        self.assertEqual(photo.call_args.args[2], 'https://pbs.twimg.com/media/original.jpg')
+        self.assertEqual(plain.call_args.args[2].count('sell me this pen'), 1)
+        self.assertNotIn('↳ 引用', plain.call_args.args[2])
+        self.assertIn('/1847662906961514935', plain.call_args.args[3])
+        self.assertEqual(plain.call_args.kwargs['thread_id'], 19)
 
+    def test_other_chinese_republication_is_not_folded(self):
+        t = self.old_tweets_fixture()
+        t['semantic_bundle']['anchor']['author'] = 'another_account'
+        t['semantic_bundle']['context_nodes'][0]['text'] = '中文原文'
+        tm._prepare_quote_translation(t, None)
+        self.assertNotIn('_quote_presentation_bundle', t)
 
     def fixture(self, text='普通开发者 vs Vibe 开发者', own_media=None, source_media=None):
         source = raw('2095813557036458451', 'DataChaz', 'normal coder vs vibe-coder 😭', media=source_media)

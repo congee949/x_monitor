@@ -4321,6 +4321,19 @@ def _prepare_quote_translation(t: dict, ai) -> None:
     if not contexts or (bundle.get("resolution") or {}).get("status") != "complete":
         return
     anchor, source = bundle.get("anchor") or {}, contexts[0]
+    # This archive account republishes old posts; the quote is the content,
+    # even when discovered through another monitored account's retweet.
+    if (str(anchor.get("author") or "").lstrip("@").casefold() == "dbs_old_tweets"
+            and isinstance(source, dict) and source.get("tweet_id")
+            and _safe_http_url(source.get("source_url"))):
+        decision.update(action="source_only", reason="old_tweets_republication",
+                        source_id=str(source["tweet_id"]),
+                        removed_id=str(anchor.get("tweet_id") or ""))
+        t["_quote_presentation_bundle"] = dict(
+            bundle, anchor=source, context_nodes=contexts[1:],
+            repost_path=list(bundle.get("repost_path") or []) + [
+                {"tweet_id": anchor.get("tweet_id"), "author": anchor.get("author")}])
+        return
     if not isinstance(source, dict) or anchor.get("article") or source.get("article"):
         return
     a, anchor_view = _semantic_node_body(anchor)
