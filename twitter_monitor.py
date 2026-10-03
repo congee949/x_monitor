@@ -20,6 +20,8 @@ import argparse
 import base64
 from contextlib import contextmanager
 import hashlib
+import quote_fold
+import thread_merge
 import http.client
 import json
 import os
@@ -2512,6 +2514,28 @@ def _event_has_term(body: str, term: str) -> bool:
     return re.search(pattern, body, re.IGNORECASE) is not None
 
 
+def _log_quote_fold(tweet: dict, fold: dict, *, dry_run: bool = False) -> None:
+    preview = " dry-run" if dry_run else ""
+    print(f"    quote-fold{preview}: tweet={tweet.get('id')} "
+          f"action={fold.get('action')} reason={fold.get('reason')} "
+          f"source={fold.get('source_id') or '-'} message={fold.get('message_id') or '-'}")
+
+
+def _journal_quote_fold(tweet: dict, fold: dict) -> None:
+    record = {"ts": datetime.now(timezone.utc).isoformat(),
+              "decision": "duplicate_terminal", "reason": fold["reason"],
+              "tweet_id": str(tweet.get("id") or ""), "matched": fold["source_id"],
+              "matched_message_id": fold["message_id"],
+              "target_chat_id": fold["target_chat_id"],
+              "target_thread_id": fold["target_thread_id"],
+              "content_snapshot": _event_body(_semantic_anchor_view(tweet))}
+    os.makedirs(os.path.dirname(SEMANTIC_DECISION_JOURNAL), exist_ok=True)
+    with open(SEMANTIC_DECISION_JOURNAL, "a", encoding="utf-8") as stream:
+        stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
 def _event_body(t: dict) -> str:
     return ((t.get("note_tweet") or {}).get("text") or t.get("text") or "").strip()
 
@@ -2750,16 +2774,30 @@ def _event_ledger_session(path: str | None = None):
         db.close()
 
 
-def event_dedup_gate_report(path: str | None = None) -> dict:
-    """Repeatable Go/No-Go report. Enforce needs reviewed candidates, not uptime."""
-    with _event_ledger_session(path) as db:
-        row = db.execute("""
-            SELECT count(*) AS candidates,
-                   sum(CASE WHEN reviewed=1 AND false_positive IN (0,1)
-                            THEN 1 ELSE 0 END) AS reviewed,
-                   sum(CASE WHEN reviewed=1 AND false_positive=1 THEN 1 ELSE 0 END) AS fp
-            FROM event_observations WHERE decision='would_suppress'
-        """).fetchone()
+def event_dedup_gate_report(path: str | None = None, *, read_only: bool = False) -> dict:
+    """Repeatable Go/No-Go report. Preview never creates or migrates the ledger."""
+    query = """
+        SELECT count(*) AS candidates,
+               sum(CASE WHEN reviewed=1 AND false_positive IN (0,1)
+                        THEN 1 ELSE 0 END) AS reviewed,
+               sum(CASE WHEN reviewed=1 AND false_positive=1 THEN 1 ELSE 0 END) AS fp
+        FROM event_observations WHERE decision='would_suppress'
+    """
+    if read_only:
+        db = None
+        try:
+            uri = "file:" + urllib.parse.quote(os.path.abspath(path or EVENT_LEDGER_PATH)) + "?mode=ro"
+            db = sqlite3.connect(uri, uri=True, timeout=10)
+            db.row_factory = sqlite3.Row
+            row = db.execute(query).fetchone()
+        except sqlite3.Error:
+            row = {"candidates": 0, "reviewed": 0, "fp": 0}
+        finally:
+            if db is not None:
+                db.close()
+    else:
+        with _event_ledger_session(path) as db:
+            row = db.execute(query).fetchone()
     reviewed = int(row["reviewed"] or 0)
     fp = int(row["fp"] or 0)
     rate = fp / reviewed if reviewed else None
@@ -2830,12 +2868,12 @@ def recover_stale_event_claims(path: str | None = None,
     return cur.rowcount
 
 
-def _init_event_dedup_mode(requested: str) -> str:
+def _init_event_dedup_mode(requested: str, *, read_only: bool = False) -> str:
     global _EVENT_DEDUP_MODE, _EVENT_DEDUP_EFFECTIVE_MODE
     requested = requested if requested in ("off", "observe", "enforce") else "observe"
     _EVENT_DEDUP_MODE = requested
     if requested == "enforce":
-        report = event_dedup_gate_report()
+        report = event_dedup_gate_report(read_only=read_only)
         if not report["ready"]:
             print(f"  ⚠ event dedup enforce Go/No-Go=NO-GO {report}; 保持 observe")
             _EVENT_DEDUP_EFFECTIVE_MODE = "observe"
@@ -2843,7 +2881,7 @@ def _init_event_dedup_mode(requested: str) -> str:
             _EVENT_DEDUP_EFFECTIVE_MODE = "enforce"
     else:
         _EVENT_DEDUP_EFFECTIVE_MODE = requested
-    if requested != "off":
+    if requested != "off" and not read_only:
         recovered = recover_stale_event_claims()
         if recovered:
             print(f"  ⚠ event ledger 恢复 {recovered} 条 stale pending → ambiguous（不盲重发）")
@@ -3064,6 +3102,9 @@ def self_reply_parent_id(t: dict, username: str) -> str:
 
 
 # ── 跨账号去重索引（纯转发 + Article；config 键 cross_account_dedup 开关）──
+_OFFICIAL_THREAD_MERGE_ENABLED = False
+_TRANSLATION_REPLY_ENABLED = False
+_OFFICIAL_QUOTE_GROUPS = []
 _CROSS_DEDUP_ENABLED = False        # main 从 cfg 置位；默认关 = 行为与现状一致
 _PUSHED_INDEX_CACHE: "dict | None" = None   # 单进程内存缓存 = 同轮跨账号共享
 
@@ -5101,7 +5142,27 @@ def send_tweet(
     reply_to_message_id：自回复串的父推消息锚点，各降级档都要带上，
     否则 rich 被拒后评论会脱离线程变成孤立消息。
     """
+    fold = t.get("_quote_fold") or {}
+    if fold.get("reason") == "translation_source_delivered":
+        link = _tweet_source_url(username, t)
+        text = "中文摘译 by @" + html.escape(username)
+        t["_delivered_fold_text"] = _html_to_plain(text)
+        return send_telegram(token, chat_id, text, link, thread_id=thread_id,
+                             reply_to_message_id=fold["message_id"])
     html_text, rich_html, link = format_message(username, t, ai)
+    if fold.get("reason") == "official_quote_update":
+        # The original already exists in this target; keep only the comment.
+        bundle = _semantic_bundle(t)
+        anchor = bundle.get("anchor") or {}
+        own = anchor or t
+        own_media = (own.get("media") or (own.get("entities") or {}).get("media")
+                     or (own.get("extended_entities") or {}).get("media"))
+        if not own_media:
+            comment = _event_body(_semantic_anchor_view(t))
+            text = "补充 @" + html.escape(username) + "\n\n" + html.escape(comment)
+            t["_delivered_fold_text"] = _html_to_plain(text)
+            return send_telegram(token, chat_id, text, _tweet_source_url(username, t),
+                                 thread_id=thread_id, reply_to_message_id=fold["message_id"])
     presentation = _quote_presentation_tweet(t)
     media_view = (_semantic_media_view(presentation)
                   if _semantic_use(t) else t)
@@ -5180,6 +5241,14 @@ def process_user(
     tweets = fetch_tweets(pool, username, limit=args.limit)
     seen, last_post_iso = load_seen(username)
     push_retry = load_push_retry(username)
+    # Idle-window retries retain original text even after falling out of the feed.
+    if not (args.test or args.seed):
+        present = {str(tweet.get("id") or "") for tweet in tweets}
+        for tid in push_retry - present - seen:
+            record = (_PUSH_RETRY_STATE_BY_USER.get(username) or {}).get(tid) or {}
+            saved = record.get("thread_tweet")
+            if isinstance(saved, dict) and str(saved.get("id") or "") == tid:
+                tweets.append(dict(saved))
     if _semantic_gray_for(username) and push_retry and HAS_GRAPHQL:
         present = {str(t.get("id") or "") for t in tweets}
         for retry_id in sorted(push_retry - present)[:twitter_graphql.SEMANTIC_DETAIL_PER_BUNDLE]:
@@ -5563,12 +5632,33 @@ def process_user(
     to_push.sort(key=lambda item: int(str(item[0].get("id") or "0") or "0")
                  if str(item[0].get("id") or "").isdigit() else 0)
 
+    thread_deferred = []
+    to_push = thread_merge.merge_ready(
+        to_push, username, enabled=bool(_OFFICIAL_THREAD_MERGE_ENABLED and policy
+                                      and not args.test and not args.dry_run),
+        deferred=thread_deferred)
+    for tweet, _ in thread_deferred:
+        retry = note_push_retry(username, tweet)
+        retry["thread_tweet"] = {key: value for key, value in tweet.items()
+                                 if not key.startswith("_")}
     push_failed: set[str] = set(resolution_deferred)
+    push_failed.update(str(tweet["id"]) for tweet, _ in thread_deferred)
     push_deferred = False
     delivered_count = 0
     for t, _reason in to_push:
         tid = str(t.get("id") or "")
         if args.dry_run:
+            if not args.test and (_TRANSLATION_REPLY_ENABLED or _OFFICIAL_QUOTE_GROUPS):
+                if _TRANSLATION_REPLY_ENABLED and not policy:
+                    _prepare_quote_translation(t, ai)
+                fold = quote_fold.plan(
+                    t, username, chat_id=content_chat_id or chat_id,
+                    thread_id=content_thread_id if content_chat_id else None,
+                    ledger_path=EVENT_LEDGER_PATH,
+                    translation_reply=_TRANSLATION_REPLY_ENABLED,
+                    groups=_OFFICIAL_QUOTE_GROUPS,
+                    facts=_event_facts(_semantic_anchor_view(t)))
+                _log_quote_fold(t, fold, dry_run=True)
             html_text, rich_html, link = format_message(username, t, ai)
             print("----- DRY RUN -----")
             print("[rich_html]")
@@ -5592,6 +5682,31 @@ def process_user(
             target_chat = content_chat_id or chat_id
             target_thread = content_thread_id if content_chat_id else None
             try:
+                fold = {"action": "deliver"}
+                t.pop("_quote_fold", None)
+                if not args.test:
+                    if _TRANSLATION_REPLY_ENABLED and not policy:
+                        _prepare_quote_translation(t, ai)
+                    fold = quote_fold.plan(
+                        t, username, chat_id=target_chat, thread_id=target_thread,
+                        ledger_path=EVENT_LEDGER_PATH,
+                        translation_reply=_TRANSLATION_REPLY_ENABLED,
+                        groups=_OFFICIAL_QUOTE_GROUPS,
+                        facts=_event_facts(_semantic_anchor_view(t)))
+                    if _TRANSLATION_REPLY_ENABLED or _OFFICIAL_QUOTE_GROUPS:
+                        _log_quote_fold(t, fold)
+                    if fold["action"] == "skip":
+                        try:
+                            _journal_quote_fold(t, fold)
+                        except OSError as exc:
+                            print(f"    quote-fold audit unavailable: {type(exc).__name__}; deliver")
+                            fold = {"action": "deliver"}
+                        else:
+                            seen.add(tid)
+                            save_seen(username, seen, last_post_iso)
+                            continue
+                    if fold["action"] == "reply":
+                        t["_quote_fold"] = fold
                 if _EVENT_DEDUP_EFFECTIVE_MODE != "off" and not args.test:
                     claim = claim_event_delivery(
                         t, username, target_chat_id=target_chat,
@@ -5624,9 +5739,9 @@ def process_user(
                 # 自回复接线程：父推若已在同一目标推送过，就把这条评论挂到那条
                 # Telegram 消息下面（原生 reply 会带出父推的引用条）。查不到锚点
                 # （父推被过滤 / 超出保留期 / 话题改路由）时按独立消息发，不阻断。
-                reply_anchor = None
+                reply_anchor = fold.get("message_id") if fold["action"] == "reply" else None
                 parent_id = "" if args.test else self_reply_parent_id(t, username)
-                if parent_id:
+                if parent_id and reply_anchor is None:
                     try:
                         reply_anchor = lookup_tweet_anchor(
                             parent_id, target_chat_id=target_chat,
@@ -5678,6 +5793,9 @@ def process_user(
                     # 失败只打日志：末尾统一落盘 + _alert 兜底。
                     # --test 不 checkpoint：测试推送发往调试目标，写生产 seen /
                     # 摘 push_retry 会让生产群永久漏掉这些推文（基线语义如此）。
+                    merged_ids = {str(member.get("id") or "")
+                                  for member in t.get("_official_thread_members") or []}
+                    seen.update(merged_ids)
                     seen.add(tid)
                     try:
                         save_seen(username, seen, last_post_iso)
@@ -5699,9 +5817,17 @@ def process_user(
                             target_chat_id=target_chat, target_thread_id=target_thread)
                     except Exception as anchor_error:
                         print(f"    线程锚点落盘失败（忽略）: {anchor_error}")
+                    for member in t.get("_official_thread_members") or []:
+                        try:
+                            record_tweet_anchor(str(member.get("id")), telegram_message_id_of(r),
+                                username=username, target_chat_id=target_chat,
+                                target_thread_id=target_thread)
+                        except Exception:
+                            pass
                     source_id = (t.get("_quote_translation") or {}).get("source_id")
                     if (source_id and not r.get("assumed_delivered")
-                            and (t.get("_quote_translation") or {}).get("action") == "source_only"):
+                            and (t.get("_quote_translation") or {}).get("action") == "source_only"
+                            and fold["action"] != "reply"):
                         try:
                             record_tweet_anchor(source_id, telegram_message_id_of(r),
                                 username=username, target_chat_id=target_chat,
@@ -5723,7 +5849,8 @@ def process_user(
                         # the repeated network probes for delivered videos/GIFs.
                         delivered_html, _rich_html, _link = format_message(
                             username, t, ai, embed_video=False)
-                        delivered_content = _html_to_plain(delivered_html)
+                        delivered_content = (t.get("_delivered_fold_text")
+                                             or _html_to_plain(delivered_html))
                     except Exception:
                         # Rendering already succeeded inside send_tweet; this
                         # fallback keeps the sidecar best-effort without exposing
@@ -5732,7 +5859,8 @@ def process_user(
                     _record_confirmed_sent_content(
                         r, chat_id=target_chat, thread_id=target_thread,
                         source_kind="x_tweet", source_ref=source_url,
-                        source_message_ids=[source_id], url=source_url,
+                        source_message_ids=([m["id"] for m in t.get("_official_thread_members") or []]
+                                            or [source_id]), url=source_url,
                         content=delivered_content,
                         content_id=f"x-tweet:{source_id}",
                         links=_tweet_outbound_links(t))
@@ -5753,6 +5881,8 @@ def process_user(
                         print(f"    semantic ambiguous journal 失败（不盲重发）: {journal_error}")
                 delivered_count += 1
                 if not args.test:
+                    seen.update(str(member.get("id") or "")
+                                for member in t.get("_official_thread_members") or [])
                     seen.add(tid)
                     try:
                         # The request already left the host, so checkpoint this
@@ -5777,6 +5907,13 @@ def process_user(
                 print(f"    推送异常: {e}")
                 push_failed.add(tid)
 
+    for tweet, _ in to_push:
+        if str(tweet.get("id") or "") in push_failed:
+            for member in tweet.get("_official_thread_members") or []:
+                push_failed.add(str(member["id"]))
+                record = note_push_retry(username, member)
+                record["thread_tweet"] = {key: value for key, value in member.items()
+                                           if not key.startswith("_")}
     if args.seed:
         seen |= ({str(t.get("id")) for t in tweets if t.get("id")}
                  - resolution_deferred)
@@ -5786,7 +5923,8 @@ def process_user(
         # silently dropped when they go stale.
         seen |= (new_ids - push_failed)
 
-    pushed_ok = {str(t.get("id") or "") for t, _ in to_push} - push_failed
+    pushed_ok = {str(member.get("id") or "") for tweet, _ in to_push
+                 for member in tweet.get("_official_thread_members") or [tweet]} - push_failed
     push_retry = (push_retry | push_failed) - pushed_ok
     if not args.dry_run:
         try:
@@ -6259,7 +6397,8 @@ def main() -> int:
         run_started = time.monotonic()
         global _ARTICLE_QUEUE_RUN_START, _THREAD_FALLBACK_ID, _CROSS_DEDUP_ENABLED
         global _ACCOUNT_CONFIG_BY_USERNAME, _ARTICLE_SUPERSEDE_ENABLED
-        global _ARTICLE_QUOTE_CARD_ENABLED
+        global _ARTICLE_QUOTE_CARD_ENABLED, _TRANSLATION_REPLY_ENABLED, _OFFICIAL_QUOTE_GROUPS
+        global _OFFICIAL_THREAD_MERGE_ENABLED
         _ARTICLE_QUEUE_RUN_START = run_started
         if HAS_GRAPHQL:
             twitter_graphql.reset_semantic_resolver_run()
@@ -6267,6 +6406,12 @@ def main() -> int:
 
         with open(CONFIG_PATH) as f:
             cfg = json.load(f)
+        _OFFICIAL_THREAD_MERGE_ENABLED = cfg.get("official_thread_merge_enabled") is True
+        _TRANSLATION_REPLY_ENABLED = cfg.get("translation_reply_enabled") is True
+        _OFFICIAL_QUOTE_GROUPS = quote_fold.normalize_groups(cfg.get("official_quote_groups"))
+        print(f"  quote-fold config: translation_reply_enabled={_TRANSLATION_REPLY_ENABLED} "
+              f"official_quote_groups={len(_OFFICIAL_QUOTE_GROUPS)} "
+              f"official_thread_merge_enabled={_OFFICIAL_THREAD_MERGE_ENABLED}")
         apply_route_overlay(cfg)  # 路由表优先，config.json 作回落
         bot_token = args.bot_token or cfg["telegram_bot_token"]
         chat_id = args.chat_id or cfg["telegram_chat_id"]
@@ -6303,10 +6448,11 @@ def main() -> int:
             print(f"  semantic bundle 灰度已启用（curators={sorted(_SEMANTIC_CURATOR_ALLOWLIST)}）")
         elif _SEMANTIC_BUNDLE_SHADOW:
             print("  semantic bundle shadow 已启用（observe-only）")
-        event_mode = _init_event_dedup_mode(str(cfg.get("event_dedup_mode") or "observe"))
+        event_mode = _init_event_dedup_mode(str(cfg.get("event_dedup_mode") or "observe"),
+                                            read_only=args.dry_run)
         print(f"  event ledger 已启用（requested={_EVENT_DEDUP_MODE}, effective={event_mode}）")
         if event_mode == "observe":
-            print(f"  event dedup observe Go/No-Go: {event_dedup_gate_report()}")
+            print(f"  event dedup observe Go/No-Go: {event_dedup_gate_report(read_only=args.dry_run)}")
         # rich 可播视频内嵌：config 键开关，默认关 = 封面缩略图行为
         global _RICH_VIDEO_ENABLED
         _RICH_VIDEO_ENABLED = bool(cfg.get("rich_video_embed"))
