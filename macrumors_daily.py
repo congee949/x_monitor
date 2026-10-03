@@ -545,9 +545,8 @@ def send_card(token: str, chat_id: str, it: dict, header: str = "",
     except tm.TgAmbiguousDelivery as e:
         # 请求已送出、响应缺失：卡片大概率已入群。抛出去会走 main 的「回落到
         # 文字」——对已送达的卡片再发一遍文字 = 重复。按已送达返回（调用方正常
-        # 标 seen），留痕供 x_monitor 下轮汇总 DM 核对。卡片自身不熔断（其失败
-        # 路径是换格式重发而非干净的下轮重试，按失败处理只会制造重复），但计入
-        # 连续歧义计数：大面积故障时后续 send_html 第一条即可熔断，整批留到次日。
+        # 标 seen），留痕供 x_monitor 下轮汇总 DM 核对。连续歧义仅计数审计；
+        # 未知结果不能改判为可安全重试，否则卡片会回落文字或次日重复。
         # （留痕文件与 x_monitor 进程有读改写竞态，最坏丢一条痕迹，可接受。）
         tm._register_ambiguous_send()
         tm._record_assumed_delivery("sendPhoto(macrumors)", it["link"])
@@ -608,15 +607,9 @@ def send_html(token: str, chat_id: str, text: str, trace_id: str = "",
             tm._tg_post(token, payload, "sendMessage")
             return
         except tm.TgAmbiguousDelivery as e:
-            # 请求已送出、响应缺失：重试必产生重复消息，首条按已送达返回（调用方
-            # 标 seen），留痕（带段落标识）供 x_monitor 汇总 DM 核对。连续歧义
-            # 熔断抛出：send_html 的失败路径是 main 的「未标 seen 次日重试」，
-            # 是干净重试，按 x_monitor 同款权衡防整期 digest 批量假送达丢失
-            # （最坏次日重发一批 << 全量永久丢失）。
-            if not tm._register_ambiguous_send():
-                print(f"sendMessage 连续歧义（疑似 Telegram 故障），按失败处理: {e}",
-                      file=sys.stderr)
-                raise
+            # 请求已送出、响应缺失：重试必产生重复消息。无论是否连续发生，
+            # 都按歧义送达收口并标 seen；持久痕迹供人工核对，绝不次日盲重发。
+            tm._register_ambiguous_send()
             tm._record_assumed_delivery("sendMessage(macrumors)", trace_id)
             print(f"sendMessage 响应缺失，按已送达处理（防重复）: {e}", file=sys.stderr)
             return
