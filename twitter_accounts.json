@@ -1,17 +1,5 @@
 [
   {
-    "username": "ClaudeDevs",
-    "enabled": true,
-    "user_id": "2024518793679294464",
-    "push_policy": "claude_dev_original"
-  },
-  {
-    "username": "OpenAIDevs",
-    "enabled": true,
-    "user_id": "1633874951508721686",
-    "push_policy": "openai_dev_original"
-  },
-  {
     "username": "claudeai",
     "enabled": true,
     "user_id": "1943306828697550848",
@@ -22,6 +10,18 @@
     "enabled": true,
     "user_id": "4398626122",
     "push_policy": "openai_major_original"
+  },
+  {
+    "username": "ClaudeDevs",
+    "enabled": true,
+    "user_id": "2024518793679294464",
+    "push_policy": "claude_dev_original"
+  },
+  {
+    "username": "OpenAIDevs",
+    "enabled": true,
+    "user_id": "1633874951508721686",
+    "push_policy": "openai_dev_original"
   },
   {
     "username": "thsottiaux",
