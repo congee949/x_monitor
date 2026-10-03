@@ -125,6 +125,46 @@ class LedgerPerformanceTest(unittest.TestCase):
                 db.execute(insert, (0, None))
 
 
+class VideoProvenancePerformanceTest(unittest.TestCase):
+    def test_confirmed_video_and_gif_keep_content_without_repeating_head(self):
+        for kind in ('video', 'animated_gif'):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as tmp, ExitStack() as stack:
+                root = Path(tmp)
+                tweet = {'id': '10', 'text': 'A detailed public release with a video demonstration.',
+                         'createdAt': 'Tue May 12 00:20:00 +0000 2026',
+                         'media': [{'type': kind, 'url': 'https://pbs.twimg.com/media/demo.jpg',
+                                    'variants': [{'url': 'https://video.twimg.com/demo.mp4', 'bitrate': 1000}],
+                                    'duration_ms': 1000}]}
+                for name, value in {
+                    'datetime': FixedDatetime, 'EVENT_LEDGER_PATH': str(root / 'ledger.sqlite3'),
+                    'SENT_CONTENT_LEDGER_PATH': str(root / 'sent.jsonl'),
+                    '_RICH_VIDEO_ENABLED': True, '_SENT_CONTENT_LEDGER_ENABLED': True,
+                    '_SEMANTIC_BUNDLE_ENABLED': False, '_CROSS_DEDUP_ENABLED': False,
+                    '_EVENT_DEDUP_EFFECTIVE_MODE': 'off', '_ACCOUNT_CONFIG_BY_USERNAME': {},
+                    '_ARTICLE_QUEUE_RUN_START': None,
+                }.items():
+                    stack.enter_context(patch.object(tm, name, value))
+                stack.enter_context(patch.object(tm, 'fetch_tweets', return_value=[tweet]))
+                stack.enter_context(patch.object(tm, 'load_seen', return_value=({'old'}, None)))
+                stack.enter_context(patch.object(tm, 'load_push_retry', return_value=set()))
+                stack.enter_context(patch.object(tm, 'save_seen'))
+                stack.enter_context(patch.object(tm, 'save_push_retry'))
+                stack.enter_context(patch.object(tm.time, 'sleep'))
+                stack.enter_context(patch.object(tm.urllib.request, 'urlopen', side_effect=AssertionError('network')))
+                heads = stack.enter_context(patch.object(tm, '_head_content_length', return_value=1000))
+                sends = stack.enter_context(patch.object(tm, '_tg_post',
+                    return_value={'ok': True, 'result': {'message_id': 42}}))
+                expected = tm._html_to_plain(tm.format_message('u', tweet, embed_video=False)[0])
+                args = argparse.Namespace(test=False, seed=False, dry_run=False, limit=20,
+                                          test_count=3, max_push_age_minutes=45)
+                with redirect_stdout(io.StringIO()):
+                    result = tm.process_user(None, FakeAI(False), 'u', 'fake', '-1001', args)
+                self.assertEqual(result, (1, 1, 0, 0))
+                self.assertEqual(heads.call_count, 1)
+                self.assertEqual(sends.call_count, 1)
+                row = json.loads((root / 'sent.jsonl').read_text())
+                self.assertEqual(row['content'], expected)
+                self.assertEqual(row['delivery_state'], 'confirmed')
 
 
 if __name__ == '__main__':

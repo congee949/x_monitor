@@ -175,6 +175,19 @@ def _sent_content_text(value: str) -> str:
     return text[:SENT_CONTENT_MAX_CHARS - len(marker)].rstrip() + marker
 
 
+def _bounded_unique_links(links) -> list:
+    """Sorted unique string links, empty-safe, hard-capped at 20."""
+    unique = []
+    seen = set()
+    for item in links or []:
+        if not isinstance(item, str) or not item or item in seen:
+            continue
+        seen.add(item)
+        unique.append(item)
+    unique.sort()
+    return unique[:20]
+
+
 def _record_confirmed_sent_content(
     send_results,
     *,
@@ -187,6 +200,7 @@ def _record_confirmed_sent_content(
     content: str,
     content_id: "str | None" = None,
     path: "str | None" = None,
+    links=None,
 ) -> int:
     """Append sent-content.v1 rows for explicit Telegram confirmations only.
 
@@ -247,6 +261,7 @@ def _record_confirmed_sent_content(
                 "content_hash": digest,
                 "delivery_state": "confirmed",
                 "sent_at": timestamp,
+                "links": _bounded_unique_links(links),
             }
             if content_id:
                 row["content_id"] = str(content_id)
@@ -3108,18 +3123,126 @@ def _cross_dup_hit(t: dict) -> "dict | None":
     return load_pushed_index().get("t:" + str(rt["id"]))
 
 
+_X_IDENTITY_HOSTS = {
+    "x.com", "twitter.com", "mobile.twitter.com",
+    "fxtwitter.com", "vxtwitter.com", "fixupx.com", "nitter.net",
+}
+_CANONICAL_DROP_QUERY_KEYS = {
+    "from", "from_source", "_from", "spm", "scene", "fbclid", "gclid",
+    "ref", "ref_src", "refer", "referer", "referrer", "src", "source",
+    "wxshare", "weibo_id", "timestamp", "ts", "_t",
+}
+_CANONICAL_REJECT_HOSTS = {"t.co", "pbs.twimg.com", "video.twimg.com"}
+_X_STATUS_PATH_RE = re.compile(
+    r"^/(?:[A-Za-z0-9_]+|i/web)/status(?:es)?/(\d+)")
+_X_ARTICLE_PATH_RE = re.compile(r"^/i/article/(\d+)")
+
+
+def _canonical_link(url: str) -> str:
+    """Deterministic outbound URL identity. Empty string = not a content key."""
+    if not isinstance(url, str):
+        return ""
+    raw = url.strip()
+    if (not raw or len(raw) > 2048
+            or any(ord(c) < 32 for c in raw)):
+        return ""
+    parsed = urllib.parse.urlsplit(raw)
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in ("http", "https"):
+        return ""
+    host = (parsed.hostname or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    if not host or host in _CANONICAL_REJECT_HOSTS:
+        return ""
+    path = parsed.path or ""
+    if host in _X_IDENTITY_HOSTS:
+        status = _X_STATUS_PATH_RE.match(path)
+        if status:
+            return "x.com/status/" + status.group(1)
+        article = _X_ARTICLE_PATH_RE.match(path)
+        if article:
+            return "x.com/i/article/" + article.group(1)
+    kept = []
+    for key, value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True):
+        lowered = key.lower()
+        if lowered.startswith("utm_") or lowered.startswith("share"):
+            continue
+        if lowered in _CANONICAL_DROP_QUERY_KEYS:
+            continue
+        kept.append((key, value))
+    kept.sort()
+    netloc = host
+    if parsed.port:
+        netloc = "%s:%s" % (host, parsed.port)
+    return urllib.parse.urlunsplit((
+        scheme or "https",
+        netloc,
+        path.rstrip("/"),
+        urllib.parse.urlencode(kept),
+        "",
+    ))
+
+
+def _tweet_outbound_links(t: dict) -> list:
+    """Canonical outbound destinations from a tweet and its quoted_status."""
+    if not isinstance(t, dict):
+        return []
+    tweets = [t]
+    quoted = t.get("quoted_status")
+    found = []
+    seen = set()
+    if isinstance(quoted, dict) and quoted:
+        tweets.append(quoted)
+        # 规范化后的 quoted_status 只带 id/screen_name（无 entities）：被引推文
+        # 本身就是已送达内容，登记其 status 键，频道裸转被引推文时可命中。
+        qid = str(quoted.get("id") or "").strip()
+        if qid.isdigit():
+            seen.add("x.com/status/" + qid)
+            found.append("x.com/status/" + qid)
+    # 送达后的登记环节绝不能因链接解析抛异常打断 send-then-mark：坏实体只丢
+    # 该条链接（少一次抑制机会，安全方向），不影响已解析出的部分。
+    for tweet in tweets:
+        if not isinstance(tweet, dict):
+            continue
+        try:
+            entities = _tweet_url_entities(tweet)
+        except Exception:
+            continue
+        for entity in entities:
+            try:
+                canon = _canonical_link(_entity_destination(entity))
+            except Exception:
+                continue
+            if not canon or canon in seen:
+                continue
+            seen.add(canon)
+            found.append(canon)
+    found.sort()
+    return found[:20]
+
+
 def _record_pushed(t: dict, username: str) -> None:
     """送达 checkpoint 同点位登记 canonical（send-then-mark：崩溃窗口最多重复一条，
     重复优于丢失；失败/tombstone/降级轮不会走到这里 → 残缺快照不落库）。"""
     idx = load_pushed_index()
-    idx[_canonical_key(t)] = {"ts": datetime.now(timezone.utc).isoformat(), "by": username}
+    try:
+        links = _tweet_outbound_links(t)
+    except Exception:
+        links = []
+    idx[_canonical_key(t)] = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "by": username,
+        "links": links,
+    }
     save_pushed_index()
 
 
 def _record_pushed_article(article_id: str, username: str, bundle_key: str = "", *,
                            message_ids: "list | None" = None, chat_id: str = "",
                            thread_id: "int | None" = None, quoted: bool = False,
-                           form: str = "summary", cover_url: str = "") -> None:
+                           form: str = "summary", cover_url: str = "",
+                           links=None) -> None:
     """登记一次 article 摘要投递。
 
     message_ids/chat_id 是删减功能撤回旧摘要的唯一入口（article 路径不走 event
@@ -3140,7 +3263,8 @@ def _record_pushed_article(article_id: str, username: str, bundle_key: str = "",
                 "thread_id": thread_id,
                 "quoted": bool(quoted),
                 "form": form,
-                "cover_url": str(cover_url or "")}
+                "cover_url": str(cover_url or ""),
+                "links": sorted(set(links or []))[:20]}
     save_pushed_index()
 
 
@@ -3303,11 +3427,13 @@ def _deliver_article_quote_card(bot_token: str, chat_id: str, username: str, ent
     print(f"    评论卡片推送 OK（挂在 {reply_to} 下，"
           f"{'带封面' if r.get('send_method') == 'sendPhoto' else '纯文本'}，"
           f"跳过抓取与 AI 摘要）")
+    article_links = [canon for canon in [_canonical_link(link)] if canon]
     try:
         _record_pushed_article(
             entry["article_id"], username, str(entry.get("bundle_key") or ""),
             message_ids=[(r.get("result") or {}).get("message_id")],
-            chat_id=chat_id, thread_id=thread_id, quoted=True, form="card")
+            chat_id=chat_id, thread_id=thread_id, quoted=True, form="card",
+            links=article_links)
     except OSError as e:
         print(f"    pushed_index 落盘失败（忽略）: {e}")
     source_id = entry.get("tweet_id") or entry.get("article_id")
@@ -3316,7 +3442,8 @@ def _deliver_article_quote_card(bot_token: str, chat_id: str, username: str, ent
         source_kind="x_article", source_ref=link,
         source_message_ids=[source_id], url=link,
         content=_html_to_plain(card),
-        content_id=f"x-article-quote:{entry.get('article_id')}:{source_id}")
+        content_id=f"x-article-quote:{entry.get('article_id')}:{source_id}",
+        links=article_links)
     time.sleep(1.2)
 
 
@@ -5359,7 +5486,13 @@ def process_user(
                     source_id = (source_tweet.get("id") if isinstance(source_tweet, dict)
                                  else None) or tid
                     try:
-                        delivered_html, _rich_html, _link = format_message(username, t, ai)
+                        # The sidecar stores the plain HTML fallback projection.  Its
+                        # rich media is never persisted, so avoid the optional video
+                        # HEAD probes performed by the default renderer.  This keeps
+                        # the stored content byte-for-byte identical while removing
+                        # the repeated network probes for delivered videos/GIFs.
+                        delivered_html, _rich_html, _link = format_message(
+                            username, t, ai, embed_video=False)
                         delivered_content = _html_to_plain(delivered_html)
                     except Exception:
                         # Rendering already succeeded inside send_tweet; this
@@ -5371,7 +5504,8 @@ def process_user(
                         source_kind="x_tweet", source_ref=source_url,
                         source_message_ids=[source_id], url=source_url,
                         content=delivered_content,
-                        content_id=f"x-tweet:{source_id}")
+                        content_id=f"x-tweet:{source_id}",
+                        links=_tweet_outbound_links(t))
                 time.sleep(1.2)
             except TgAmbiguousDelivery as e:
                 # Any surfaced ambiguity is an unknown outcome for this claim.
@@ -5718,7 +5852,8 @@ def process_article_queue(ai: AIClassifier, bot_token: str, chat_id: str, dry_ru
                                     source_kind="x_article", source_ref=article_link,
                                     source_message_ids=[aid], url=article_link,
                                     content=article_content,
-                                    content_id=f"x-article:{aid}")
+                                    content_id=f"x-article:{aid}",
+                                    links=[canon for canon in [_canonical_link(article_link)] if canon])
                             time.sleep(1.2)
                         else:
                             print(f"    rich 推送被拒({str(r.get('description', ''))[:80]})，回退分块 HTML")
@@ -5741,7 +5876,8 @@ def process_article_queue(ai: AIClassifier, bot_token: str, chat_id: str, dry_ru
                                     source_kind="x_article", source_ref=article_link,
                                     source_message_ids=[aid], url=article_link,
                                     content=_html_to_plain(part),
-                                    content_id=f"x-article:{aid}:part:{idx}")
+                                    content_id=f"x-article:{aid}:part:{idx}",
+                                    links=[canon for canon in [_canonical_link(article_link)] if canon])
                             ok = ok and part_ok
                             time.sleep(1.2)
                             if not part_ok:
@@ -5777,7 +5913,8 @@ def process_article_queue(ai: AIClassifier, bot_token: str, chat_id: str, dry_ru
                                 _record_pushed_article(
                                     aid, username, bundle_key, message_ids=sent_mids,
                                     chat_id=chat_id, thread_id=file_thread,
-                                    quoted=entry_quoted, cover_url=cover or "")
+                                    quoted=entry_quoted, cover_url=cover or "",
+                                    links=[canon for canon in [_canonical_link(article_link)] if canon])
                             except OSError as e:
                                 print(f"    pushed_index 落盘失败（忽略）: {e}")
                         if learning_feed is not None:

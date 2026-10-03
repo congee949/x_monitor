@@ -95,7 +95,9 @@ class SentContentLedgerTest(unittest.TestCase):
                     "schema", "chat_id", "thread_id", "message_id", "producer",
                     "source_kind", "source_ref", "source_message_ids", "url",
                     "content", "content_hash", "delivery_state", "sent_at", "content_id",
+                    "links",
                 })
+                self.assertEqual(row["links"], [])
                 self.assertEqual(row["schema"], "sent-content.v1")
                 self.assertEqual(row["producer"], "x_monitor")
                 self.assertEqual(row["delivery_state"], "confirmed")
@@ -152,6 +154,85 @@ class SentContentLedgerTest(unittest.TestCase):
             self.assertEqual(twitter_monitor._record_confirmed_sent_content(
                 {"ok": True, "result": {"message_id": 9}},
                 path=str(blocker / "ledger.jsonl"), **common), 0)
+
+    def test_links_sorted_unique_capped_and_omitted_is_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "ledger.jsonl"
+            common = dict(
+                chat_id=-1001, thread_id=None, source_kind="x_tweet",
+                source_ref="https://x.com/u/status/10", source_message_ids=[10],
+                url="https://x.com/u/status/10", content="public content",
+                content_id="x-tweet:10", path=str(path))
+            extras = ["https://n.example/%02d" % i for i in range(18)]
+            written = twitter_monitor._record_confirmed_sent_content(
+                {"ok": True, "result": {"message_id": 1}},
+                links=["https://b.example/z", "https://a.example/y",
+                       "https://b.example/z"] + extras,
+                **common)
+            self.assertEqual(written, 1)
+            row = json.loads(path.read_text(encoding="utf-8"))
+            expected = sorted(set(
+                ["https://a.example/y", "https://b.example/z"] + extras))[:20]
+            self.assertEqual(row["links"], expected)
+            self.assertEqual(len(row["links"]), 20)
+            self.assertEqual(row["links"], sorted(set(row["links"])))
+
+            empty_path = Path(tmp) / "empty.jsonl"
+            common["path"] = str(empty_path)
+            written = twitter_monitor._record_confirmed_sent_content(
+                {"ok": True, "result": {"message_id": 2}}, **common)
+            self.assertEqual(written, 1)
+            row = json.loads(empty_path.read_text(encoding="utf-8"))
+            self.assertEqual(row["links"], [])
+
+
+class CanonicalLinkTest(unittest.TestCase):
+    def test_outbound_links_include_quoted_status_key_and_entities(self):
+        tweet = {
+            "id": "1", "text": "看这个 https://t.co/abc",
+            "entities": {"urls": [{
+                "url": "https://t.co/abc",
+                "expanded_url": "https://z.ai/blog/glm-built-its-inference-infrastructure/?utm_source=x",
+            }]},
+            "quoted_status": {"id": "2100494599475155288", "screen_name": "dotey"},
+        }
+        self.assertEqual(
+            twitter_monitor._tweet_outbound_links(tweet),
+            ["https://z.ai/blog/glm-built-its-inference-infrastructure",
+             "x.com/status/2100494599475155288"])
+        self.assertEqual(twitter_monitor._tweet_outbound_links({"id": "1", "text": "no links"}), [])
+        self.assertEqual(twitter_monitor._tweet_outbound_links({"quoted_status": {"id": "abc"}}), [])
+
+    def test_tracker_host_slash_and_fragment(self):
+        self.assertEqual(
+            twitter_monitor._canonical_link(
+                "https://www.Z.ai/blog/glm-built-its-inference-infrastructure/"
+                "?utm_source=x#top"),
+            "https://z.ai/blog/glm-built-its-inference-infrastructure")
+
+    def test_x_status_shapes(self):
+        expected = "x.com/status/123"
+        for url in (
+            "https://x.com/dotey/status/123",
+            "https://twitter.com/dotey/status/123",
+            "https://x.com/i/web/status/123",
+            "https://twitter.com/dotey/status/123?s=20&t=abc",
+            "https://mobile.twitter.com/dotey/statuses/123",
+        ):
+            self.assertEqual(twitter_monitor._canonical_link(url), expected, url)
+
+    def test_x_article(self):
+        self.assertEqual(
+            twitter_monitor._canonical_link("https://x.com/i/article/99"),
+            "x.com/i/article/99")
+
+    def test_rejected_hosts_and_schemes(self):
+        self.assertEqual(twitter_monitor._canonical_link("https://t.co/abc"), "")
+        self.assertEqual(
+            twitter_monitor._canonical_link("https://pbs.twimg.com/media/x.jpg"), "")
+        self.assertEqual(twitter_monitor._canonical_link("javascript:alert(1)"), "")
+        self.assertEqual(twitter_monitor._canonical_link("ftp://example.com/a"), "")
+        self.assertEqual(twitter_monitor._canonical_link(""), "")
 
 
 class EventDeliveryLedgerTest(unittest.TestCase):
@@ -680,6 +761,52 @@ class SentContentFlowTest(unittest.TestCase):
             self.assertEqual((row["source_kind"], row["message_id"], row["source_message_ids"]),
                              ("x_article", 88, [777]))
             self.assertEqual(row["content_id"], "x-article:777")
+
+    def test_outbound_links_land_in_ledger_and_pushed_index(self):
+        tweet = dict(self.TWEET)
+        tweet["entities"] = {
+            "urls": [
+                {
+                    "url": "https://t.co/glm",
+                    "expanded_url": (
+                        "https://z.ai/blog/glm-built-its-inference-infrastructure"
+                        "?utm_source=x"),
+                },
+                {"url": "https://t.co/abc", "expanded_url": "https://t.co/abc"},
+            ],
+        }
+        expected_links = [
+            "https://z.ai/blog/glm-built-its-inference-infrastructure",
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ledger = root / "confirmed.jsonl"
+            pushed = root / "pushed.json"
+            with patch.object(twitter_monitor, "datetime", FixedDatetime), \
+                 patch.object(twitter_monitor, "SENT_CONTENT_LEDGER_PATH", str(ledger)), \
+                 patch.object(twitter_monitor, "PUSHED_INDEX_PATH", str(pushed)), \
+                 patch.object(twitter_monitor, "_PUSHED_INDEX_CACHE", None), \
+                 patch.object(twitter_monitor, "_EVENT_DEDUP_EFFECTIVE_MODE", "off"), \
+                 patch.object(twitter_monitor, "_CROSS_DEDUP_ENABLED", True), \
+                 patch.object(twitter_monitor, "fetch_tweets", return_value=[tweet]), \
+                 patch.object(twitter_monitor, "load_seen", return_value=({"old"}, None)), \
+                 patch.object(twitter_monitor, "load_push_retry", return_value=set()), \
+                 patch.object(twitter_monitor, "save_seen", return_value=None), \
+                 patch.object(twitter_monitor, "save_push_retry", return_value=None), \
+                 patch.object(twitter_monitor, "send_tweet",
+                              return_value={"ok": True, "result": {"message_id": 42},
+                                            "send_method": "sendMessage"}), \
+                 patch.object(twitter_monitor.time, "sleep", return_value=None):
+                result = twitter_monitor.process_user(
+                    pool=None, ai=FakeAI(False), username="u",
+                    bot_token="b", chat_id="-1001", args=self._args(),
+                    content_chat_id="-1002", content_thread_id=19)
+            self.assertEqual(result[1], 1)
+            row = json.loads(ledger.read_text(encoding="utf-8"))
+            self.assertEqual(row["links"], expected_links)
+            idx = json.loads(pushed.read_text(encoding="utf-8"))
+            entry = idx["entries"]["t:" + tweet["id"]]
+            self.assertEqual(entry["links"], expected_links)
 
 
 class OfficialPushPolicyTest(unittest.TestCase):
