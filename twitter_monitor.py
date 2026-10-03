@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+from contextlib import contextmanager
 import hashlib
 import http.client
 import json
@@ -2589,96 +2590,125 @@ def _event_ledger_connect(path: str | None = None) -> sqlite3.Connection:
                 CREATE INDEX IF NOT EXISTS tweet_anchors_age_idx
                     ON tweet_anchors(updated_at);
             """)
-            # Existing production ledgers predate destination-scoped keys. Add the
-            # columns in place; legacy rows remain queryable with an empty target,
-            # while every new claim is scoped to the actual Telegram destination.
-            db.execute("BEGIN IMMEDIATE")
-            try:
+            # Existing production ledgers predate destination-scoped keys. Probe
+            # the schema without taking a write lock; only a legacy or damaged
+            # ledger enters the migration transaction. This keeps read-only
+            # anchor lookups and gate reports out of the claimer's lock queue.
+            expected_columns = ["target_chat_id", "target_thread_id", "event_key",
+                                "candidate_tweet_id", "decision"]
+
+            def migration_state():
                 delivery_columns = {row["name"] for row in db.execute(
                     "PRAGMA table_info(deliveries)")}
-                if "target_chat_id" not in delivery_columns:
-                    db.execute("ALTER TABLE deliveries ADD COLUMN "
-                               "target_chat_id TEXT NOT NULL DEFAULT ''")
-                if "target_thread_id" not in delivery_columns:
-                    db.execute("ALTER TABLE deliveries ADD COLUMN "
-                               "target_thread_id TEXT NOT NULL DEFAULT ''")
                 observation_columns = {row["name"] for row in db.execute(
                     "PRAGMA table_info(event_observations)")}
-                if "target_chat_id" not in observation_columns:
-                    db.execute("ALTER TABLE event_observations ADD COLUMN "
-                               "target_chat_id TEXT NOT NULL DEFAULT ''")
-                if "target_thread_id" not in observation_columns:
-                    db.execute("ALTER TABLE event_observations ADD COLUMN "
-                               "target_thread_id TEXT NOT NULL DEFAULT ''")
+                index_meta = next((row for row in db.execute(
+                    "PRAGMA index_list(event_observations)")
+                    if row["name"] == "event_observations_candidate_idx"), None)
+                index_columns = [row["name"] for row in db.execute(
+                    "PRAGMA index_info(event_observations_candidate_idx)")]
+                index_ready = bool(index_meta and index_meta["unique"]
+                                   and index_columns == expected_columns)
+                version = db.execute("PRAGMA user_version").fetchone()[0]
+                return delivery_columns, observation_columns, index_ready, version
+
+            # Read the readiness probes from one deferred snapshot. In WAL mode
+            # this does not block a writer, avoids five autocommit snapshots, and
+            # still commits before any possible BEGIN IMMEDIATE migration.
+            db.execute("BEGIN")
+            try:
+                delivery_columns, observation_columns, index_ready, version = migration_state()
                 db.execute("COMMIT")
             except Exception:
                 db.execute("ROLLBACK")
                 raise
-            # v2 observation identity deliberately excludes prior_delivery_key:
-            # a changing "latest prior" must not turn one candidate tweet into
-            # multiple Go/No-Go samples. Migrate old/pre-index ledgers once and
-            # keep a labelled row when consolidating legacy duplicates.
-            index_rows = db.execute(
-                "PRAGMA index_info(event_observations_candidate_idx)").fetchall()
-            index_columns = [row["name"] for row in index_rows]
-            expected_columns = ["target_chat_id", "target_thread_id", "event_key",
-                                "candidate_tweet_id", "decision"]
-            if index_columns != expected_columns:
+            needs_migration = (
+                not {"target_chat_id", "target_thread_id"} <= delivery_columns
+                or not {"target_chat_id", "target_thread_id"} <= observation_columns
+                or not index_ready or version < LEDGER_SCHEMA_VERSION)
+            if needs_migration:
+                # Re-read all state after acquiring the lock: two first-use
+                # processes may have probed the same legacy schema concurrently.
                 db.execute("BEGIN IMMEDIATE")
                 try:
-                    db.execute("""
-                        DELETE FROM event_observations
-                        WHERE id NOT IN (
-                            SELECT COALESCE(
-                                MIN(CASE WHEN reviewed=1 AND false_positive IN (0,1)
-                                         THEN id END),
-                                MIN(id))
-                            FROM event_observations
-                            GROUP BY target_chat_id,target_thread_id,event_key,
-                                     candidate_tweet_id,decision
-                        )
-                    """)
-                    db.execute("DROP INDEX IF EXISTS event_observations_candidate_idx")
-                    db.execute("""
-                        CREATE UNIQUE INDEX event_observations_candidate_idx
-                        ON event_observations(target_chat_id,target_thread_id,event_key,
-                                              candidate_tweet_id,decision)
-                    """)
+                    delivery_columns, observation_columns, index_ready, version = migration_state()
+                    if "target_chat_id" not in delivery_columns:
+                        db.execute("ALTER TABLE deliveries ADD COLUMN "
+                                   "target_chat_id TEXT NOT NULL DEFAULT ''")
+                    if "target_thread_id" not in delivery_columns:
+                        db.execute("ALTER TABLE deliveries ADD COLUMN "
+                                   "target_thread_id TEXT NOT NULL DEFAULT ''")
+                    if "target_chat_id" not in observation_columns:
+                        db.execute("ALTER TABLE event_observations ADD COLUMN "
+                                   "target_chat_id TEXT NOT NULL DEFAULT ''")
+                    if "target_thread_id" not in observation_columns:
+                        db.execute("ALTER TABLE event_observations ADD COLUMN "
+                                   "target_thread_id TEXT NOT NULL DEFAULT ''")
+                    # v2 observation identity deliberately excludes
+                    # prior_delivery_key; preserve an existing reviewed label
+                    # when collapsing legacy duplicate observations.
+                    if not index_ready:
+                        db.execute("""
+                            DELETE FROM event_observations
+                            WHERE id NOT IN (
+                                SELECT COALESCE(
+                                    MIN(CASE WHEN reviewed=1 AND false_positive IN (0,1)
+                                             THEN id END),
+                                    MIN(id))
+                                FROM event_observations
+                                GROUP BY target_chat_id,target_thread_id,event_key,
+                                         candidate_tweet_id,decision
+                            )
+                        """)
+                        db.execute("DROP INDEX IF EXISTS event_observations_candidate_idx")
+                        db.execute("""
+                            CREATE UNIQUE INDEX event_observations_candidate_idx
+                            ON event_observations(target_chat_id,target_thread_id,event_key,
+                                                  candidate_tweet_id,decision)
+                        """)
+                    # One-time anchor backfill follows column migration and is
+                    # committed in the same transaction as its version marker.
+                    if version < LEDGER_SCHEMA_VERSION:
+                        db.execute("""INSERT OR IGNORE INTO tweet_anchors
+                            (target_chat_id,target_thread_id,tweet_id,message_id,username,updated_at)
+                            SELECT target_chat_id,target_thread_id,tweet_id,message_id,username,updated_at
+                            FROM deliveries
+                            WHERE state='confirmed' AND tweet_id<>''
+                              AND message_id IS NOT NULL AND message_id<>''""")
+                        db.execute(f"PRAGMA user_version={LEDGER_SCHEMA_VERSION}")
                     db.execute("COMMIT")
                 except Exception:
                     db.execute("ROLLBACK")
                     raise
-            # 一次性回填，必须排在上面所有 schema 迁移之后（老库的 deliveries 还
-            # 没有 target_* 列，早跑会 no such column）：已确认送达的投递自带
-            # message_id，导入后自回复线程上线即对历史父推生效，不必空等一个 TTL
-            # 攒锚点。用 user_version 记账而不是「表空则回填」——后者会在 TTL GC
-            # 清空表后反复把过期锚点捞回来。
-            if db.execute("PRAGMA user_version").fetchone()[0] < LEDGER_SCHEMA_VERSION:
-                db.execute("BEGIN IMMEDIATE")
-                try:
-                    db.execute("""INSERT OR IGNORE INTO tweet_anchors
-                        (target_chat_id,target_thread_id,tweet_id,message_id,username,updated_at)
-                        SELECT target_chat_id,target_thread_id,tweet_id,message_id,username,updated_at
-                        FROM deliveries
-                        WHERE state='confirmed' AND tweet_id<>''
-                          AND message_id IS NOT NULL AND message_id<>''""")
-                    db.execute("COMMIT")
-                except Exception:
-                    db.execute("ROLLBACK")
-                    raise
-                db.execute(f"PRAGMA user_version={LEDGER_SCHEMA_VERSION}")
             return db
-        except sqlite3.OperationalError as e:
+        except Exception as e:
             db.close()
-            if "locked" not in str(e).lower() or attempt == 19:
+            if (not isinstance(e, sqlite3.OperationalError)
+                    or "locked" not in str(e).lower() or attempt == 19):
                 raise
             time.sleep(min(0.01 * (attempt + 1), 0.1))
     raise RuntimeError("event ledger initialization exhausted retries")
 
 
+@contextmanager
+def _event_ledger_session(path: str | None = None):
+    """Use a ledger connection with the same commit/rollback semantics, then close it.
+
+    `_event_ledger_connect` remains a public-ish connection factory because tests
+    and maintenance tools use it directly. Production call sites use this wrapper
+    so SQLite file descriptors do not depend on garbage-collection timing.
+    """
+    db = _event_ledger_connect(path)
+    try:
+        with db:
+            yield db
+    finally:
+        db.close()
+
+
 def event_dedup_gate_report(path: str | None = None) -> dict:
     """Repeatable Go/No-Go report. Enforce needs reviewed candidates, not uptime."""
-    with _event_ledger_connect(path) as db:
+    with _event_ledger_session(path) as db:
         row = db.execute("""
             SELECT count(*) AS candidates,
                    sum(CASE WHEN reviewed=1 AND false_positive IN (0,1)
@@ -2702,7 +2732,7 @@ def event_review_rows(path: str | None = None, limit: int = 100) -> list[dict]:
     Tweet URLs are enough for a human reviewer to inspect the public source while
     the ledger retains only stable IDs and labels.
     """
-    with _event_ledger_connect(path) as db:
+    with _event_ledger_session(path) as db:
         rows = db.execute("""
             SELECT o.id,o.observed_at,o.event_key,o.candidate_tweet_id,
                    o.candidate_username,o.reviewed,o.false_positive,o.note,
@@ -2729,7 +2759,7 @@ def event_review_rows(path: str | None = None, limit: int = 100) -> list[dict]:
 def review_event_observation(observation_id: int, false_positive: bool,
                              note: str = "", *, path: str | None = None) -> bool:
     """Atomically label one suppression candidate for the enforce gate."""
-    with _event_ledger_connect(path) as db:
+    with _event_ledger_session(path) as db:
         cur = db.execute("""
             UPDATE event_observations
             SET reviewed=1,false_positive=?,note=?
@@ -2748,7 +2778,7 @@ def recover_stale_event_claims(path: str | None = None,
     """
     now = now or datetime.now(timezone.utc)
     cutoff = (now - timedelta(seconds=EVENT_LEDGER_PENDING_TTL_SECONDS)).isoformat()
-    with _event_ledger_connect(path) as db:
+    with _event_ledger_session(path) as db:
         cur = db.execute("""UPDATE deliveries SET state='ambiguous',updated_at=?,
             detail=CASE WHEN detail IS NULL OR detail='' THEN 'startup_stale_pending_recovery'
                         ELSE detail END
@@ -2799,7 +2829,7 @@ def claim_event_delivery(t: dict, username: str, *, target_chat_id: str = "",
     delivery_key = (f"target:{target_digest}:event:{event_key}:{fact_digest}"
                     if enforce_key else f"target:{target_digest}:tweet:{tid}")
     token = hashlib.sha256(f"{delivery_key}:{os.getpid()}:{time.time_ns()}".encode()).hexdigest()
-    with _event_ledger_connect(path) as db:
+    with _event_ledger_session(path) as db:
         db.execute("BEGIN IMMEDIATE")
         try:
             prior = None
@@ -2889,7 +2919,7 @@ def finish_event_delivery(claim: dict, state: str, result: dict | None = None,
     message_id = telegram_message_id_of(result)
     method = result.get("send_method") or result.get("method")
     now_iso = datetime.now(timezone.utc).isoformat()
-    with _event_ledger_connect(path) as db:
+    with _event_ledger_session(path) as db:
         cur = db.execute("""UPDATE deliveries SET state=?,updated_at=?,message_id=?,send_method=?,detail=?
             WHERE delivery_key=? AND claim_token=? AND state='pending'""",
             (state,now_iso,str(message_id) if message_id is not None else None,method,
@@ -2932,7 +2962,7 @@ def record_tweet_anchor(tweet_id: str, message_id: "int | None", *, username: st
     now = now or datetime.now(timezone.utc)
     chat, thread = _anchor_target(target_chat_id, target_thread_id)
     cutoff = (now - timedelta(days=TWEET_ANCHOR_TTL_DAYS)).isoformat()
-    with _event_ledger_connect(path) as db:
+    with _event_ledger_session(path) as db:
         db.execute("""INSERT INTO tweet_anchors
             (target_chat_id,target_thread_id,tweet_id,message_id,username,updated_at)
             VALUES (?,?,?,?,?,?)
@@ -2957,7 +2987,7 @@ def lookup_tweet_anchor(tweet_id: str, *, target_chat_id: str = "",
     if not tweet_id:
         return None
     chat, thread = _anchor_target(target_chat_id, target_thread_id)
-    with _event_ledger_connect(path) as db:
+    with _event_ledger_session(path) as db:
         row = db.execute("""SELECT message_id FROM tweet_anchors
             WHERE target_chat_id=? AND target_thread_id=? AND tweet_id=?""",
             (chat, thread, tweet_id)).fetchone()
