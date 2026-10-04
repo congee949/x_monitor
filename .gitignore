@@ -24,3 +24,16 @@ __pycache__/
 .account_failures.json
 .dashboard.json
 .cookie_health.json
+
+# Additional runtime sidecars; never publish generated content or access URLs.
+state/
+reports/
+transcripts/
+downloads/
+backup/
+.learning_feed_url
+.semantic_detail_cache.json
+.macrumors_seen.json
+.macrumors.lock
+*.log
+.deploy-*/

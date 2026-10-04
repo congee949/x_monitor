@@ -1,0 +1,27 @@
+--- a/cc98_telegram_bot.py
++++ b/cc98_telegram_bot.py
+@@ -1272,7 +1272,8 @@
+ 
+ 
+ def get_updates(config, offset, timeout=25):
+-    payload = {"timeout": timeout, "allowed_updates": ["message"]}
++    from x_review_bridge import allowed_updates
++    payload = {"timeout": timeout, "allowed_updates": allowed_updates(config)}
+     if offset:
+         payload["offset"] = offset
+     # socket 超时只比 long-poll 多 5s：连接被静默切断时最多空转 timeout+5，
+@@ -1658,9 +1659,13 @@
+     state = load_state()
+     offset = state.get("last_update_id", 0) + 1 if state.get("last_update_id", 0) else 0
+     updates = get_updates(config, offset=offset, timeout=25)
++    from x_review_bridge import persist_configured_batch
++    # Commit the complete bridge batch before any Telegram offset advances.
++    bridged_callbacks = persist_configured_batch(config, updates)
+     for update in updates:
+         try:
+-            process_update(config, profile_key, update)
++            if update["update_id"] not in bridged_callbacks:
++                process_update(config, profile_key, update)
+         except Exception as e:
+             traceback.print_exc(file=sys.stderr)
+             try:

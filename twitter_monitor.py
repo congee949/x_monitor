@@ -4461,6 +4461,7 @@ def _prepare_quote_translation(t: dict, ai) -> None:
             repost_path=list(bundle.get("repost_path") or []) + [
                 {"tweet_id": anchor.get("tweet_id"), "author": anchor.get("author")}])
         return
+
     if not isinstance(source, dict) or anchor.get("article") or source.get("article"):
         return
     a, anchor_view = _semantic_node_body(anchor)
