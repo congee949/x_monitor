@@ -100,8 +100,24 @@ def collect(repo, ids, *, max_requests=48, deadline_seconds=240):
 
     for tid in ids:
         fetch(tid)
+
+    review_nodes = {}
+
+    def include_review_node(tid):
+        if tid not in nodes or tid in review_nodes:
+            return
+        node = review_nodes[tid] = nodes[tid]
+        for raw in (((node.get('legacy') or {}).get('retweeted_status_result') or {}).get('result'),
+                    (node.get('quoted_status_result') or {}).get('result')):
+            child = gql._unwrap_tweet_result(raw)
+            child_id = str((child.get('legacy') or {}).get('id_str') or child.get('rest_id') or '')
+            include_review_node(child_id)
+
+    # Keep the full cache available for reuse, but spend requests only on review roots and descendants.
+    for tid in ids:
+        include_review_node(tid)
     for _ in range(gql.SEMANTIC_MAX_DEPTH):
-        missing = [(node, relation, tid) for node in list(nodes.values())
+        missing = [(node, relation, tid) for node in list(review_nodes.values())
                    for relation, tid in gql._relation_missing_ids(node)]
         if not missing:
             break
@@ -109,6 +125,7 @@ def collect(repo, ids, *, max_requests=48, deadline_seconds=240):
         for node, relation, tid in missing:
             fetch(tid)
             if tid in nodes:
+                include_review_node(tid)
                 gql._inject_relation(node, relation, copy.deepcopy(nodes[tid]))
                 changed = True
         if not changed:
