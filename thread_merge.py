@@ -33,6 +33,24 @@ def body(tweet):
     return (tweet.get('note_tweet') or {}).get('text') or tweet.get('text') or ''
 
 
+def combine(prior, members, tweet):
+    """One card for a thread; every member id stays on _official_thread_members."""
+    combined = dict(prior)
+    merged_body = body(prior) + '\n\n' + body(tweet)
+    entities = {}
+    for member in members + [tweet]:
+        for source in (member.get('entities') or {},
+                       (member.get('note_tweet') or {}).get('entities') or {}):
+            for key, values in source.items():
+                if isinstance(values, list):
+                    entities.setdefault(key, []).extend(values)
+    combined.pop('semantic_bundle', None)
+    combined.update(text=merged_body, entities=entities,
+                    note_tweet={'text': merged_body, 'entities': entities},
+                    _official_thread_members=members + [tweet], _semantic_active=False)
+    return combined
+
+
 def merge_ready(items, username, *, enabled, now=None, idle_seconds=90, deferred=None):
     if not enabled:
         return items
@@ -52,20 +70,7 @@ def merge_ready(items, username, *, enabled, now=None, idle_seconds=90, deferred
                 and timestamp(tweet) is not None and all(timestamp(t) is not None for t in members)
                 and not has_context_or_media(tweet) and not has_context_or_media(prior)
                 and len(body(tweet)) + len(body(prior)) < 3000):
-            combined = dict(prior)
-            merged_body = body(prior) + '\n\n' + body(tweet)
-            entities = {}
-            for member in members + [tweet]:
-                for source in (member.get('entities') or {},
-                               (member.get('note_tweet') or {}).get('entities') or {}):
-                    for key, values in source.items():
-                        if isinstance(values, list):
-                            entities.setdefault(key, []).extend(values)
-            combined.pop('semantic_bundle', None)
-            combined.update(text=merged_body, entities=entities,
-                            note_tweet={'text': merged_body, 'entities': entities},
-                            _official_thread_members=members + [tweet], _semantic_active=False)
-            result[-1] = (combined, reason)
+            result[-1] = (combine(prior, members, tweet), reason)
         else:
             result.append((tweet, reason))
     ready = []
@@ -84,3 +89,39 @@ def merge_ready(items, username, *, enabled, now=None, idle_seconds=90, deferred
         else:
             ready.append((tweet, reason))
     return ready
+
+
+def _has_context(tweet):
+    bundle = tweet.get('semantic_bundle') or {}
+    return bool(tweet.get('quoted_status') or tweet.get('retweeted_status')
+                or tweet.get('article') or bundle.get('context_nodes'))
+
+
+def merge_self_replies(items, username, *, enabled, max_chars=4000):
+    """Fold a curator's same-run follow-ups ("链接见评论区" etc.) into the parent card.
+
+    The parent may carry media; a follow-up must be plain text so nothing it shows
+    is lost when the parent card renders.  Quotes, retweets and articles keep their
+    own cards.  Follow-ups that arrive in a later run still reply to the delivered
+    parent through the tweet-anchor table.
+    """
+    if not enabled:
+        return items
+    user = username.lstrip('@').casefold()
+    result = []
+    for tweet, reason in items:
+        parent = tweet.get('in_reply_to_status') or {}
+        prior = result[-1][0] if result else {}
+        members = prior.get('_official_thread_members') or [prior]
+        ids = {str(t.get('id')) for t in members}
+        conversation = str(tweet.get('conversation_id_str') or '')
+        if (prior and str(parent.get('id') or '') in ids
+                and str(parent.get('screen_name') or '').lstrip('@').casefold() == user
+                and conversation
+                and conversation == str(prior.get('conversation_id_str') or prior.get('id') or '')
+                and not has_context_or_media(tweet) and not _has_context(prior)
+                and len(body(tweet)) + len(body(prior)) < max_chars):
+            result[-1] = (combine(prior, members, tweet), reason)
+        else:
+            result.append((tweet, reason))
+    return result

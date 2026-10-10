@@ -318,3 +318,14 @@ Addressed the remaining eval items the user explicitly opted into.
 ### Verification
 - 用 BWG 送达台账回放 10/1–10/10 dotey、vista8、Khazix0918 的 145 条推送：有候选 32 条，AI 结论 drop 16、fold 2、其余 keep。drop 覆盖 Haiku 5.5、Nano Banana 2.1、EmbeddingGemma 2、Codex 28 天系列等官宣转述；作者亲测 Projects 的两条为 fold。
 - 新增 `test_relay_filter.py`（14 项）；全部 537 项测试在本地与 BWG Python 3.9 通过。
+
+## 2026-10-10 — 策展号帖子串合并与短评记录（config 键 self_thread_merge_enabled）
+
+### Design Decisions
+- 策展号常把一条内容拆成主帖加“开源地址：…”“原文见评论区”之类的自回复。同一轮拉到的自回复由 `thread_merge.merge_self_replies` 并入主帖，只发一张卡片；成员 id 沿用 `_official_thread_members`，seen、push_retry 和送达台账的处理与官号串合并一致。
+- 主帖可以带图或视频；自回复必须是纯文字（无媒体、引用、转推、文章），这样合并后不丢任何展示内容。主帖本身是引用、转推或文章时不合并。跨轮到达的自回复仍按 tweet anchor 挂在已送达的主帖下面。
+- 官号串合并（`official_thread_merge_enabled`）保持原样：它带发布类事件的空闲窗口，策展号合并不等待。
+- 短评（去掉链接后不超过 `SHORT_COMMENT_CHARS` 个字符）引用或链接的推文若已由其他账号推送过，relay observe 记为 `short_comment_on_delivered`，不调用 AI。仍处于 observe 阶段，不影响推送。
+
+### Verification
+- 新增 `test_self_thread_merge.py`（6 项，含 process_user 的单卡送达与失败重试）和 3 项短评测试；合并后的卡片渲染保留主帖图片并展开自回复里的 t.co 链接。

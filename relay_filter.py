@@ -23,6 +23,7 @@ MIN_LATIN_SHARED = 3
 MIN_LATIN_COVERAGE = 0.2
 CONFIDENCE_FLOOR = 0.8
 CANDIDATE_CHARS = 1500
+SHORT_COMMENT_CHARS = 40
 
 _ai_calls = 0
 
@@ -34,6 +35,7 @@ _NUMBER_RE = re.compile(r"\d+(?:[.,]\d+)?%?")
 _STATUS_RE = re.compile(r"/status(?:es)?/(\d{6,})")
 _SOURCE_AUTHOR_RE = re.compile(r"^https://(?:x|twitter)\.com/([^/]+)/")
 _HEADER_RE = re.compile(r"^📢 ?@\S+\s*")
+_URL_RE = re.compile(r"https?://\S+|(?:x|twitter)\.com/\S+")
 _QUOTE_MARK = "↳ 引用"
 # Words present in most posts of this feed carry no event identity.
 _STOP = frozenset("""
@@ -240,22 +242,55 @@ def decide(result, candidates):
     return "keep", None
 
 
+def _candidate_view(c):
+    return {"author": row_author(c["row"]), "source_ref": c["row"].get("source_ref"),
+            "sent_at": c["row"].get("sent_at"), "score": c["score"],
+            "coverage": c["coverage"], "latin_coverage": c["latin_coverage"],
+            "direct": c["direct"]}
+
+
+def direct_matches(referenced_ids, rows, *, author):
+    """Deliveries from other accounts that the post quotes or links."""
+    referenced = {str(value) for value in referenced_ids or [] if value}
+    author_key = str(author or "").lstrip("@").casefold()
+    return [{"row": row, "score": 0.0, "coverage": 0.0, "latin_coverage": 0.0, "direct": True}
+            for row in rows
+            if row_author(row).casefold() != author_key and referenced & row_ids(row)]
+
+
+def short_comment(text):
+    """A comment of at most SHORT_COMMENT_CHARS visible characters, links excluded."""
+    visible = re.sub(r"\s+", "", _URL_RE.sub("", text or ""))
+    return 0 < len(visible) <= SHORT_COMMENT_CHARS
+
+
 def evaluate(*, text, quoted_text, referenced_ids, author, rows, ai):
     """Return an audit record; never raises."""
     global _ai_calls
     record = {"decision": "keep", "reason": "not_eligible", "candidates": []}
     if not is_chinese_post(text):
+        # A one-line reaction to a post the group already received repeats that
+        # post with a few words; no AI call is needed to see that.
+        if short_comment(text):
+            try:
+                matches = direct_matches(referenced_ids, rows, author=author)
+            except Exception as exc:
+                record["reason"] = "retrieve_failed:" + type(exc).__name__
+                return record
+            if matches:
+                first = matches[0]["row"]
+                record.update(decision="drop", reason="short_comment_on_delivered",
+                              candidates=[_candidate_view(c) for c in matches[:MAX_CANDIDATES]],
+                              matched={"author": row_author(first),
+                                       "source_ref": first.get("source_ref"),
+                                       "message_id": first.get("message_id")})
         return record
     try:
         candidates = retrieve(text, referenced_ids, rows, author=author)
     except Exception as exc:
         record["reason"] = "retrieve_failed:" + type(exc).__name__
         return record
-    record["candidates"] = [
-        {"author": row_author(c["row"]), "source_ref": c["row"].get("source_ref"),
-         "sent_at": c["row"].get("sent_at"), "score": c["score"],
-         "coverage": c["coverage"], "latin_coverage": c["latin_coverage"],
-         "direct": c["direct"]} for c in candidates]
+    record["candidates"] = [_candidate_view(c) for c in candidates]
     if not candidates:
         record["reason"] = "no_candidate"
         return record

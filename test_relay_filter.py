@@ -179,3 +179,31 @@ class MonitorObserveTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ShortCommentTest(unittest.TestCase):
+    def setUp(self):
+        rf.reset_run()
+        self.rows = [row("thsottiaux", "2108000000000000001", "Codex resets for everyone tonight.")]
+
+    def test_short_reaction_to_delivered_post_drops_without_ai(self):
+        ai = fake_ai({})
+        record = rf.evaluate(text="这是一道送分题 x.com/thsottiaux/status/2108000000000000001",
+                             quoted_text="Codex resets for everyone tonight.",
+                             referenced_ids={"2108000000000000001"}, author="dotey",
+                             rows=self.rows, ai=ai)
+        self.assertEqual((record["decision"], record["reason"]),
+                         ("drop", "short_comment_on_delivered"))
+        self.assertEqual(record["matched"]["author"], "thsottiaux")
+        ai.complete.assert_not_called()
+
+    def test_short_reaction_to_new_post_is_not_recorded(self):
+        record = rf.evaluate(text="这条也挺酷", quoted_text="A new demo",
+                             referenced_ids={"2109000000000000009"}, author="dotey",
+                             rows=self.rows, ai=fake_ai({}))
+        self.assertEqual(record["reason"], "not_eligible")
+
+    def test_links_do_not_count_toward_length(self):
+        self.assertTrue(rf.short_comment("开源的：https://x.com/blended_jpeg/status/123456789"))
+        self.assertFalse(rf.short_comment("　 "))
+        self.assertFalse(rf.short_comment("这是一段明显超过四十个字的评论，" * 3))

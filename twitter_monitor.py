@@ -3107,6 +3107,7 @@ def self_reply_parent_id(t: dict, username: str) -> str:
 
 # ── 跨账号去重索引（纯转发 + Article；config 键 cross_account_dedup 开关）──
 _OFFICIAL_THREAD_MERGE_ENABLED = False
+_SELF_THREAD_MERGE_ENABLED = False
 _TRANSLATION_REPLY_ENABLED = False
 _OFFICIAL_QUOTE_GROUPS = []
 _CROSS_DEDUP_ENABLED = False        # main 从 cfg 置位；默认关 = 行为与现状一致
@@ -5700,6 +5701,8 @@ def process_user(
         to_push, username, enabled=bool(_OFFICIAL_THREAD_MERGE_ENABLED and policy
                                       and not args.test and not args.dry_run),
         deferred=thread_deferred)
+    to_push = thread_merge.merge_self_replies(
+        to_push, username, enabled=bool(_SELF_THREAD_MERGE_ENABLED and not policy and not args.test))
     for tweet, _ in thread_deferred:
         retry = note_push_retry(username, tweet)
         retry["thread_tweet"] = {key: value for key, value in tweet.items()
@@ -6462,7 +6465,7 @@ def main() -> int:
         global _ARTICLE_QUEUE_RUN_START, _THREAD_FALLBACK_ID, _CROSS_DEDUP_ENABLED
         global _ACCOUNT_CONFIG_BY_USERNAME, _ARTICLE_SUPERSEDE_ENABLED
         global _ARTICLE_QUOTE_CARD_ENABLED, _TRANSLATION_REPLY_ENABLED, _OFFICIAL_QUOTE_GROUPS
-        global _OFFICIAL_THREAD_MERGE_ENABLED
+        global _OFFICIAL_THREAD_MERGE_ENABLED, _SELF_THREAD_MERGE_ENABLED
         _ARTICLE_QUEUE_RUN_START = run_started
         if HAS_GRAPHQL:
             twitter_graphql.reset_semantic_resolver_run()
@@ -6471,6 +6474,7 @@ def main() -> int:
         with open(CONFIG_PATH) as f:
             cfg = json.load(f)
         _OFFICIAL_THREAD_MERGE_ENABLED = cfg.get("official_thread_merge_enabled") is True
+        _SELF_THREAD_MERGE_ENABLED = cfg.get("self_thread_merge_enabled") is True
         _TRANSLATION_REPLY_ENABLED = cfg.get("translation_reply_enabled") is True
         _OFFICIAL_QUOTE_GROUPS = quote_fold.normalize_groups(cfg.get("official_quote_groups"))
         _RELAY_FILTER_MODE = relay_filter.normalize_mode(cfg.get("relay_filter_mode"))
@@ -6479,7 +6483,8 @@ def main() -> int:
             print(f"  relay filter: mode={_RELAY_FILTER_MODE}")
         print(f"  quote-fold config: translation_reply_enabled={_TRANSLATION_REPLY_ENABLED} "
               f"official_quote_groups={len(_OFFICIAL_QUOTE_GROUPS)} "
-              f"official_thread_merge_enabled={_OFFICIAL_THREAD_MERGE_ENABLED}")
+              f"official_thread_merge_enabled={_OFFICIAL_THREAD_MERGE_ENABLED} "
+              f"self_thread_merge_enabled={_SELF_THREAD_MERGE_ENABLED}")
         apply_route_overlay(cfg)  # 路由表优先，config.json 作回落
         bot_token = args.bot_token or cfg["telegram_bot_token"]
         chat_id = args.chat_id or cfg["telegram_chat_id"]
