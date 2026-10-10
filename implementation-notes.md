@@ -306,3 +306,15 @@ Addressed the remaining eval items the user explicitly opted into.
 
 ### Tradeoffs
 - 保留 BWG 现有账号策略和事件新鲜度配置，不在本次合并中重新设计推送规则。
+
+## 2026-10-10 — 二手转述识别（config 键 relay_filter_mode，先 observe）
+
+### Design Decisions
+- 目标是中文策展号对已推官宣的转述：一手源已在本群推过时，中文翻译或复述不再单独占一条消息。现有 `_prepare_quote_translation` 只覆盖引用推文且要求“零新增信息”，dotey 这类带背景解释的转述从未命中。
+- 候选来自 `state/x_monitor_sent_content_ledger.jsonl` 近 72 小时的确认送达记录，排除同一作者。检索分两路：直接引用或链接已推推文必中；跨语言转述依靠版本化名称、英文词和数字（`relay_filter.retrieve`），中文对中文依靠 IDF 加权的字二元组。
+- AI 只在有候选时调用，每轮上限 `MAX_AI_CALLS_PER_RUN`。官方博客、文档、价格页里的细节也算转述；只有作者亲测、作者自己的分析或对比、基于经验的建议算实质增量。映射：转述 → drop，同事件且有实质增量 → fold（只保留增量挂在原文下），其余 keep；格式不对或置信度低于 `CONFIDENCE_FLOOR` 一律 keep。
+- observe 模式只写 `state/relay-observe.jsonl`，不改变推送、seen 或任何台账。`relay_filter_mode` 缺省为 off。
+
+### Verification
+- 用 BWG 送达台账回放 10/1–10/10 dotey、vista8、Khazix0918 的 145 条推送：有候选 32 条，AI 结论 drop 16、fold 2、其余 keep。drop 覆盖 Haiku 5.5、Nano Banana 2.1、EmbeddingGemma 2、Codex 28 天系列等官宣转述；作者亲测 Projects 的两条为 fold。
+- 新增 `test_relay_filter.py`（14 项）；全部 537 项测试在本地与 BWG Python 3.9 通过。

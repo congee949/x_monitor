@@ -21,6 +21,7 @@ import base64
 from contextlib import contextmanager
 import hashlib
 import quote_fold
+import relay_filter
 import thread_merge
 import http.client
 import json
@@ -95,6 +96,9 @@ SENT_CONTENT_LEDGER_PATH = os.path.join(
     SCRIPT_DIR, "state", "x_monitor_sent_content_ledger.jsonl")
 SENT_CONTENT_MAX_CHARS = 12000
 _SENT_CONTENT_LEDGER_ENABLED = True
+# Second-hand relay decisions (relay_filter_mode=observe): audit rows only.
+RELAY_OBSERVE_PATH = os.path.join(SCRIPT_DIR, "state", "relay-observe.jsonl")
+_RELAY_FILTER_MODE = "off"
 # 跨账号去重索引（纯转发原推 id / article rest_id → 首推记录）
 PUSHED_INDEX_PATH = os.path.join(SEEN_DIR, ".pushed_index.json")
 PUSHED_INDEX_TTL_DAYS = 14      # 45min 推送窗口已挡旧推，索引只防迟到的 RT 波
@@ -4524,6 +4528,62 @@ def _prepare_quote_translation(t: dict, ai) -> None:
         decision["reason"] = "classification_failed:" + type(exc).__name__
 
 
+def _relay_inputs(t: dict) -> tuple[str, str, set]:
+    """Own text, quoted text and referenced status ids of one candidate post."""
+    bundle = _semantic_bundle(t)
+    referenced = set()
+    if bundle:
+        anchor = bundle.get("anchor") or {}
+        text, view = _semantic_node_body(anchor)
+        text = _expand_tco(text, view)
+        quoted = []
+        for node in bundle.get("context_nodes") or []:
+            if not isinstance(node, dict):
+                continue
+            if node.get("tweet_id"):
+                referenced.add(str(node["tweet_id"]))
+            body, node_view = _semantic_node_body(node)
+            quoted.append(_expand_tco(body, node_view))
+        quoted_text = "\n\n".join(part for part in quoted if part)
+    else:
+        text = _expand_tco(_tweet_body_text(t), t)
+        quoted_text = ""
+        qid = str((t.get("quoted_status") or {}).get("id") or "")
+        if qid:
+            referenced.add(qid)
+    for link in _tweet_outbound_links(t):
+        referenced.update(relay_filter._STATUS_RE.findall(str(link)))
+    referenced.discard(str(t.get("id") or ""))
+    return text, quoted_text, referenced
+
+
+def _relay_observe(t: dict, username: str, ai, *, dry_run: bool = False) -> dict:
+    """Record what the relay filter would do; delivery is never affected."""
+    text = ""
+    try:
+        text, quoted_text, referenced = _relay_inputs(t)
+        rows = relay_filter.load_recent(SENT_CONTENT_LEDGER_PATH)
+        record = relay_filter.evaluate(text=text, quoted_text=quoted_text,
+                                       referenced_ids=referenced, author=username,
+                                       rows=rows, ai=ai)
+    except Exception as exc:
+        record = {"decision": "keep", "reason": "observe_failed:" + type(exc).__name__,
+                  "candidates": []}
+    if record.get("reason") == "not_eligible":
+        return record
+    record = dict(record, ts=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                  mode="observe", username=username, tweet_id=str(t.get("id") or ""),
+                  url=_tweet_source_url(username, t), text_head=text[:300])
+    print(f"    relay-observe: {record['tweet_id']} decision={record['decision']} "
+          f"reason={record.get('reason')} candidates={len(record.get('candidates') or [])}")
+    if not dry_run:
+        try:
+            relay_filter.append_observation(RELAY_OBSERVE_PATH, record)
+        except OSError as exc:
+            print(f"    relay-observe 落盘失败（忽略）: {type(exc).__name__}")
+    return record
+
+
 def _quote_presentation_tweet(t: dict) -> dict:
     bundle = t.get("_quote_presentation_bundle")
     return dict(t, semantic_bundle=bundle) if isinstance(bundle, dict) else t
@@ -5609,6 +5669,9 @@ def process_user(
                         continue
                 filtered.append((t, reason))
                 continue
+        if (_RELAY_FILTER_MODE == "observe" and not policy and not args.test
+                and tid not in push_retry and not t.get("retweeted_status")):
+            _relay_observe(t, username, ai, dry_run=args.dry_run)
         quality_candidates.append((t, candidate_reason))
     to_push = quality_candidates
 
@@ -6336,7 +6399,7 @@ def process_article_queue(ai: AIClassifier, bot_token: str, chat_id: str, dry_ru
 
 def main() -> int:
     global _SEMANTIC_BUNDLE_ENABLED, _SEMANTIC_BUNDLE_SHADOW, _SEMANTIC_CURATOR_ALLOWLIST
-    global _SENT_CONTENT_LEDGER_ENABLED
+    global _SENT_CONTENT_LEDGER_ENABLED, _RELAY_FILTER_MODE
     ap = argparse.ArgumentParser(description="Twitter 多账号监控 → Telegram 推送")
     ap.add_argument("--test", action="store_true", help="测试模式")
     ap.add_argument("--seed", action="store_true", help="只记录已见，不推送")
@@ -6356,6 +6419,7 @@ def main() -> int:
     previous_semantic_shadow = _SEMANTIC_BUNDLE_SHADOW
     previous_semantic_allowlist = set(_SEMANTIC_CURATOR_ALLOWLIST)
     previous_sent_content_ledger_enabled = _SENT_CONTENT_LEDGER_ENABLED
+    previous_relay_mode = _RELAY_FILTER_MODE
 
     # LOCK-1: prevent an overrunning run from overlapping the next cron tick (which
     # causes double-sends + last-writer-wins state clobber). Non-blocking; skip if held.
@@ -6409,6 +6473,10 @@ def main() -> int:
         _OFFICIAL_THREAD_MERGE_ENABLED = cfg.get("official_thread_merge_enabled") is True
         _TRANSLATION_REPLY_ENABLED = cfg.get("translation_reply_enabled") is True
         _OFFICIAL_QUOTE_GROUPS = quote_fold.normalize_groups(cfg.get("official_quote_groups"))
+        _RELAY_FILTER_MODE = relay_filter.normalize_mode(cfg.get("relay_filter_mode"))
+        relay_filter.reset_run()
+        if _RELAY_FILTER_MODE != "off":
+            print(f"  relay filter: mode={_RELAY_FILTER_MODE}")
         print(f"  quote-fold config: translation_reply_enabled={_TRANSLATION_REPLY_ENABLED} "
               f"official_quote_groups={len(_OFFICIAL_QUOTE_GROUPS)} "
               f"official_thread_merge_enabled={_OFFICIAL_THREAD_MERGE_ENABLED}")
@@ -6580,6 +6648,7 @@ def main() -> int:
         globals()["_SEMANTIC_BUNDLE_SHADOW"] = previous_semantic_shadow
         globals()["_SEMANTIC_CURATOR_ALLOWLIST"] = previous_semantic_allowlist
         globals()["_SENT_CONTENT_LEDGER_ENABLED"] = previous_sent_content_ledger_enabled
+        globals()["_RELAY_FILTER_MODE"] = previous_relay_mode
         # P0-1: always cancel the global timeout and release the flock lock so a
         # hung/hard-killed predecessor cannot starve subsequent cron ticks.
         if hasattr(signal, "SIGALRM"):
